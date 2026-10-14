@@ -653,6 +653,136 @@ window.addEventListener("pageshow", () => {{
         assert checkpoint.scrolls == 0
 
 
+def test_home_waits_for_delayed_strict_card_hydration() -> None:
+    actor = "offline.operator"
+    first_url = "https://www.threads.com/@candidate/post/hydrated-first"
+    second_url = "https://www.threads.com/@candidate/post/hydrated-second"
+    body = "Hiring a frontend engineer"
+    feed_html = f"""<!doctype html><html><head><style>
+.post-card {{ box-sizing: border-box; height: 760px; padding-top: 80px; }}
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a id="profile" aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main>
+  <div class="post-card" id="hydrating">
+    <a href="/@candidate/post/hydrated-first"><time>2h</time></a>
+    <a href="/@">Loading</a>
+  </div>
+  <div class="post-card">
+    <a href="/@candidate/post/hydrated-second"><time>1h</time></a>
+    <a href="/@candidate">@candidate</a><p>A weather update</p>
+  </div>
+</main><script>
+const hydrate = () => {{
+  const card = document.querySelector("#hydrating");
+  if (card.querySelector('a[href="/@candidate"]')) return;
+  card.querySelector('a[href="/@"]').remove();
+  card.insertAdjacentHTML("beforeend", '<a href="/@candidate">@candidate</a>'
+    + '<p>{body}</p>');
+}};
+window.addEventListener("pageshow", () => {{
+  const shows = Number(sessionStorage.getItem("home-shows") || "0") + 1;
+  sessionStorage.setItem("home-shows", String(shows));
+  if (shows >= 2) setTimeout(hydrate, 300);
+}});
+window.addEventListener("wheel", event => {{
+  event.preventDefault();
+  setTimeout(() => window.scrollBy(0, 850), 40);
+}}, {{ once: true, passive: false }});
+</script></body></html>"""
+
+    async def exercise(page) -> None:
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        sample = await reader.sample_and_scroll(2)
+        first = next(target for target in sample.observed_targets if target.url == first_url)
+        assert first.body == body
+        assert any(target.url == second_url for target in sample.observed_targets)
+        assert reader.scrolls == 1
+
+    _run_offline_page(feed_html, exercise)
+
+
+def test_home_readiness_skips_offscreen_permalink_for_visible_valid_card() -> None:
+    actor = "offline.operator"
+    visible_url = "https://www.threads.com/@candidate/post/visible"
+    feed_html = f"""<!doctype html><html><head><style>
+main {{ position: relative; height: 1400px; }}
+.post-card {{ box-sizing: border-box; position: absolute; width: 100%; height: 320px; }}
+#offscreen {{ top: 1000px; }}
+#visible {{ top: 80px; }}
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main>
+  <div class="post-card" id="offscreen">
+    <a href="/@candidate/post/offscreen"><time>3h</time></a>
+  </div>
+  <div class="post-card" id="visible">
+    <a href="/@candidate/post/visible"><time>1h</time></a>
+    <a href="/@candidate">@candidate</a><p>A weather update</p>
+  </div>
+</main></body></html>"""
+
+    async def exercise(page) -> None:
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        targets, _ = await reader._wait_for_home_targets(
+            1,
+            timeout_code="FEED_INITIAL_NOT_READY",
+        )
+        assert len(targets) == 1
+        assert targets[0].url == visible_url
+        assert targets[0].author == "candidate"
+
+    _run_offline_page(feed_html, exercise)
+
+
+def test_initial_feed_readiness_deadline_stops_without_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actor = "offline.operator"
+    feed_html = f"""<!doctype html><html><head><style>
+.post-card {{ box-sizing: border-box; height: 760px; padding-top: 80px; }}
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main><div class="post-card">
+  <a href="/@candidate/post/never-ready"><time>1h</time></a>
+  <a href="/@">Loading</a>
+</div></main></body></html>"""
+    monkeypatch.setattr(reader_module, "_READINESS_TIMEOUT_MS", 300)
+
+    with tempfile.TemporaryDirectory(prefix="threads-browser-feed-deadline-") as root:
+        synthetic_root = Path(root)
+        profile = synthetic_root / "profile"
+        profile.mkdir()
+        account = AccountStore(synthetic_root / "data").add("offline", actor, profile)
+        store = CheckpointStore(synthetic_root / "data")
+
+        async def exercise(page) -> None:
+            with pytest.raises(UiReadError) as caught:
+                await workflow.run_page_workflow(
+                    page,
+                    account,
+                    store,
+                    max_posts=1,
+                    terms=("hiring",),
+                )
+            assert caught.value.code == "FEED_INITIAL_NOT_READY"
+
+        _run_offline_page(feed_html, exercise)
+        policy = policy_fingerprint(canonical_terms(("hiring",)))
+        checkpoint = store.load(account.account_id, policy)
+        assert checkpoint.completed_runs == 0
+        assert checkpoint.home_sampled == 0
+        assert checkpoint.scroll_attempts == 0
+        assert checkpoint.scrolls == 0
+
+
 def test_non_article_mixed_permalink_container_fails_closed() -> None:
     html = """<!doctype html><html><head><style>
 .mixed-card { height: 900px; }

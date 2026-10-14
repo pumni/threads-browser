@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 import unicodedata
@@ -31,7 +32,7 @@ _MAX_BODY_CODEPOINTS = 10_000
 _MAX_CARD_ANCESTORS = 8
 _MAX_CARD_LINKS = 40
 _MAX_PERMALINK_CANDIDATES = 40
-_MAX_READINESS_RECHECKS = 3
+_MAX_DETAIL_READINESS_RECHECKS = 3
 _USERNAME = re.compile(r"[A-Za-z0-9._]{1,30}")
 _POST_PATH = re.compile(r"/@(?P<author>[A-Za-z0-9._]{1,30})/post/(?P<post>[A-Za-z0-9_-]{1,120})")
 _PROFILE_PATH = re.compile(r"/@(?P<author>[A-Za-z0-9._]{1,30})/?")
@@ -48,20 +49,42 @@ class UiReadError(Exception):
         super().__init__(code)
 
 
+@dataclass(frozen=True, slots=True)
+class _CardWaitSignal:
+    locator: Locator
+    condition: Literal["visible", "in_viewport", "nonempty_text", "mutation"]
+    timeout_code: str | None = None
+
+
 class _CardNotReady(Exception):
     def __init__(
         self,
-        locator: Locator,
+        locator: Locator | None = None,
         *,
         in_viewport: bool = False,
         nonempty_text: bool = False,
         timeout_code: str | None = None,
+        condition: Literal["visible", "mutation"] = "visible",
+        signals: tuple[_CardWaitSignal, ...] | None = None,
     ) -> None:
-        self.locator = locator
-        self.in_viewport = in_viewport
-        self.nonempty_text = nonempty_text
-        self.timeout_code = timeout_code
+        if signals is None:
+            if locator is None:
+                raise ValueError("card readiness requires a locator")
+            if in_viewport:
+                condition = "in_viewport"
+            elif nonempty_text:
+                condition = "nonempty_text"
+            signals = (_CardWaitSignal(locator, condition, timeout_code),)
+        self.signals = signals
+        self.timeout_code = timeout_code or next(
+            (signal.timeout_code for signal in signals if signal.timeout_code),
+            None,
+        )
         super().__init__()
+
+    @classmethod
+    def combine(cls, pending: list[_CardNotReady]) -> _CardNotReady:
+        return cls(signals=tuple(signal for item in pending for signal in item.signals))
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -286,7 +309,7 @@ class ThreadsHomeReader:
             raise UiReadError("POST_LIMIT_INVALID")
         before, scroll_anchor = await self._wait_for_home_targets(
             max_posts,
-            timeout_code="FEED_UI_UNVERIFIED",
+            timeout_code="FEED_INITIAL_NOT_READY",
         )
         before_by_fingerprint = {target.fingerprint: target for target in before}
         before_by_url = {target.url: target for target in before}
@@ -365,7 +388,8 @@ class ThreadsHomeReader:
     ) -> tuple[tuple[PostTarget, ...], dict[str, float]]:
         if deadline is None:
             deadline = self._readiness_deadline(_READINESS_TIMEOUT_MS)
-        for _ in range(_MAX_READINESS_RECHECKS):
+        while True:
+            self._remaining_readiness_ms(deadline, timeout_code)
             await self._require_feed_url()
             try:
                 targets, scroll_anchor = await self._visible_targets(
@@ -379,37 +403,50 @@ class ThreadsHomeReader:
             if targets and scroll_anchor is not None:
                 self._remaining_readiness_ms(deadline, timeout_code)
                 return targets, scroll_anchor
-            signal = await self._feed_readiness_signal()
-            try:
-                await expect(signal).to_be_in_viewport(
-                    timeout=self._remaining_readiness_ms(deadline, timeout_code)
+            pending = await self._feed_readiness_signals()
+            if not pending:
+                pending = _CardNotReady(
+                    self._page.locator("body"),
+                    condition="mutation",
                 )
-            except (AssertionError, PlaywrightTimeoutError):
-                raise UiReadError(timeout_code) from None
-        raise UiReadError(timeout_code)
+            await self._wait_for_pending_card(pending, deadline, timeout_code)
 
-    async def _feed_readiness_signal(self) -> Locator:
+    async def _feed_readiness_signals(self) -> _CardNotReady | None:
+        signals: list[_CardWaitSignal] = []
+        viewport = self._page.viewport_size
         articles = self._page.get_by_role("article")
         article_count = await articles.count()
         for index in range(min(article_count, _MAX_PERMALINK_CANDIDATES)):
             article = articles.nth(index)
-            if not await self._is_outside_content_landmark(article):
-                return article
-        if article_count:
-            return articles.nth(min(article_count, _MAX_PERMALINK_CANDIDATES))
-
-        region = await self._content_region()
-        permalinks = region.locator('a[href*="/post/"]')
-        count = await permalinks.count()
-        for index in range(min(count, _MAX_PERMALINK_CANDIDATES)):
-            permalink = permalinks.nth(index)
-            if await self._is_outside_content_landmark(permalink):
+            if await self._is_outside_content_landmark(article):
                 continue
-            href = await permalink.get_attribute("href")
-            if href is None or _post_url(href) is None:
-                raise UiReadError("POST_PROVENANCE_UNVERIFIED")
-            return permalink
-        return permalinks.nth(min(count, _MAX_PERMALINK_CANDIDATES))
+            box = await article.bounding_box()
+            if viewport is None or box is None or not self._intersects_viewport(box, viewport):
+                signals.append(_CardWaitSignal(article, "in_viewport"))
+
+        if article_count == 0:
+            region = await self._content_region()
+            permalinks = region.locator('a[href*="/post/"]')
+            count = await permalinks.count()
+            for index in range(min(count, _MAX_PERMALINK_CANDIDATES)):
+                permalink = permalinks.nth(index)
+                if await self._is_outside_content_landmark(permalink):
+                    continue
+                href = await permalink.get_attribute("href")
+                if href is None or _post_url(href) is None:
+                    raise UiReadError("POST_PROVENANCE_UNVERIFIED")
+                box = await permalink.bounding_box()
+                if (
+                    viewport is None
+                    or box is None
+                    or not self._intersects_viewport(box, viewport)
+                ):
+                    signals.append(_CardWaitSignal(permalink, "in_viewport"))
+
+        if not signals:
+            return None
+        signals.append(_CardWaitSignal(self._page.locator("body"), "mutation"))
+        return _CardNotReady(signals=tuple(signals))
 
     async def _wait_for_pending_card(
         self,
@@ -417,20 +454,71 @@ class ThreadsHomeReader:
         deadline: float,
         timeout_code: str,
     ) -> None:
-        remaining = self._remaining_readiness_ms(deadline, timeout_code)
-        try:
-            if pending.in_viewport:
-                await expect(pending.locator).to_be_in_viewport(timeout=remaining)
-            elif pending.nonempty_text:
-                await expect(pending.locator).to_be_visible(timeout=remaining)
-                await expect(pending.locator).to_have_text(
-                    re.compile(r"\S"),
-                    timeout=self._remaining_readiness_ms(deadline, timeout_code),
-                )
-            else:
-                await expect(pending.locator).to_be_visible(timeout=remaining)
-        except (AssertionError, PlaywrightTimeoutError):
-            raise UiReadError(pending.timeout_code or timeout_code) from None
+        async def wait_for_signal(signal: _CardWaitSignal) -> bool:
+            remaining = int((deadline - time.monotonic()) * 1000)
+            if remaining <= 0:
+                return False
+            try:
+                if signal.condition == "in_viewport":
+                    await expect(signal.locator).to_be_in_viewport(timeout=remaining)
+                elif signal.condition == "nonempty_text":
+                    await expect(signal.locator).to_be_visible(timeout=remaining)
+                    await expect(signal.locator).to_have_text(
+                        re.compile(r"\S"),
+                        timeout=max(1, int((deadline - time.monotonic()) * 1000)),
+                    )
+                elif signal.condition == "mutation":
+                    return bool(
+                        await signal.locator.evaluate(
+                            """(element, timeoutMs) => new Promise(resolve => {
+                                const observer = new MutationObserver(() => {
+                                    observer.disconnect();
+                                    clearTimeout(timer);
+                                    resolve(true);
+                                });
+                                observer.observe(element, {
+                                    attributes: true,
+                                    childList: true,
+                                    characterData: true,
+                                    subtree: true,
+                                });
+                                const timer = setTimeout(() => {
+                                    observer.disconnect();
+                                    resolve(false);
+                                }, timeoutMs);
+                            })""",
+                            remaining,
+                        )
+                    )
+                else:
+                    await expect(signal.locator).to_be_visible(timeout=remaining)
+                return True
+            except (AssertionError, PlaywrightError):
+                return False
+
+        tasks = {
+            asyncio.create_task(wait_for_signal(signal)) for signal in pending.signals
+        }
+        while tasks:
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0:
+                break
+            done, tasks = await asyncio.wait(
+                tasks,
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                break
+            if any(task.result() for task in done):
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                return
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise UiReadError(pending.timeout_code or timeout_code)
 
     async def _wait_for_scroll_movement(
         self,
@@ -480,7 +568,7 @@ class ThreadsHomeReader:
         articles = self._page.get_by_role("article")
         viewport = self._page.viewport_size
         if viewport is None:
-            raise UiReadError("FEED_UI_UNVERIFIED")
+            raise UiReadError("FEED_VIEWPORT_UNVERIFIED")
         targets: list[PostTarget] = []
         scroll_anchor: dict[str, float] | None = None
         article_count = await articles.count()
@@ -492,6 +580,7 @@ class ThreadsHomeReader:
             )
         scan_limit = min(article_count, max_posts + 20)
         visible_limit = max_posts if prefer_new_fingerprints is None else max_posts + 20
+        pending_cards: list[_CardNotReady] = []
         for index in range(scan_limit):
             article = articles.nth(index)
             if not await article.is_visible():
@@ -507,15 +596,20 @@ class ThreadsHomeReader:
                 continue
             if scroll_anchor is None:
                 scroll_anchor = box
-            targets.append(
-                await self._read_card(
+            try:
+                target = await self._read_card(
                     article,
                     visible_after_scroll=visible_after_scroll,
                     viewport_y=box["y"],
                 )
-            )
+            except _CardNotReady as pending:
+                pending_cards.append(pending)
+                continue
+            targets.append(target)
             if len(targets) >= visible_limit:
                 break
+        if not targets and pending_cards:
+            raise _CardNotReady.combine(pending_cards)
         if prefer_new_fingerprints is not None:
             targets.sort(key=lambda target: target.fingerprint in prefer_new_fingerprints)
             targets = targets[:max_posts]
@@ -533,7 +627,12 @@ class ThreadsHomeReader:
             and box["y"] + box["height"] > 0
         )
 
-    async def _content_region(self, *, prefer_main: bool = False) -> Locator:
+    async def _content_region(
+        self,
+        *,
+        prefer_main: bool = False,
+        error_code: str = "FEED_REGION_UNVERIFIED",
+    ) -> Locator:
         roles = ("main", "feed") if prefer_main else ("feed", "main")
         for role in roles:
             landmarks = self._page.get_by_role(role)
@@ -543,7 +642,7 @@ class ThreadsHomeReader:
                 if await landmark.is_visible():
                     visible.append(landmark)
             if len(visible) > 1:
-                raise UiReadError("FEED_UI_UNVERIFIED")
+                raise UiReadError(error_code)
             if visible:
                 return visible[0]
         return self._page.locator("body")
@@ -617,7 +716,10 @@ class ThreadsHomeReader:
                 continue
             if not authors:
                 if pending_author is None:
-                    pending_author = self._profile_link_signal(ancestor)
+                    pending_author = self._expected_profile_link_signal(
+                        ancestor,
+                        expected_author,
+                    )
                 continue
             candidate = (ancestor, box)
             if smallest_without_body is None:
@@ -636,8 +738,10 @@ class ThreadsHomeReader:
         raise UiReadError("POST_PROVENANCE_UNVERIFIED")
 
     @staticmethod
-    def _profile_link_signal(root: Locator) -> Locator:
-        return root.locator('a[href*="/@" i]:not([href*="/post/" i])').first
+    def _expected_profile_link_signal(root: Locator, author: str) -> Locator:
+        return root.locator(
+            f'a[href$="/@{author}" i], a[href$="/@{author}/" i]'
+        ).first
 
     async def _visible_permalink_targets(
         self,
@@ -648,7 +752,7 @@ class ThreadsHomeReader:
     ) -> tuple[tuple[PostTarget, ...], dict[str, float] | None]:
         viewport = self._page.viewport_size
         if viewport is None:
-            raise UiReadError("FEED_UI_UNVERIFIED")
+            raise UiReadError("FEED_VIEWPORT_UNVERIFIED")
         region = await self._content_region()
         permalinks = region.locator('a[href*="/post/"]')
         scan_limit = min(
@@ -658,6 +762,7 @@ class ThreadsHomeReader:
         visible_limit = max_posts if prefer_new_fingerprints is None else max_posts + 20
         targets_by_url: dict[str, PostTarget] = {}
         scroll_anchor: dict[str, float] | None = None
+        pending_cards: list[_CardNotReady] = []
         for index in range(scan_limit):
             permalink = permalinks.nth(index)
             if not await permalink.is_visible():
@@ -676,18 +781,22 @@ class ThreadsHomeReader:
             if permalink_box is None or not self._intersects_viewport(permalink_box, viewport):
                 continue
 
-            root, box = await self._resolve_permalink_card(
-                permalink,
-                parsed_post[0],
-                parsed_post[1],
-            )
-            if not self._intersects_viewport(box, viewport):
+            try:
+                root, box = await self._resolve_permalink_card(
+                    permalink,
+                    parsed_post[0],
+                    parsed_post[1],
+                )
+                if not self._intersects_viewport(box, viewport):
+                    continue
+                target = await self._read_card(
+                    root,
+                    visible_after_scroll=visible_after_scroll,
+                    viewport_y=box["y"],
+                )
+            except _CardNotReady as pending:
+                pending_cards.append(pending)
                 continue
-            target = await self._read_card(
-                root,
-                visible_after_scroll=visible_after_scroll,
-                viewport_y=box["y"],
-            )
             if target.url != parsed_post[0] or target.author != parsed_post[1]:
                 raise UiReadError("POST_PROVENANCE_UNVERIFIED")
             if scroll_anchor is None:
@@ -696,6 +805,8 @@ class ThreadsHomeReader:
             if len(targets_by_url) >= visible_limit:
                 break
 
+        if not targets_by_url and pending_cards:
+            raise _CardNotReady.combine(pending_cards)
         targets = list(targets_by_url.values())
         if prefer_new_fingerprints is not None:
             targets.sort(key=lambda target: target.fingerprint in prefer_new_fingerprints)
@@ -724,7 +835,7 @@ class ThreadsHomeReader:
         if not _same_home_origin(self._page.url):
             raise UiReadError("OFF_ORIGIN_REDIRECT")
         detail: PostTarget | None = None
-        for _ in range(_MAX_READINESS_RECHECKS):
+        for _ in range(_MAX_DETAIL_READINESS_RECHECKS):
             await self._check_blocker()
             try:
                 articles = self._page.get_by_role("article")
@@ -764,7 +875,10 @@ class ThreadsHomeReader:
         return detail
 
     async def _detail_permalink_card(self, target: PostTarget) -> Locator:
-        region = await self._content_region(prefer_main=True)
+        region = await self._content_region(
+            prefer_main=True,
+            error_code="DETAIL_ROOT_UNVERIFIED",
+        )
         permalinks = region.locator('a[href*="/post/"]')
         scan_limit = min(await permalinks.count(), _MAX_PERMALINK_CANDIDATES)
         for index in range(scan_limit):
@@ -807,7 +921,7 @@ class ThreadsHomeReader:
             raise UiReadError("RETURN_UNVERIFIED")
         await self._wait_for_home_targets(
             1,
-            timeout_code="FEED_UI_UNVERIFIED",
+            timeout_code="FEED_RETURN_NOT_READY",
         )
     async def _for_you_control(self) -> Locator:
         matches: list[Locator] = []
@@ -917,9 +1031,11 @@ class ThreadsHomeReader:
         if len(unique_urls) > 1 or len(unique_permalink_links) > 1 or len(authors) > 1:
             raise UiReadError("POST_PROVENANCE_UNVERIFIED")
         if not post_links:
-            raise _CardNotReady(article.locator('a[href*="/post/"]').first)
+            raise _CardNotReady(article, condition="mutation")
         if not authors:
-            raise _CardNotReady(self._profile_link_signal(article))
+            raise _CardNotReady(
+                self._expected_profile_link_signal(article, post_links[0][1])
+            )
         if len(unique_urls) != 1 or len(unique_permalink_links) != 1:
             raise UiReadError("POST_PROVENANCE_UNVERIFIED")
         url, permalink_author, link = post_links[0]
