@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 import unicodedata
 from dataclasses import dataclass, field
 from hashlib import sha256
@@ -15,6 +16,7 @@ from playwright.async_api import (
 from playwright.async_api import (
     Locator,
     Page,
+    expect,
 )
 from playwright.async_api import (
     TimeoutError as PlaywrightTimeoutError,
@@ -29,6 +31,7 @@ _MAX_BODY_CODEPOINTS = 10_000
 _MAX_CARD_ANCESTORS = 8
 _MAX_CARD_LINKS = 40
 _MAX_PERMALINK_CANDIDATES = 40
+_MAX_READINESS_RECHECKS = 3
 _USERNAME = re.compile(r"[A-Za-z0-9._]{1,30}")
 _POST_PATH = re.compile(r"/@(?P<author>[A-Za-z0-9._]{1,30})/post/(?P<post>[A-Za-z0-9_-]{1,120})")
 _PROFILE_PATH = re.compile(r"/@(?P<author>[A-Za-z0-9._]{1,30})/?")
@@ -43,6 +46,22 @@ class UiReadError(Exception):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+class _CardNotReady(Exception):
+    def __init__(
+        self,
+        locator: Locator,
+        *,
+        in_viewport: bool = False,
+        nonempty_text: bool = False,
+        timeout_code: str | None = None,
+    ) -> None:
+        self.locator = locator
+        self.in_viewport = in_viewport
+        self.nonempty_text = nonempty_text
+        self.timeout_code = timeout_code
+        super().__init__()
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -261,16 +280,22 @@ class ThreadsHomeReader:
         await self._require_feed_url()
         if self._page.url != self._home_url:
             raise UiReadError("RETURN_UNVERIFIED")
+
     async def sample_and_scroll(self, max_posts: int) -> HomeSample:
         if not 1 <= max_posts <= 20:
             raise UiReadError("POST_LIMIT_INVALID")
-        before, scroll_anchor = await self._visible_targets(max_posts)
-        if not before or scroll_anchor is None:
-            raise UiReadError("FEED_UI_UNVERIFIED")
+        before, scroll_anchor = await self._wait_for_home_targets(
+            max_posts,
+            timeout_code="FEED_UI_UNVERIFIED",
+        )
         before_by_fingerprint = {target.fingerprint: target for target in before}
         self.feed_duplicates = len(before) - len(before_by_fingerprint)
         self.scroll_attempts = 0
         self.scrolls = 0
+        deadline = self._readiness_deadline(_READINESS_TIMEOUT_MS)
+        anchor_box = await before[0].permalink.bounding_box()
+        if anchor_box is None:
+            raise UiReadError("HOME_SCROLL_UNVERIFIED")
         try:
             await self._page.mouse.move(
                 scroll_anchor["x"] + scroll_anchor["width"] / 2,
@@ -280,23 +305,22 @@ class ThreadsHomeReader:
             await self._page.mouse.wheel(0, 850)
         except PlaywrightError:
             raise UiReadError("HOME_SCROLL_FAILED") from None
-        after, _ = await self._visible_targets(
+        await self._wait_for_scroll_movement(
+            before[0].permalink,
+            anchor_box["y"],
+            deadline,
+        )
+        after, _ = await self._wait_for_home_targets(
             max_posts,
+            timeout_code="HOME_SCROLL_UNVERIFIED",
             visible_after_scroll=True,
             prefer_new_fingerprints=set(before_by_fingerprint),
+            deadline=deadline,
         )
         await self._require_feed_url()
         after_by_fingerprint = {target.fingerprint: target for target in after}
         self.feed_duplicates += len(after) - len(after_by_fingerprint)
-        self.scrolls = int(
-            any(
-                fingerprint not in before_by_fingerprint
-                or abs(target.viewport_y - before_by_fingerprint[fingerprint].viewport_y) > 1
-                for fingerprint, target in after_by_fingerprint.items()
-            )
-        )
-        if self.scrolls == 0:
-            raise UiReadError("HOME_SCROLL_UNVERIFIED")
+        self.scrolls = 1
         for fingerprint in after_by_fingerprint:
             if fingerprint in before_by_fingerprint:
                 self.feed_duplicates += 1
@@ -310,6 +334,123 @@ class ThreadsHomeReader:
             targets=tuple(after_first[:max_posts]),
             observed_targets=tuple(after_first),
         )
+
+    @staticmethod
+    def _readiness_deadline(timeout_ms: int) -> float:
+        return time.monotonic() + timeout_ms / 1000
+
+    @staticmethod
+    def _remaining_readiness_ms(deadline: float, timeout_code: str) -> int:
+        remaining = int((deadline - time.monotonic()) * 1000)
+        if remaining <= 0:
+            raise UiReadError(timeout_code)
+        return remaining
+
+    async def _wait_for_home_targets(
+        self,
+        max_posts: int,
+        *,
+        timeout_code: str,
+        visible_after_scroll: bool = False,
+        prefer_new_fingerprints: set[str] | None = None,
+        deadline: float | None = None,
+    ) -> tuple[tuple[PostTarget, ...], dict[str, float]]:
+        if deadline is None:
+            deadline = self._readiness_deadline(_READINESS_TIMEOUT_MS)
+        for _ in range(_MAX_READINESS_RECHECKS):
+            await self._require_feed_url()
+            try:
+                targets, scroll_anchor = await self._visible_targets(
+                    max_posts,
+                    visible_after_scroll=visible_after_scroll,
+                    prefer_new_fingerprints=prefer_new_fingerprints,
+                )
+            except _CardNotReady as pending:
+                await self._wait_for_pending_card(pending, deadline, timeout_code)
+                continue
+            if targets and scroll_anchor is not None:
+                self._remaining_readiness_ms(deadline, timeout_code)
+                return targets, scroll_anchor
+            signal = await self._feed_readiness_signal()
+            try:
+                await expect(signal).to_be_in_viewport(
+                    timeout=self._remaining_readiness_ms(deadline, timeout_code)
+                )
+            except (AssertionError, PlaywrightTimeoutError):
+                raise UiReadError(timeout_code) from None
+        raise UiReadError(timeout_code)
+
+    async def _feed_readiness_signal(self) -> Locator:
+        articles = self._page.get_by_role("article")
+        article_count = await articles.count()
+        for index in range(min(article_count, _MAX_PERMALINK_CANDIDATES)):
+            article = articles.nth(index)
+            if not await self._is_outside_content_landmark(article):
+                return article
+        if article_count:
+            return articles.nth(min(article_count, _MAX_PERMALINK_CANDIDATES))
+
+        region = await self._content_region()
+        permalinks = region.locator('a[href*="/post/"]')
+        count = await permalinks.count()
+        for index in range(min(count, _MAX_PERMALINK_CANDIDATES)):
+            permalink = permalinks.nth(index)
+            if await self._is_outside_content_landmark(permalink):
+                continue
+            href = await permalink.get_attribute("href")
+            if href is None or _post_url(href) is None:
+                raise UiReadError("POST_PROVENANCE_UNVERIFIED")
+            return permalink
+        return permalinks.nth(min(count, _MAX_PERMALINK_CANDIDATES))
+
+    async def _wait_for_pending_card(
+        self,
+        pending: _CardNotReady,
+        deadline: float,
+        timeout_code: str,
+    ) -> None:
+        remaining = self._remaining_readiness_ms(deadline, timeout_code)
+        try:
+            if pending.in_viewport:
+                await expect(pending.locator).to_be_in_viewport(timeout=remaining)
+            elif pending.nonempty_text:
+                await expect(pending.locator).to_be_visible(timeout=remaining)
+                await expect(pending.locator).to_have_text(
+                    re.compile(r"\S"),
+                    timeout=self._remaining_readiness_ms(deadline, timeout_code),
+                )
+            else:
+                await expect(pending.locator).to_be_visible(timeout=remaining)
+        except (AssertionError, PlaywrightTimeoutError):
+            raise UiReadError(pending.timeout_code or timeout_code) from None
+
+    async def _wait_for_scroll_movement(
+        self,
+        permalink: Locator,
+        initial_y: float,
+        deadline: float,
+    ) -> None:
+        handle = await permalink.element_handle()
+        if handle is None:
+            raise UiReadError("HOME_SCROLL_UNVERIFIED")
+        try:
+            await self._page.wait_for_function(
+                "([element, initialY]) => !element.isConnected "
+                "|| Math.abs(element.getBoundingClientRect().y - initialY) > 1",
+                arg=[handle, initial_y],
+                timeout=self._remaining_readiness_ms(deadline, "HOME_SCROLL_UNVERIFIED"),
+                polling="raf",
+            )
+        except PlaywrightTimeoutError:
+            raise UiReadError("HOME_SCROLL_UNVERIFIED") from None
+        except PlaywrightError:
+            raise UiReadError("HOME_SCROLL_UNVERIFIED") from None
+        finally:
+            try:
+                await handle.dispose()
+            except PlaywrightError:
+                pass
+        self._remaining_readiness_ms(deadline, "HOME_SCROLL_UNVERIFIED")
 
     async def _visible_targets(
         self,
@@ -407,6 +548,7 @@ class ThreadsHomeReader:
     ) -> tuple[Locator, dict[str, float]]:
         ancestor = permalink
         smallest_without_body: tuple[Locator, dict[str, float]] | None = None
+        pending_author: Locator | None = None
         for _ in range(_MAX_CARD_ANCESTORS):
             ancestor = ancestor.locator("xpath=..")
             if await ancestor.count() == 0:
@@ -436,6 +578,8 @@ class ThreadsHomeReader:
                 if parsed_post is not None:
                     post_authors[parsed_post[0]] = parsed_post[1]
                     continue
+                if "/post/" in href:
+                    raise UiReadError("POST_PROVENANCE_UNVERIFIED")
                 author = _profile_author(href)
                 if author is not None:
                     authors.add(author)
@@ -449,11 +593,13 @@ class ThreadsHomeReader:
                 raise UiReadError("POST_PROVENANCE_UNVERIFIED")
             if authors and expected_author not in authors:
                 raise UiReadError("POST_AUTHOR_UNVERIFIED")
-            if not authors:
-                continue
 
             box = await ancestor.bounding_box()
             if box is None:
+                continue
+            if not authors:
+                if pending_author is None:
+                    pending_author = self._profile_link_signal(ancestor)
                 continue
             candidate = (ancestor, box)
             if smallest_without_body is None:
@@ -465,9 +611,15 @@ class ThreadsHomeReader:
             if paragraph_count == 1 and await paragraphs.first.is_visible():
                 return candidate
 
+        if pending_author is not None:
+            raise _CardNotReady(pending_author)
         if smallest_without_body is not None:
             return smallest_without_body
         raise UiReadError("POST_PROVENANCE_UNVERIFIED")
+
+    @staticmethod
+    def _profile_link_signal(root: Locator) -> Locator:
+        return root.locator('a[href*="/@" i]:not([href*="/post/" i])').first
 
     async def _visible_permalink_targets(
         self,
@@ -496,7 +648,11 @@ class ThreadsHomeReader:
                 continue
             href = await permalink.get_attribute("href")
             parsed_post = None if href is None else _post_url(href)
-            if parsed_post is None or parsed_post[0] in targets_by_url:
+            if parsed_post is None:
+                if href is not None and "/post/" in href:
+                    raise UiReadError("POST_PROVENANCE_UNVERIFIED")
+                continue
+            if parsed_post[0] in targets_by_url:
                 continue
             permalink_box = await permalink.bounding_box()
             if permalink_box is None or not self._intersects_viewport(permalink_box, viewport):
@@ -531,31 +687,58 @@ class ThreadsHomeReader:
     async def read_detail(self, target: PostTarget) -> PostTarget:
         if not target.visible_after_scroll:
             raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED")
+        deadline = self._readiness_deadline(_DETAIL_TIMEOUT_MS)
         try:
-            await target.permalink.click(timeout=_DETAIL_TIMEOUT_MS)
-            await self._page.wait_for_url(target.url, timeout=_DETAIL_TIMEOUT_MS)
+            remaining = self._remaining_readiness_ms(
+                deadline,
+                "DETAIL_NAVIGATION_UNVERIFIED",
+            )
+            await target.permalink.click(timeout=remaining)
+            await self._page.wait_for_url(
+                target.url,
+                timeout=self._remaining_readiness_ms(
+                    deadline,
+                    "DETAIL_NAVIGATION_UNVERIFIED",
+                ),
+            )
         except PlaywrightTimeoutError:
             raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED") from None
         if not _same_home_origin(self._page.url):
             raise UiReadError("OFF_ORIGIN_REDIRECT")
-        await self._check_blocker()
-        articles = self._page.get_by_role("article")
-        matching: list[Locator] = []
-        for index in range(await articles.count()):
-            article = articles.nth(index)
-            for link in await article.get_by_role("link").all():
-                href = await link.get_attribute("href")
-                parsed = None if href is None else _post_url(href)
-                if parsed is not None and parsed[0] == target.url:
-                    matching.append(article)
-                    break
-        if len(matching) > 1:
+        detail: PostTarget | None = None
+        for _ in range(_MAX_READINESS_RECHECKS):
+            await self._check_blocker()
+            try:
+                articles = self._page.get_by_role("article")
+                matching: list[Locator] = []
+                for index in range(await articles.count()):
+                    article = articles.nth(index)
+                    for link in await article.get_by_role("link").all():
+                        href = await link.get_attribute("href")
+                        parsed = None if href is None else _post_url(href)
+                        if parsed is not None and parsed[0] == target.url:
+                            matching.append(article)
+                            break
+                        if href is not None and "/post/" in href and parsed is None:
+                            raise UiReadError("DETAIL_ROOT_UNVERIFIED")
+                if len(matching) > 1:
+                    raise UiReadError("DETAIL_ROOT_UNVERIFIED")
+                root = matching[0] if matching else await self._detail_permalink_card(target)
+                detail = await self._read_card(
+                    root,
+                    require_body=target.body is not None,
+                )
+                self._remaining_readiness_ms(deadline, "DETAIL_ROOT_UNVERIFIED")
+            except _CardNotReady as pending:
+                await self._wait_for_pending_card(
+                    pending,
+                    deadline,
+                    pending.timeout_code or "DETAIL_ROOT_UNVERIFIED",
+                )
+                continue
+            break
+        if detail is None:
             raise UiReadError("DETAIL_ROOT_UNVERIFIED")
-        if matching:
-            root = matching[0]
-        else:
-            root = await self._detail_permalink_card(target)
-        detail = await self._read_card(root)
         if detail.url != target.url or detail.author != target.author:
             raise UiReadError("DETAIL_PROVENANCE_UNVERIFIED")
         if detail.body is None or target.body is None or detail.body != target.body:
@@ -574,7 +757,11 @@ class ThreadsHomeReader:
                 continue
             href = await permalink.get_attribute("href")
             parsed_post = None if href is None else _post_url(href)
-            if parsed_post is None or parsed_post[0] != target.url:
+            if parsed_post is None:
+                if href is not None and "/post/" in href:
+                    raise UiReadError("DETAIL_ROOT_UNVERIFIED")
+                continue
+            if parsed_post[0] != target.url:
                 continue
             try:
                 root, _ = await self._resolve_permalink_card(
@@ -587,28 +774,32 @@ class ThreadsHomeReader:
                     raise UiReadError("DETAIL_ROOT_UNVERIFIED") from None
                 raise
             return root
-        raise UiReadError("DETAIL_ROOT_UNVERIFIED")
+        path = urlsplit(target.url).path
+        matching_permalink = region.locator(f'a[href$="{path}"]')
+        raise _CardNotReady(matching_permalink.first, in_viewport=True)
 
     async def return_to_home(self) -> None:
         await self._go_back_to_home()
         await self.verify_actor()
+        await self._wait_for_home_targets(
+            1,
+            timeout_code="FEED_UI_UNVERIFIED",
+        )
     async def _for_you_control(self) -> Locator:
         matches: list[Locator] = []
-        for role in ("link", "tab"):
-            controls = self._page.get_by_role(role, name=_FOR_YOU_NAME)
-            try:
-                await controls.first.wait_for(
-                    state="visible",
-                    timeout=_READINESS_TIMEOUT_MS,
-                )
-            except PlaywrightTimeoutError:
-                continue
+        links = self._page.get_by_role("link", name=_FOR_YOU_NAME)
+        tabs = self._page.get_by_role("tab", name=_FOR_YOU_NAME)
+        try:
+            await expect(links.or_(tabs).first).to_be_visible(
+                timeout=_READINESS_TIMEOUT_MS
+            )
+        except (AssertionError, PlaywrightTimeoutError):
+            raise UiReadError("HOME_UI_UNVERIFIED") from None
+        for controls in (links, tabs):
             for index in range(await controls.count()):
                 control = controls.nth(index)
                 if await control.is_visible():
                     matches.append(control)
-            if matches:
-                break
         if len(matches) != 1:
             raise UiReadError("HOME_UI_UNVERIFIED")
         return matches[0]
@@ -676,9 +867,10 @@ class ThreadsHomeReader:
         *,
         visible_after_scroll: bool = False,
         viewport_y: float = 0.0,
+        require_body: bool = False,
     ) -> PostTarget:
         if not await article.is_visible():
-            raise UiReadError("POST_NOT_VISIBLE")
+            raise _CardNotReady(article)
         post_links: list[tuple[str, str, Locator]] = []
         authors: set[str] = set()
         for link in await article.get_by_role("link").all():
@@ -689,6 +881,8 @@ class ThreadsHomeReader:
             if parsed_post is not None:
                 post_links.append((parsed_post[0], parsed_post[1], link))
                 continue
+            if "/post/" in href:
+                raise UiReadError("POST_PROVENANCE_UNVERIFIED")
             author = _profile_author(href)
             if author is not None:
                 authors.add(author)
@@ -696,7 +890,13 @@ class ThreadsHomeReader:
         unique_permalink_links = {
             (item[0], item[1]) for item in post_links
         }
-        if len(unique_urls) != 1 or len(unique_permalink_links) != 1 or len(authors) != 1:
+        if len(unique_urls) > 1 or len(unique_permalink_links) > 1 or len(authors) > 1:
+            raise UiReadError("POST_PROVENANCE_UNVERIFIED")
+        if not post_links:
+            raise _CardNotReady(article.locator('a[href*="/post/"]').first)
+        if not authors:
+            raise _CardNotReady(self._profile_link_signal(article))
+        if len(unique_urls) != 1 or len(unique_permalink_links) != 1:
             raise UiReadError("POST_PROVENANCE_UNVERIFIED")
         url, permalink_author, link = post_links[0]
         author = next(iter(authors))
@@ -716,6 +916,24 @@ class ThreadsHomeReader:
                     and await more_buttons.count() == 0
                 ):
                     body = candidate
+                elif require_body and not candidate:
+                    raise _CardNotReady(
+                        paragraph,
+                        nonempty_text=True,
+                        timeout_code="DETAIL_BODY_UNVERIFIED",
+                    )
+            elif require_body:
+                raise _CardNotReady(
+                    paragraph,
+                    nonempty_text=True,
+                    timeout_code="DETAIL_BODY_UNVERIFIED",
+                )
+        elif require_body and await paragraphs.count() == 0:
+            raise _CardNotReady(
+                paragraphs.first,
+                nonempty_text=True,
+                timeout_code="DETAIL_BODY_UNVERIFIED",
+            )
         fingerprint = sha256(f"{url}\n{author}".encode()).hexdigest()
         return PostTarget(
             url,

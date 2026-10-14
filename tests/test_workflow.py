@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit
@@ -291,6 +292,234 @@ def test_non_article_permalink_cards_sample_and_verify_detail() -> None:
         assert page.url == HOME_URL
 
     _run_offline_page(feed_html, exercise)
+
+
+def test_delayed_home_feed_after_profile_return_is_sampled() -> None:
+    actor = "offline.operator"
+    feed_html = f"""<!doctype html><html><head><style>
+.post-card {{ box-sizing: border-box; height: 760px; padding-top: 80px; }}
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a id="profile" aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main></main><script>
+const main = document.querySelector("main");
+document.querySelector("#profile").addEventListener("click", () => main.replaceChildren());
+window.addEventListener("pageshow", () => {{
+  const shows = Number(sessionStorage.getItem("home-shows") || "0") + 1;
+  sessionStorage.setItem("home-shows", String(shows));
+  if (shows >= 3) setTimeout(() => {{
+    main.innerHTML = `
+      <div class="post-card"><a href="/@candidate/post/delayed-first"><time>2h</time></a>
+        <a href="/@candidate">@candidate</a><p>A weather update</p></div>
+      <div class="post-card"><a href="/@candidate/post/delayed-second"><time>1h</time></a>
+        <a href="/@candidate">@candidate</a><p>Another update</p></div>`;
+  }}, 100);
+}});
+window.addEventListener("wheel", event => {{
+  event.preventDefault();
+  setTimeout(() => window.scrollBy(0, 850), 100);
+}}, {{ once: true, passive: false }});
+</script></body></html>"""
+
+    async def exercise(page) -> None:
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        sample = await reader.sample_and_scroll(2)
+        assert reader.scroll_attempts == 1
+        assert reader.scrolls == 1
+        assert len(sample.observed_targets) >= 1
+        assert any("delayed-" in target.url for target in sample.observed_targets)
+
+    _run_offline_page(feed_html, exercise)
+
+
+def test_delayed_wheel_and_detail_hydration_return_to_home() -> None:
+    actor = "offline.operator"
+    detail_url = "https://www.threads.com/@candidate/post/ready-detail"
+    detail_body = "Hiring a frontend engineer in Vietnam"
+    feed_html = f"""<!doctype html><html><head><style>
+.post-card {{ box-sizing: border-box; height: 760px; padding-top: 80px; }}
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a id="profile" aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main>
+  <div class="post-card"><a href="/@candidate/post/first"><time>2h</time></a>
+    <a href="/@candidate">@candidate</a><p>A weather update</p></div>
+  <div class="post-card"><a href="/@candidate/post/ready-detail"><time>1h</time></a>
+    <a href="/@candidate">@candidate</a><p>{detail_body}</p></div>
+</main><script>
+window.addEventListener("wheel", event => {{
+  event.preventDefault();
+  setTimeout(() => window.scrollBy(0, 850), 100);
+}}, {{ once: true, passive: false }});
+const main = document.querySelector("main");
+const restoreFeed = () => main.innerHTML = `
+  <div class="post-card"><a href="/@candidate/post/first"><time>2h</time></a>
+    <a href="/@candidate">@candidate</a><p>A weather update</p></div>
+  <div class="post-card"><a href="/@candidate/post/ready-detail"><time>1h</time></a>
+    <a href="/@candidate">@candidate</a><p>{detail_body}</p></div>`;
+if (sessionStorage.getItem("return-feed") === "cleared") main.replaceChildren();
+window.addEventListener("pageshow", () => {{
+  if (sessionStorage.getItem("return-feed") === "cleared") {{
+    sessionStorage.setItem("return-feed", "rendering");
+    setTimeout(restoreFeed, 300);
+  }}
+}});
+document.querySelector("#profile").addEventListener("click", () => {{
+  if (sessionStorage.getItem("return-feed") === "armed") {{
+    main.replaceChildren();
+    sessionStorage.setItem("return-feed", "cleared");
+  }} else {{
+    sessionStorage.setItem("return-feed", "armed");
+  }}
+}});
+</script></body></html>"""
+
+    async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=f"""<!doctype html><html><body><main><div id="detail">
+<a href="/@candidate/post/ready-detail"><time>1h</time></a>
+<script>
+setTimeout(() => document.querySelector("#detail").insertAdjacentHTML(
+  "beforeend", '<a href="/@candidate">@candidate</a><p>{detail_body}</p>'
+), 100);
+</script></div></main></body></html>""",
+            )
+
+        await page.route(detail_url, serve_detail)
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        sample = await reader.sample_and_scroll(2)
+        target = next(target for target in sample.targets if target.url == detail_url)
+        assert target.body == detail_body
+        detail = await reader.read_detail(target)
+        assert detail.url == detail_url
+        assert detail.author == "candidate"
+        assert detail.body == detail_body
+        await reader.return_to_home()
+        assert page.url == HOME_URL
+        home_targets, _ = await reader._visible_targets(1)
+        assert home_targets
+
+    _run_offline_page(feed_html, exercise)
+
+
+def test_readiness_timeouts_do_not_complete_checkpoint_and_bad_provenance_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actor = "offline.operator"
+    target_url = "https://www.threads.com/@candidate/post/pending-detail"
+    relevant_body = "Hiring a frontend engineer"
+    feed_html = f"""<!doctype html><html><head><style>
+.post-card {{ box-sizing: border-box; height: 760px; padding-top: 80px; }}
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main>
+  <div class="post-card"><a href="/@candidate/post/first"><time>2h</time></a>
+    <a href="/@candidate">@candidate</a><p>A weather update</p></div>
+  <div class="post-card"><a href="/@candidate/post/pending-detail"><time>1h</time></a>
+    <a href="/@candidate">@candidate</a><p>{relevant_body}</p></div>
+</main><script>
+window.addEventListener("wheel", event => {{
+  event.preventDefault();
+  setTimeout(() => window.scrollBy(0, 850), 40);
+}}, {{ once: true, passive: false }});
+</script></body></html>"""
+    async def timeout_exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=(
+                    '<!doctype html><html><body><main><div>'
+                    '<a href="/@candidate/post/pending-detail"><time>1h</time></a>'
+                    '<a href="/@candidate">@candidate</a>'
+                    "</div></main></body></html>"
+                ),
+            )
+
+        await page.route(target_url, serve_detail)
+        with pytest.raises(UiReadError) as caught:
+            await workflow.run_page_workflow(
+                page,
+                account,
+                store,
+                max_posts=1,
+                terms=("hiring", "engineer"),
+            )
+        assert caught.value.code == "DETAIL_BODY_UNVERIFIED"
+
+    monkeypatch.setattr(reader_module, "_READINESS_TIMEOUT_MS", 1_000)
+    monkeypatch.setattr(reader_module, "_DETAIL_TIMEOUT_MS", 1_000)
+    with tempfile.TemporaryDirectory(prefix="threads-browser-readiness-") as synthetic_root:
+        synthetic_path = Path(synthetic_root)
+        data_root = synthetic_path / "data"
+        profile = synthetic_path / "profile"
+        profile.mkdir()
+        account = AccountStore(data_root).add("offline", actor, profile)
+        store = CheckpointStore(data_root)
+        _run_offline_page(feed_html, timeout_exercise)
+        policy = policy_fingerprint(canonical_terms(("hiring", "engineer")))
+        assert store.load(account.account_id, policy).completed_runs == 0
+        assert store.load(account.account_id, policy).detail_reads == 0
+
+    malformed_html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main><div>
+  <a href="/@candidate/post/one"><time>2h</time></a>
+  <a href="/@quoted/post/two"><time>1h</time></a>
+  <a href="/@candidate">@candidate</a><a href="/@quoted">@quoted</a>
+  <p>Two identities in one card.</p>
+</div></main></body></html>"""
+
+    async def malformed_exercise(page) -> None:
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        with pytest.raises(UiReadError) as caught:
+            await reader.sample_and_scroll(2)
+        assert caught.value.code == "POST_PROVENANCE_UNVERIFIED"
+        assert reader.scroll_attempts == 0
+
+    _run_offline_page(malformed_html, malformed_exercise)
+
+    no_movement_html = f"""<!doctype html><html><head><style>
+.post-card {{ box-sizing: border-box; height: 760px; padding-top: 80px; }}
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main>
+  <div class="post-card"><a href="/@candidate/post/first"><time>2h</time></a>
+    <a href="/@candidate">@candidate</a><p>A weather update</p></div>
+  <div class="post-card"><a href="/@candidate/post/second"><time>1h</time></a>
+    <a href="/@candidate">@candidate</a><p>Another update</p></div>
+</main></body></html>"""
+
+    async def no_movement_exercise(page) -> None:
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+
+        async def wheel_without_movement(_delta_x: float, _delta_y: float) -> None:
+            return None
+
+        monkeypatch.setattr(page.mouse, "wheel", wheel_without_movement)
+        monkeypatch.setattr(reader_module, "_READINESS_TIMEOUT_MS", 1_000)
+        with pytest.raises(UiReadError) as caught:
+            await reader.sample_and_scroll(2)
+        assert caught.value.code == "HOME_SCROLL_UNVERIFIED"
+        assert reader.scroll_attempts == 1
+        assert reader.scrolls == 0
+
+    _run_offline_page(no_movement_html, no_movement_exercise)
 
 
 def test_non_article_mixed_permalink_container_fails_closed() -> None:
