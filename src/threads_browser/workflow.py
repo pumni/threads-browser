@@ -20,6 +20,7 @@ from .storage import (
     BrowserDataError,
     Checkpoint,
     CheckpointStore,
+    ensure_safe_browser_profile,
 )
 
 _MAX_SEEN = 5_000
@@ -29,11 +30,13 @@ _MAX_SEEN = 5_000
 class NurtureResult:
     status: str
     home_sampled: int
+    home_new: int
     home_relevant: int
     home_irrelevant: int
     home_unknown: int
     duplicates: int
     detail_reads: int
+    scroll_attempts: int
     scrolls: int
     checkpoint_runs: int
     home_relevant_ratio: float | None
@@ -65,28 +68,25 @@ async def run_page_workflow(
     previously_seen = set(checkpoint.seen_fingerprints)
     seen_this_run: set[str] = set()
     new_targets = []
-    duplicates = 0
-    duplicate_relevant = False
-    for target in targets:
-        if target.fingerprint in previously_seen or target.fingerprint in seen_this_run:
-            duplicates += 1
-            duplicate_relevant = (
-                duplicate_relevant
-                or classify_body(target.body, normalized_terms) == "RELEVANT"
-            )
-            continue
-        seen_this_run.add(target.fingerprint)
-        new_targets.append(target)
-
+    duplicates = reader.feed_duplicates
     relevant = 0
     irrelevant = 0
     unknown = 0
     selected = None
-    for target in new_targets:
+    new_relevant = False
+    for target in targets:
+        is_new = target.fingerprint not in previously_seen and target.fingerprint not in seen_this_run
+        if is_new:
+            seen_this_run.add(target.fingerprint)
+            new_targets.append(target)
+        else:
+            duplicates += 1
         decision = classify_body(target.body, normalized_terms)
         if decision == "RELEVANT":
             relevant += 1
-            if selected is None:
+            if is_new:
+                new_relevant = True
+            if is_new and target.visible_after_scroll and selected is None:
                 selected = target
         elif decision == "IRRELEVANT":
             irrelevant += 1
@@ -99,7 +99,9 @@ async def run_page_workflow(
         await reader.return_to_home()
         detail_reads = 1
         status = "COMPLETE"
-    elif duplicate_relevant:
+    elif new_relevant:
+        status = "RELEVANT_POST_NOT_CURRENT"
+    elif relevant:
         status = "NO_NEW_RELEVANT_POST"
     else:
         status = "NO_RELEVANT_POST"
@@ -111,25 +113,29 @@ async def run_page_workflow(
         account.account_id,
         fingerprint,
         completed_runs=checkpoint.completed_runs + 1,
-        home_sampled=checkpoint.home_sampled + len(new_targets),
+        home_sampled=checkpoint.home_sampled + len(targets),
+        home_new=checkpoint.home_new + len(new_targets),
         home_relevant=checkpoint.home_relevant + relevant,
         home_irrelevant=checkpoint.home_irrelevant + irrelevant,
         home_unknown=checkpoint.home_unknown + unknown,
         duplicates=checkpoint.duplicates + duplicates,
         detail_reads=checkpoint.detail_reads + detail_reads,
+        scroll_attempts=checkpoint.scroll_attempts + reader.scroll_attempts,
         scrolls=checkpoint.scrolls + reader.scrolls,
         seen_fingerprints=tuple(seen),
     )
     checkpoint_store.save(updated)
-    ratio = None if not new_targets else relevant / len(new_targets)
+    ratio = None if not targets else relevant / len(targets)
     return NurtureResult(
         status=status,
-        home_sampled=len(new_targets),
+        home_sampled=len(targets),
+        home_new=len(new_targets),
         home_relevant=relevant,
         home_irrelevant=irrelevant,
         home_unknown=unknown,
         duplicates=duplicates,
         detail_reads=detail_reads,
+        scroll_attempts=reader.scroll_attempts,
         scrolls=reader.scrolls,
         checkpoint_runs=updated.completed_runs,
         home_relevant_ratio=ratio,
@@ -143,6 +149,7 @@ async def run_browser_nurture(
     max_posts: int,
     terms: tuple[str, ...],
 ) -> NurtureResult:
+    ensure_safe_browser_profile(account.profile_directory)
     try:
         async with async_playwright() as playwright:
             context = await playwright.chromium.launch_persistent_context(

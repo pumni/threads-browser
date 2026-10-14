@@ -23,7 +23,6 @@ THREADS_ORIGIN = "https://www.threads.com"
 HOME_URL = f"{THREADS_ORIGIN}/"
 _NAVIGATION_TIMEOUT_MS = 20_000
 _DETAIL_TIMEOUT_MS = 15_000
-_SCROLL_WAIT_MS = 1_500
 _READINESS_TIMEOUT_MS = 8_000
 _MAX_BODY_CODEPOINTS = 10_000
 _USERNAME = re.compile(r"[A-Za-z0-9._]{1,30}")
@@ -49,6 +48,8 @@ class PostTarget:
     body: str | None = field(repr=False)
     fingerprint: str
     permalink: Locator = field(repr=False)
+    visible_after_scroll: bool = field(default=False, repr=False)
+    viewport_y: float = field(default=0.0, repr=False)
 
     def __repr__(self) -> str:
         return "PostTarget(<private>)"
@@ -123,7 +124,9 @@ class ThreadsHomeReader:
         self._page = page
         self._expected_actor = expected_actor.casefold()
         self._home_url = HOME_URL
+        self.scroll_attempts = 0
         self.scrolls = 0
+        self.feed_duplicates = 0
 
     async def open_home(self) -> None:
         try:
@@ -140,9 +143,7 @@ class ThreadsHomeReader:
         destination = None if href is None else urljoin(self._page.url, href)
         if destination is not None and not _same_home_origin(destination):
             raise UiReadError("OFF_ORIGIN_REDIRECT")
-        current = await control.get_attribute("aria-current")
-        selected = await control.get_attribute("aria-selected")
-        if current != "page" and selected != "true":
+        if not await self._for_you_is_active(control):
             try:
                 await control.click(timeout=_NAVIGATION_TIMEOUT_MS)
                 if destination is not None and destination != self._page.url:
@@ -153,6 +154,9 @@ class ThreadsHomeReader:
             except PlaywrightTimeoutError:
                 raise UiReadError("HOME_UI_UNVERIFIED") from None
         await self._require_feed_url()
+        active = await self._for_you_is_active(control)
+        if not active and not self._is_for_you_route(self._page.url):
+            raise UiReadError("HOME_UI_UNVERIFIED")
         self._home_url = self._page.url
         await self.verify_actor()
     async def verify_actor(self) -> None:
@@ -183,31 +187,83 @@ class ThreadsHomeReader:
     async def sample_and_scroll(self, max_posts: int) -> tuple[PostTarget, ...]:
         if not 1 <= max_posts <= 20:
             raise UiReadError("POST_LIMIT_INVALID")
-        articles = self._page.get_by_role("article")
-        before = await articles.count()
+        before, scroll_anchor = await self._visible_targets(max_posts)
+        if not before or scroll_anchor is None:
+            raise UiReadError("FEED_UI_UNVERIFIED")
+        before_by_fingerprint = {target.fingerprint: target for target in before}
+        self.feed_duplicates = len(before) - len(before_by_fingerprint)
+        self.scroll_attempts = 0
         self.scrolls = 0
         try:
+            await self._page.mouse.move(
+                scroll_anchor["x"] + scroll_anchor["width"] / 2,
+                scroll_anchor["y"] + scroll_anchor["height"] / 2,
+            )
+            self.scroll_attempts = 1
             await self._page.mouse.wheel(0, 850)
         except PlaywrightError:
             raise UiReadError("HOME_SCROLL_FAILED") from None
-        self.scrolls = 1
-        if before < max_posts:
-            try:
-                await articles.nth(before).wait_for(
-                    state="visible",
-                    timeout=_SCROLL_WAIT_MS,
-                )
-            except PlaywrightTimeoutError:
-                pass
+        after, _ = await self._visible_targets(max_posts, visible_after_scroll=True)
         await self._require_feed_url()
-        count = min(await articles.count(), max_posts)
-        if count == 0:
+        after_by_fingerprint = {target.fingerprint: target for target in after}
+        self.feed_duplicates += len(after) - len(after_by_fingerprint)
+        self.scrolls = int(
+            any(
+                fingerprint not in before_by_fingerprint
+                or abs(target.viewport_y - before_by_fingerprint[fingerprint].viewport_y) > 1
+                for fingerprint, target in after_by_fingerprint.items()
+            )
+        )
+        targets = dict(before_by_fingerprint)
+        for fingerprint, target in after_by_fingerprint.items():
+            if fingerprint in targets:
+                self.feed_duplicates += 1
+            targets[fingerprint] = target
+        return tuple(list(targets.values())[:max_posts])
+
+    async def _visible_targets(
+        self,
+        max_posts: int,
+        *,
+        visible_after_scroll: bool = False,
+    ) -> tuple[tuple[PostTarget, ...], dict[str, float] | None]:
+        articles = self._page.get_by_role("article")
+        viewport = self._page.viewport_size
+        if viewport is None:
             raise UiReadError("FEED_UI_UNVERIFIED")
         targets: list[PostTarget] = []
-        for index in range(count):
-            targets.append(await self._read_card(articles.nth(index)))
-        return tuple(targets)
+        scroll_anchor: dict[str, float] | None = None
+        article_count = await articles.count()
+        scan_limit = min(article_count, max_posts + 20)
+        visible_limit = max_posts
+        for index in range(scan_limit):
+            article = articles.nth(index)
+            if not await article.is_visible():
+                continue
+            box = await article.bounding_box()
+            if (
+                box is None
+                or box["x"] >= viewport["width"]
+                or box["y"] >= viewport["height"]
+                or box["x"] + box["width"] <= 0
+                or box["y"] + box["height"] <= 0
+            ):
+                continue
+            if scroll_anchor is None:
+                scroll_anchor = box
+            targets.append(
+                await self._read_card(
+                    article,
+                    visible_after_scroll=visible_after_scroll,
+                    viewport_y=box["y"],
+                )
+            )
+            if len(targets) >= visible_limit:
+                break
+        return tuple(targets), scroll_anchor
     async def read_detail(self, target: PostTarget) -> PostTarget:
+        if not target.visible_after_scroll:
+            raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED")
         try:
             await target.permalink.click(timeout=_DETAIL_TIMEOUT_MS)
             await self._page.wait_for_url(target.url, timeout=_DETAIL_TIMEOUT_MS)
@@ -268,6 +324,27 @@ class ThreadsHomeReader:
             raise UiReadError("HOME_UI_UNVERIFIED")
         return matches[0]
 
+    @staticmethod
+    async def _for_you_is_active(control: Locator) -> bool:
+        return (
+            await control.get_attribute("aria-current") == "page"
+            or await control.get_attribute("aria-selected") == "true"
+        )
+
+    @staticmethod
+    def _is_for_you_route(value: str) -> bool:
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            return False
+        return (
+            parsed.scheme == "https"
+            and parsed.netloc.casefold() == "www.threads.com"
+            and parsed.path == "/for_you"
+            and not parsed.query
+            and not parsed.fragment
+        )
+
     async def _require_feed_url(self) -> None:
         if not _same_home_origin(self._page.url):
             raise UiReadError("OFF_ORIGIN_REDIRECT")
@@ -304,7 +381,13 @@ class ThreadsHomeReader:
             for marker in ("rate limit", "too many requests", "try again later", "temporarily blocked")
         ):
             raise UiReadError("RATE_LIMITED")
-    async def _read_card(self, article: Locator) -> PostTarget:
+    async def _read_card(
+        self,
+        article: Locator,
+        *,
+        visible_after_scroll: bool = False,
+        viewport_y: float = 0.0,
+    ) -> PostTarget:
         if not await article.is_visible():
             raise UiReadError("POST_NOT_VISIBLE")
         post_links: list[tuple[str, str, Locator]] = []
@@ -345,4 +428,12 @@ class ThreadsHomeReader:
                 ):
                     body = candidate
         fingerprint = sha256(f"{url}\n{author}".encode()).hexdigest()
-        return PostTarget(url, author, body, fingerprint, link)
+        return PostTarget(
+            url,
+            author,
+            body,
+            fingerprint,
+            link,
+            visible_after_scroll,
+            viewport_y,
+        )

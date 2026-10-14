@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -30,11 +31,13 @@ _CHECKPOINT_KEYS = {
     "policy_fingerprint",
     "completed_runs",
     "home_sampled",
+    "home_new",
     "home_relevant",
     "home_irrelevant",
     "home_unknown",
     "duplicates",
     "detail_reads",
+    "scroll_attempts",
     "scrolls",
     "seen_fingerprints",
 }
@@ -84,6 +87,65 @@ def normalize_actor(value: object) -> str:
     if _ACTOR.fullmatch(actor) is None:
         raise BrowserDataError("ACCOUNT_INVALID")
     return actor.casefold()
+
+
+def ensure_safe_browser_profile(profile_directory: Path) -> None:
+    """Reject the default desktop browser data roots without reading their contents."""
+    try:
+        candidate = profile_directory.expanduser().resolve(strict=False)
+        if os.name == "nt":
+            local_app_data = os.environ.get("LOCALAPPDATA")
+            local = (
+                Path(local_app_data)
+                if local_app_data is not None and local_app_data.strip()
+                else Path.home() / "AppData" / "Local"
+            )
+            roots = tuple(
+                local / "Google" / name / "User Data"
+                for name in ("Chrome", "Chrome Beta", "Chrome Dev", "Chrome SxS")
+            ) + tuple(
+                local / "Microsoft" / name / "User Data"
+                for name in ("Edge", "Edge Beta", "Edge Dev", "Edge SxS")
+            )
+        elif sys.platform == "darwin":
+            support = Path.home() / "Library" / "Application Support"
+            roots = tuple(
+                support / "Google" / name
+                for name in ("Chrome", "Chrome Beta", "Chrome Dev", "Chrome Canary")
+            ) + tuple(
+                support / name
+                for name in ("Microsoft Edge", "Microsoft Edge Beta", "Microsoft Edge Dev", "Microsoft Edge Canary")
+            )
+        else:
+            config = Path.home() / ".config"
+            roots = tuple(
+                config / name
+                for name in (
+                    "google-chrome",
+                    "google-chrome-beta",
+                    "google-chrome-unstable",
+                    "chromium",
+                    "microsoft-edge",
+                    "microsoft-edge-beta",
+                    "microsoft-edge-dev",
+                    "microsoft-edge-canary",
+                )
+            )
+        candidate_path = os.path.normcase(os.path.abspath(candidate)).casefold()
+        for root in roots:
+            root_path = (
+                os.path.normcase(os.path.abspath(root.expanduser().resolve(strict=False)))
+                .casefold()
+            )
+            try:
+                if os.path.commonpath((candidate_path, root_path)) == root_path:
+                    raise BrowserDataError("PROFILE_UNAVAILABLE")
+            except ValueError:
+                continue
+    except BrowserDataError:
+        raise
+    except (OSError, RuntimeError, ValueError):
+        raise BrowserDataError("PROFILE_UNAVAILABLE") from None
 
 
 def resolve_data_root(environment: Mapping[str, str] | None = None) -> Path:
@@ -228,6 +290,7 @@ class AccountStore:
             raise BrowserDataError("PROFILE_UNAVAILABLE") from None
         if not profile.is_dir():
             raise BrowserDataError("PROFILE_UNAVAILABLE")
+        ensure_safe_browser_profile(profile)
 
         root = _ensure_root(self._data_root)
         lock_path = root / "locks" / "registry.lock"
@@ -295,14 +358,16 @@ class Checkpoint:
     policy_fingerprint: str
     completed_runs: int = 0
     home_sampled: int = 0
+    home_new: int = 0
     home_relevant: int = 0
     home_irrelevant: int = 0
     home_unknown: int = 0
     duplicates: int = 0
     detail_reads: int = 0
+    scroll_attempts: int = 0
     scrolls: int = 0
     seen_fingerprints: tuple[str, ...] = field(default=(), repr=False)
-    schema_version: int = 1
+    schema_version: int = 2
 
     def __repr__(self) -> str:
         return (
@@ -318,11 +383,13 @@ class Checkpoint:
             "policy_fingerprint": self.policy_fingerprint,
             "completed_runs": self.completed_runs,
             "home_sampled": self.home_sampled,
+            "home_new": self.home_new,
             "home_relevant": self.home_relevant,
             "home_irrelevant": self.home_irrelevant,
             "home_unknown": self.home_unknown,
             "duplicates": self.duplicates,
             "detail_reads": self.detail_reads,
+            "scroll_attempts": self.scroll_attempts,
             "scrolls": self.scrolls,
             "seen_fingerprints": list(self.seen_fingerprints),
         }
@@ -372,7 +439,7 @@ def _decode_checkpoint(
     if (
         set(document) != _CHECKPOINT_KEYS
         or type(document.get("schema_version")) is not int
-        or document.get("schema_version") != 1
+        or document.get("schema_version") != 2
     ):
         raise BrowserDataError("STATE_INVALID")
     if document.get("account_id") != str(expected_account):
@@ -385,11 +452,13 @@ def _decode_checkpoint(
     for key in (
         "completed_runs",
         "home_sampled",
+        "home_new",
         "home_relevant",
         "home_irrelevant",
         "home_unknown",
         "duplicates",
         "detail_reads",
+        "scroll_attempts",
         "scrolls",
     ):
         value = document.get(key)
@@ -407,8 +476,10 @@ def _decode_checkpoint(
     if (
         counts["home_relevant"] + counts["home_irrelevant"] + counts["home_unknown"]
         != counts["home_sampled"]
-        or counts["detail_reads"] > counts["home_relevant"]
-        or counts["scrolls"] > counts["completed_runs"]
+        or counts["home_new"] > counts["home_sampled"]
+        or counts["detail_reads"] > counts["home_new"]
+        or counts["scrolls"] > counts["scroll_attempts"]
+        or counts["scroll_attempts"] > counts["completed_runs"]
     ):
         raise BrowserDataError("STATE_INVALID")
     return Checkpoint(

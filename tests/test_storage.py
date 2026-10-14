@@ -52,8 +52,10 @@ def test_checkpoint_resume_is_strict_atomic_and_contains_only_fingerprints(
         policy,
         completed_runs=1,
         home_sampled=1,
+        home_new=1,
         home_relevant=1,
         detail_reads=1,
+        scroll_attempts=1,
         scrolls=1,
         seen_fingerprints=("b" * 64,),
     )
@@ -65,6 +67,16 @@ def test_checkpoint_resume_is_strict_atomic_and_contains_only_fingerprints(
     assert "post-body" not in raw
     assert "/@offline.operator/post/123" not in raw
 
+    legacy = json.loads(raw)
+    legacy["schema_version"] = 1
+    checkpoint_path.write_text(json.dumps(legacy), encoding="utf-8")
+    legacy_before = checkpoint_path.read_bytes()
+    with pytest.raises(BrowserDataError) as old_schema:
+        store.load(account_id, policy)
+    assert old_schema.value.code == "STATE_INVALID"
+    assert checkpoint_path.read_bytes() == legacy_before
+
+    checkpoint_path.write_text(raw, encoding="utf-8")
     corrupted = json.loads(raw)
     corrupted["unexpected"] = True
     checkpoint_path.write_text(json.dumps(corrupted), encoding="utf-8")

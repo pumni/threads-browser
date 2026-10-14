@@ -9,9 +9,9 @@ From this repository, install the package and its development tools, then instal
     uv sync
     uv run playwright install chromium
 
-Register an existing signed-in Chromium user-data directory (the directory passed to Playwright as user_data_dir). The command stores only its path reference and expected actor in the private Browser data root; it does not copy or inspect profile contents.
+Register an existing, separately provisioned, dedicated Chromium automation profile (the directory passed to Playwright as user_data_dir). For example, use a path such as `C:\Users\you\AppData\Local\ThreadsBrowser\profiles\my-account`, chosen for this automation by the owner. Do not use the default desktop Chrome or Edge data directory, and do not copy cookies or another profile to work around this restriction. The command stores only the path reference and expected actor in the private Browser data root; it does not copy or inspect profile contents.
 
-    uv run threads-browser account add my-account --actor "@example" --profile-dir "C:\Users\you\AppData\Local\Google\Chrome\User Data"
+    uv run threads-browser account add my-account --actor "@example" --profile-dir "C:\Users\you\AppData\Local\ThreadsBrowser\profiles\my-account"
 
 Run one headed, read-only Home / For You sample. Terms are local relevance hints; they are not search queries and do not navigate to Search.
 
@@ -21,8 +21,8 @@ The data root defaults to %LOCALAPPDATA%\ThreadsBrowser on Windows and ~/.local/
 
 ## Scope and limits
 
-The command verifies the visible profile control against the expected actor, samples accessible post cards, scrolls once, opens at most one relevant unseen card, verifies its URL and author, returns to the feed, and atomically saves counts plus hashed dedupe fingerprints. It never likes, follows, replies, posts, sends messages, or accesses the official API.
+The command verifies that For you is active and checks the visible profile control against the expected actor. It samples visible post cards before and after one wheel action, deduplicates them by permalink, opens at most one relevant unseen card that remains visible after scrolling, verifies its URL and author, returns to the feed, and atomically saves counts plus hashed dedupe fingerprints. `home_sampled` and `home_relevant_ratio` include all distinct cards in the bounded sample for that run; `home_new` and `duplicates` report dedupe counts separately. `scroll_attempts` counts the wheel action, while `scrolls` increases only when the after-sample shows a new permalink or a sampled card changes its viewport position. It never likes, follows, replies, posts, sends messages, or accesses the official API.
 
 Every invocation prints ui=UNVERIFIED_LIVE_UI. The current assumptions are a visible For you link/tab, one Profile/Your profile/Account link in navigation, semantic article cards, a single paragraph body, and an @actor/post permalink. They have only been exercised against a minimal local Chromium page. Owner-run, headed UAT is required to establish compatibility with the current Threads UI. Login, challenge, redirect, ambiguous post, and selector failures stop with a reason code.
 
-The profile lock coordinates processes using this repository and data root. It does not coordinate with threads-standalone; do not open the same profile in both CLIs concurrently.
+The profile lock coordinates processes using this repository and data root. It does not coordinate with threads-standalone; never open the same profile in both CLIs concurrently.
