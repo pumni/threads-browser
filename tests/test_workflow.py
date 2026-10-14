@@ -522,6 +522,137 @@ window.addEventListener("wheel", event => {{
     _run_offline_page(no_movement_html, no_movement_exercise)
 
 
+def test_detached_scroll_anchor_without_feed_displacement_stops_without_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actor = "offline.operator"
+    feed_html = f"""<!doctype html><html><head><style>
+.post-card {{ box-sizing: border-box; height: 760px; padding-top: 80px; }}
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main><div class="post-card" id="old-card">
+  <a href="/@candidate/post/stable"><time>2h</time></a>
+  <a href="/@candidate">@candidate</a><p>A weather update</p>
+</div></main><script>
+window.addEventListener("wheel", event => {{
+  event.preventDefault();
+  const oldCard = document.querySelector("#old-card");
+  oldCard.replaceWith(oldCard.cloneNode(true));
+}}, {{ once: true, passive: false }});
+</script></body></html>"""
+    readers: list[ThreadsHomeReader] = []
+
+    class TrackingReader(ThreadsHomeReader):
+        def __init__(self, page, expected_actor: str) -> None:
+            super().__init__(page, expected_actor)
+            readers.append(self)
+
+    monkeypatch.setattr(workflow, "ThreadsHomeReader", TrackingReader)
+    monkeypatch.setattr(reader_module, "_READINESS_TIMEOUT_MS", 1_000)
+    with tempfile.TemporaryDirectory(prefix="threads-browser-detached-scroll-") as root:
+        synthetic_root = Path(root)
+        profile = synthetic_root / "profile"
+        profile.mkdir()
+        account = AccountStore(synthetic_root / "data").add("offline", actor, profile)
+        store = CheckpointStore(synthetic_root / "data")
+
+        async def exercise(page) -> None:
+            with pytest.raises(UiReadError) as caught:
+                await workflow.run_page_workflow(
+                    page,
+                    account,
+                    store,
+                    max_posts=1,
+                    terms=("hiring",),
+                )
+            assert caught.value.code == "HOME_SCROLL_UNVERIFIED"
+
+        _run_offline_page(feed_html, exercise)
+        policy = policy_fingerprint(canonical_terms(("hiring",)))
+        checkpoint = store.load(account.account_id, policy)
+        assert checkpoint.completed_runs == 0
+        assert checkpoint.scrolls == 0
+        assert readers[0].scroll_attempts == 1
+        assert readers[0].scrolls == 0
+
+
+def test_detail_return_with_inactive_for_you_stops_without_checkpoint() -> None:
+    actor = "offline.operator"
+    detail_url = "https://www.threads.com/@candidate/post/return-check"
+    detail_body = "Hiring a frontend engineer in Vietnam"
+    feed_html = f"""<!doctype html><html><head><style>
+.post-card {{ box-sizing: border-box; height: 760px; padding-top: 80px; }}
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+  <a id="for-you" aria-current="page" aria-label="For you" href="/">For you</a>
+  <a id="profile" aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main>
+  <div class="post-card"><a href="/@candidate/post/first"><time>2h</time></a>
+    <a href="/@candidate">@candidate</a><p>A weather update</p></div>
+  <div class="post-card"><a href="/@candidate/post/return-check"><time>1h</time></a>
+    <a href="/@candidate">@candidate</a><p>{detail_body}</p></div>
+</main><script>
+window.addEventListener("wheel", event => {{
+  event.preventDefault();
+  setTimeout(() => window.scrollBy(0, 850), 40);
+}}, {{ once: true, passive: false }});
+const deactivateForYou = () => {{
+  const control = document.querySelector("#for-you");
+  control.removeAttribute("aria-current");
+  control.setAttribute("aria-selected", "false");
+}};
+document.querySelector("#profile").addEventListener("click", () => {{
+  const visits = Number(sessionStorage.getItem("profile-visits") || "0") + 1;
+  sessionStorage.setItem("profile-visits", String(visits));
+  if (visits >= 2) deactivateForYou();
+}});
+window.addEventListener("pageshow", () => {{
+  if (Number(sessionStorage.getItem("profile-visits") || "0") >= 2) {{
+    deactivateForYou();
+  }}
+}});
+</script></body></html>"""
+
+    with tempfile.TemporaryDirectory(prefix="threads-browser-return-tab-") as root:
+        synthetic_root = Path(root)
+        profile = synthetic_root / "profile"
+        profile.mkdir()
+        account = AccountStore(synthetic_root / "data").add("offline", actor, profile)
+        store = CheckpointStore(synthetic_root / "data")
+
+        async def exercise(page) -> None:
+            async def serve_detail(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="text/html",
+                    body=f"""<!doctype html><html><body><main><div>
+<a href="/@candidate/post/return-check"><time>1h</time></a>
+<a href="/@candidate">@candidate</a><p>{detail_body}</p>
+</div></main></body></html>""",
+                )
+
+            await page.route(detail_url, serve_detail)
+            with pytest.raises(UiReadError) as caught:
+                await workflow.run_page_workflow(
+                    page,
+                    account,
+                    store,
+                    max_posts=2,
+                    terms=("hiring", "engineer"),
+                )
+            assert caught.value.code == "RETURN_UNVERIFIED"
+            assert await page.get_by_text(detail_body, exact=True).is_visible()
+
+        _run_offline_page(feed_html, exercise)
+        policy = policy_fingerprint(canonical_terms(("hiring", "engineer")))
+        checkpoint = store.load(account.account_id, policy)
+        assert checkpoint.completed_runs == 0
+        assert checkpoint.detail_reads == 0
+        assert checkpoint.scrolls == 0
+
+
 def test_non_article_mixed_permalink_container_fails_closed() -> None:
     html = """<!doctype html><html><head><style>
 .mixed-card { height: 900px; }

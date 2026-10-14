@@ -289,6 +289,7 @@ class ThreadsHomeReader:
             timeout_code="FEED_UI_UNVERIFIED",
         )
         before_by_fingerprint = {target.fingerprint: target for target in before}
+        before_by_url = {target.url: target for target in before}
         self.feed_duplicates = len(before) - len(before_by_fingerprint)
         self.scroll_attempts = 0
         self.scrolls = 0
@@ -305,7 +306,7 @@ class ThreadsHomeReader:
             await self._page.mouse.wheel(0, 850)
         except PlaywrightError:
             raise UiReadError("HOME_SCROLL_FAILED") from None
-        await self._wait_for_scroll_movement(
+        anchor_moved = await self._wait_for_scroll_movement(
             before[0].permalink,
             anchor_box["y"],
             deadline,
@@ -320,6 +321,13 @@ class ThreadsHomeReader:
         await self._require_feed_url()
         after_by_fingerprint = {target.fingerprint: target for target in after}
         self.feed_duplicates += len(after) - len(after_by_fingerprint)
+        visible_feed_transition = any(
+            target.url not in before_by_url
+            or abs(target.viewport_y - before_by_url[target.url].viewport_y) > 1
+            for target in after
+        )
+        if not anchor_moved and not visible_feed_transition:
+            raise UiReadError("HOME_SCROLL_UNVERIFIED")
         self.scrolls = 1
         for fingerprint in after_by_fingerprint:
             if fingerprint in before_by_fingerprint:
@@ -429,28 +437,38 @@ class ThreadsHomeReader:
         permalink: Locator,
         initial_y: float,
         deadline: float,
-    ) -> None:
+    ) -> bool:
         handle = await permalink.element_handle()
         if handle is None:
             raise UiReadError("HOME_SCROLL_UNVERIFIED")
+        result = None
+        outcome: str | None = None
         try:
-            await self._page.wait_for_function(
-                "([element, initialY]) => !element.isConnected "
-                "|| Math.abs(element.getBoundingClientRect().y - initialY) > 1",
+            result = await self._page.wait_for_function(
+                "([element, initialY]) => !element.isConnected ? 'detached' "
+                ": Math.abs(element.getBoundingClientRect().y - initialY) > 1 "
+                "? 'moved' : false",
                 arg=[handle, initial_y],
                 timeout=self._remaining_readiness_ms(deadline, "HOME_SCROLL_UNVERIFIED"),
                 polling="raf",
             )
+            outcome = await result.json_value()
         except PlaywrightTimeoutError:
             raise UiReadError("HOME_SCROLL_UNVERIFIED") from None
         except PlaywrightError:
             raise UiReadError("HOME_SCROLL_UNVERIFIED") from None
         finally:
+            if result is not None:
+                try:
+                    await result.dispose()
+                except PlaywrightError:
+                    pass
             try:
                 await handle.dispose()
             except PlaywrightError:
                 pass
         self._remaining_readiness_ms(deadline, "HOME_SCROLL_UNVERIFIED")
+        return outcome == "moved"
 
     async def _visible_targets(
         self,
@@ -781,6 +799,12 @@ class ThreadsHomeReader:
     async def return_to_home(self) -> None:
         await self._go_back_to_home()
         await self.verify_actor()
+        await self._require_feed_url()
+        control = await self._for_you_control()
+        if not await self._for_you_is_active(control) and not self._is_for_you_route(
+            self._page.url
+        ):
+            raise UiReadError("RETURN_UNVERIFIED")
         await self._wait_for_home_targets(
             1,
             timeout_code="FEED_UI_UNVERIFIED",
