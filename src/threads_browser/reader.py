@@ -166,30 +166,101 @@ class ThreadsHomeReader:
         self._home_url = self._page.url
         await self.verify_actor()
     async def verify_actor(self) -> None:
-        navigation = self._page.get_by_role("navigation")
-        profile_links = navigation.get_by_role("link", name=_PROFILE_NAME)
+        links = await self._visible_profile_controls("link")
+        buttons = await self._visible_profile_controls("button")
+        if len(links) + len(buttons) > 1:
+            raise UiReadError("ACTOR_UI_AMBIGUOUS")
+        if links:
+            await self._open_profile_link(links[0])
+            return
+        if not buttons:
+            raise UiReadError("ACTOR_UI_UNVERIFIED")
+
+        current_url = self._page.url
+        try:
+            await buttons[0].click(timeout=_READINESS_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            raise UiReadError("ACTOR_UI_UNVERIFIED") from None
+        if self._page.url != current_url:
+            await self._verify_current_profile_route()
+            await self._go_back_to_home()
+            return
+
+        profile_links = self._page.get_by_role("link", name=_PROFILE_NAME)
         try:
             await profile_links.first.wait_for(
                 state="visible",
                 timeout=_READINESS_TIMEOUT_MS,
             )
         except PlaywrightTimeoutError:
-            raise UiReadError("ACTOR_UNVERIFIED") from None
+            if self._page.url != current_url:
+                await self._verify_current_profile_route()
+                await self._go_back_to_home()
+                return
+            raise UiReadError("ACTOR_UI_UNVERIFIED") from None
+        links = await self._visible_profile_controls("link")
+        if len(links) != 1:
+            code = "ACTOR_UI_AMBIGUOUS" if len(links) > 1 else "ACTOR_UI_UNVERIFIED"
+            raise UiReadError(code)
+        await self._open_profile_link(links[0])
+
+    async def _visible_profile_controls(self, role: str) -> list[Locator]:
+        controls = self._page.get_by_role(role, name=_PROFILE_NAME)
         matches: list[Locator] = []
-        for index in range(await navigation.count()):
-            links = navigation.nth(index).get_by_role("link", name=_PROFILE_NAME)
-            for link_index in range(await links.count()):
-                link = links.nth(link_index)
-                if await link.is_visible():
-                    matches.append(link)
-        if len(matches) != 1:
-            raise UiReadError("ACTOR_UNVERIFIED")
-        href = await matches[0].get_attribute("href")
-        actor = None if href is None else _profile_author(href)
+        for index in range(await controls.count()):
+            control = controls.nth(index)
+            if await control.is_visible():
+                matches.append(control)
+        return matches
+
+    async def _open_profile_link(self, link: Locator) -> None:
+        href = await link.get_attribute("href")
+        destination = None if href is None else urljoin(self._page.url, href)
+        if destination is not None and not _same_home_origin(destination):
+            raise UiReadError("OFF_ORIGIN_REDIRECT")
+        current_url = self._page.url
+        try:
+            await link.click(timeout=_READINESS_TIMEOUT_MS)
+            await self._page.wait_for_url(
+                lambda url: url != current_url,
+                timeout=_READINESS_TIMEOUT_MS,
+            )
+        except PlaywrightTimeoutError:
+            await self._check_blocker()
+            if self._page.url == current_url:
+                raise UiReadError("ACTOR_UI_UNVERIFIED") from None
+        await self._verify_current_profile_route()
+        await self._go_back_to_home()
+
+    async def _verify_current_profile_route(self) -> None:
+        await self._check_blocker()
+        if not _same_home_origin(self._page.url):
+            raise UiReadError("OFF_ORIGIN_REDIRECT")
+        try:
+            path = urlsplit(self._page.url).path.casefold()
+        except ValueError:
+            raise UiReadError("ACTOR_UI_UNVERIFIED") from None
+        if "challenge" in path or "checkpoint" in path:
+            raise UiReadError("CHALLENGE_REQUIRED")
+        if path in {"/login", "/accounts/login"}:
+            raise UiReadError("LOGIN_REQUIRED")
+        actor = _profile_author(self._page.url)
         if actor is None:
-            raise UiReadError("ACTOR_UNVERIFIED")
+            raise UiReadError("ACTOR_UI_UNVERIFIED")
         if actor != self._expected_actor:
             raise UiReadError("ACTOR_MISMATCH")
+
+    async def _go_back_to_home(self) -> None:
+        try:
+            await self._page.go_back(
+                wait_until="domcontentloaded",
+                timeout=_NAVIGATION_TIMEOUT_MS,
+            )
+        except PlaywrightTimeoutError:
+            raise UiReadError("RETURN_UNVERIFIED") from None
+        await self._require_feed_url()
+        if self._page.url != self._home_url:
+            raise UiReadError("RETURN_UNVERIFIED")
     async def sample_and_scroll(self, max_posts: int) -> HomeSample:
         if not 1 <= max_posts <= 20:
             raise UiReadError("POST_LIMIT_INVALID")
@@ -315,16 +386,7 @@ class ThreadsHomeReader:
         return detail
 
     async def return_to_home(self) -> None:
-        try:
-            await self._page.go_back(
-                wait_until="domcontentloaded",
-                timeout=_NAVIGATION_TIMEOUT_MS,
-            )
-        except PlaywrightTimeoutError:
-            raise UiReadError("RETURN_UNVERIFIED") from None
-        await self._require_feed_url()
-        if self._page.url != self._home_url:
-            raise UiReadError("RETURN_UNVERIFIED")
+        await self._go_back_to_home()
         await self.verify_actor()
     async def _for_you_control(self) -> Locator:
         matches: list[Locator] = []

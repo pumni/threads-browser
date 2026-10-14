@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit
@@ -29,6 +30,16 @@ from threads_browser.storage import (
 from threads_browser.workflow import policy_fingerprint
 
 
+def _is_offline_profile_url(url: str) -> bool:
+    parsed = urlsplit(url)
+    return (
+        parsed.netloc == "www.threads.com"
+        and re.fullmatch(r"/@[A-Za-z0-9._]{1,30}/?", parsed.path) is not None
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
 def _run_offline_page(html: str, exercise) -> None:
     async def run() -> None:
         async with real_async_playwright() as playwright:
@@ -38,6 +49,12 @@ def _run_offline_page(html: str, exercise) -> None:
             async def respond(route: Route) -> None:
                 if route.request.url == HOME_URL:
                     await route.fulfill(status=200, content_type="text/html", body=html)
+                elif _is_offline_profile_url(route.request.url):
+                    await route.fulfill(
+                        status=200,
+                        content_type="text/html",
+                        body="<!doctype html><html><body><h1>Local profile</h1></body></html>",
+                    )
                 else:
                     await route.abort()
 
@@ -135,6 +152,8 @@ def test_offline_chromium_cli_reads_once_and_resumes_without_double_counting(
             html = feed_html
         elif url == target_url:
             html = detail_html
+        elif _is_offline_profile_url(url):
+            html = "<!doctype html><html><body><h1>Local profile</h1></body></html>"
         else:
             await route.abort()
             return
@@ -274,6 +293,8 @@ def test_unread_relevant_post_resumes_after_scroll_without_second_read(
             html = render_feed(posts)
         elif url in detail_pages:
             html = detail_pages[url]
+        elif _is_offline_profile_url(url):
+            html = "<!doctype html><html><body><h1>Local profile</h1></body></html>"
         else:
             await route.abort()
             return
@@ -353,6 +374,47 @@ def test_for_you_click_must_leave_an_active_marker_or_route() -> None:
         assert caught.value.code == "HOME_UI_UNVERIFIED"
 
     _run_offline_page(html, exercise)
+
+
+def test_actor_verification_supports_global_profile_link_and_fails_closed() -> None:
+    for_you = '<a aria-current="page" aria-label="For you" href="/">For you</a>'
+    outside_navigation = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">{for_you}</nav>
+<a aria-label="Your profile" href="/@offline.operator">Profile</a>
+</body></html>"""
+
+    async def successful_profile_route(page) -> None:
+        await ThreadsHomeReader(page, "offline.operator").open_home()
+        assert page.url == HOME_URL
+
+    _run_offline_page(outside_navigation, successful_profile_route)
+
+    ambiguous = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">{for_you}
+  <a aria-label="Profile" href="/@offline.operator">Profile</a>
+</nav><a aria-label="Account" href="/@other.operator">Account</a>
+</body></html>"""
+
+    async def ambiguous_profile_controls(page) -> None:
+        with pytest.raises(UiReadError) as caught:
+            await ThreadsHomeReader(page, "offline.operator").open_home()
+        assert caught.value.code == "ACTOR_UI_AMBIGUOUS"
+        assert page.url == HOME_URL
+
+    _run_offline_page(ambiguous, ambiguous_profile_controls)
+
+    mismatched = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">{for_you}</nav>
+<a aria-label="Your profile" href="/@other.operator">Profile</a>
+</body></html>"""
+
+    async def mismatched_profile_route(page) -> None:
+        with pytest.raises(UiReadError) as caught:
+            await ThreadsHomeReader(page, "offline.operator").open_home()
+        assert caught.value.code == "ACTOR_MISMATCH"
+        assert page.url == "https://www.threads.com/@other.operator"
+
+    _run_offline_page(mismatched, mismatched_profile_route)
 
 
 def test_scroll_attempt_is_not_counted_without_observed_feed_movement() -> None:
