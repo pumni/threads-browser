@@ -65,7 +65,8 @@ def _format_result(result: object) -> str:
 async def _prompt_readiness_extension(stage: str, retry: int) -> bool:
     while True:
         try:
-            answer = input(
+            answer = await asyncio.to_thread(
+                input,
                 f"Stage {stage} is still waiting (retry={retry}). "
                 "Enter to wait again, q to stop safely: "
             )

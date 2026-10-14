@@ -362,6 +362,9 @@ window.addEventListener("pageshow", () => {{
   if (shows >= 3) {{
     if (!sessionStorage.getItem("recovery-feed-scheduled")) {{
       sessionStorage.setItem("recovery-feed-scheduled", "1");
+      const profile = document.querySelector("#profile");
+      profile.remove();
+      setTimeout(() => document.querySelector("nav").append(profile), 750);
       setTimeout(() => main.innerHTML = renderedFeed, 750);
     }} else {{
       main.innerHTML = renderedFeed;
@@ -439,8 +442,8 @@ setTimeout(() => document.querySelector("#detail").insertAdjacentHTML(
         assert checkpoint.detail_reads == 1
         assert detail_requests == 1
         output = capsys.readouterr().out
-        assert "WAITING stage=FEED_INITIAL retry=1" in output
-        assert "RECOVERED stage=FEED_INITIAL retry=1" in output
+        assert "WAITING stage=HOME_RETURN retry=1" in output
+        assert "RECOVERED stage=HOME_RETURN retry=1" in output
         assert "WAITING stage=DETAIL retry=1" in output
         assert "RECOVERED stage=DETAIL retry=1" in output
 

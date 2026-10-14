@@ -1336,7 +1336,7 @@ class ThreadsHomeReader:
         if len(profile_controls) > 1:
             raise UiReadError("PROFILE_CONTROL_AMBIGUOUS")
         if not profile_controls:
-            raise UiReadError("PROFILE_CONTROL_NOT_FOUND")
+            raise UiReadError("PROFILE_CONTROL_NOT_READY")
         profile_href = await profile_controls[0].get_attribute("href")
         if profile_href is not None:
             profile_destination = urljoin(self._page.url, profile_href)
@@ -1367,7 +1367,10 @@ class ThreadsHomeReader:
             try:
                 await self._require_feed_url(route_error_code=route_error_code)
             except UiReadError as error:
-                if error.code != "FOR_YOU_CONTROL_NOT_READY":
+                if error.code not in {
+                    "PROFILE_CONTROL_NOT_READY",
+                    "FOR_YOU_CONTROL_NOT_READY",
+                }:
                     raise
                 await self._wait_for_pending_card(
                     _CardNotReady(
