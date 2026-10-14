@@ -11,6 +11,7 @@ from uuid import uuid4
 
 import pytest
 from playwright.async_api import Route
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright as real_async_playwright
 
 from threads_browser import reader as reader_module
@@ -334,6 +335,209 @@ window.addEventListener("wheel", event => {{
     _run_offline_page(feed_html, exercise)
 
 
+def test_transient_home_and_detail_hydration_recover_once(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    detail_url = "https://www.threads.com/@candidate/post/recovery-detail"
+    detail_body = "Hiring a frontend engineer in Vietnam"
+    feed_html = f"""<!doctype html><html><head><style>
+.post-card {{ box-sizing: border-box; height: 500px; padding-top: 80px; }}
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a id="profile" aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main></main><script>
+const main = document.querySelector("main");
+const renderedFeed = `
+  <div class="post-card"><a href="/@candidate/post/older"><time>2h</time></a>
+    <a href="/@candidate">@candidate</a><p>A weather update</p></div>
+  <div class="post-card"><a href="/@candidate/post/recovery-detail"><time>1h</time></a>
+    <a href="/@candidate">@candidate</a><p>{detail_body}</p></div>
+`;
+window.addEventListener("pageshow", () => {{
+  const shows = Number(sessionStorage.getItem("recovery-home-shows") || "0") + 1;
+  sessionStorage.setItem("recovery-home-shows", String(shows));
+  if (shows >= 3) {{
+    if (!sessionStorage.getItem("recovery-feed-scheduled")) {{
+      sessionStorage.setItem("recovery-feed-scheduled", "1");
+      setTimeout(() => main.innerHTML = renderedFeed, 750);
+    }} else {{
+      main.innerHTML = renderedFeed;
+    }}
+  }}
+}});
+window.addEventListener("wheel", event => {{
+  event.preventDefault();
+  const wheels = Number(sessionStorage.getItem("recovery-wheel-count") || "0") + 1;
+  sessionStorage.setItem("recovery-wheel-count", String(wheels));
+  setTimeout(() => window.scrollBy(0, 400), 40);
+}}, {{ once: true, passive: false }});
+</script></body></html>"""
+    monkeypatch.setattr(reader_module, "_READINESS_TIMEOUT_MS", 600)
+    monkeypatch.setattr(reader_module, "_READINESS_RECHECK_INTERVAL_MS", 75)
+    monkeypatch.setattr(reader_module, "_DETAIL_TIMEOUT_MS", 2_000)
+
+    with tempfile.TemporaryDirectory(prefix="threads-browser-recovery-once-") as root:
+        synthetic_root = Path(root)
+        profile = synthetic_root / "profile"
+        profile.mkdir()
+        account = AccountStore(synthetic_root / "data").add("offline", actor, profile)
+        store = CheckpointStore(synthetic_root / "data")
+        detail_requests = 0
+
+        async def exercise(page) -> None:
+            original_goto = page.goto
+            goto_calls = 0
+
+            async def goto_then_timeout(*args, **kwargs) -> None:
+                nonlocal goto_calls
+                goto_calls += 1
+                await original_goto(*args, **kwargs)
+                raise PlaywrightTimeoutError("synthetic committed navigation timeout")
+
+            async def serve_detail(route: Route) -> None:
+                nonlocal detail_requests
+                detail_requests += 1
+                await route.fulfill(
+                    status=200,
+                    content_type="text/html",
+                    body=f"""<!doctype html><html><body><main><div id="detail">
+<a href="/@candidate/post/recovery-detail"><time>1h</time></a>
+<a href="/@candidate">@candidate</a><script>
+setTimeout(() => document.querySelector("#detail").insertAdjacentHTML(
+  "beforeend", '<p>{detail_body}</p>'
+), 750);
+</script></div></main></body></html>""",
+                )
+
+            await page.route(detail_url, serve_detail)
+            monkeypatch.setattr(page, "goto", goto_then_timeout)
+            result = await workflow.run_page_workflow(
+                page,
+                account,
+                store,
+                max_posts=1,
+                terms=("hiring", "engineer"),
+            )
+            assert result.status == "COMPLETE"
+            assert result.scroll_attempts == 1
+            assert result.scrolls == 1
+            assert result.detail_reads == 1
+            assert goto_calls == 1
+            assert await page.evaluate(
+                "sessionStorage.getItem('recovery-wheel-count')"
+            ) == "1"
+
+        _run_offline_page(feed_html, exercise)
+        policy = policy_fingerprint(canonical_terms(("hiring", "engineer")))
+        checkpoint = store.load(account.account_id, policy)
+        assert checkpoint.completed_runs == 1
+        assert checkpoint.scroll_attempts == 1
+        assert checkpoint.scrolls == 1
+        assert checkpoint.detail_reads == 1
+        assert detail_requests == 1
+        output = capsys.readouterr().out
+        assert "WAITING stage=FEED_INITIAL retry=1" in output
+        assert "RECOVERED stage=FEED_INITIAL retry=1" in output
+        assert "WAITING stage=DETAIL retry=1" in output
+        assert "RECOVERED stage=DETAIL retry=1" in output
+
+
+def test_observation_rechecks_readiness_missed_before_wait_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actor = "offline.operator"
+    url = "https://www.threads.com/@candidate/post/boundary-ready"
+    feed_html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main></main></body></html>"""
+    monkeypatch.setattr(reader_module, "_READINESS_TIMEOUT_MS", 1_500)
+    monkeypatch.setattr(reader_module, "_READINESS_RECHECK_INTERVAL_MS", 100)
+
+    async def exercise(page) -> None:
+        class BoundaryReader(ThreadsHomeReader):
+            injected = False
+
+            async def _feed_readiness_signals(self):
+                pending = await super()._feed_readiness_signals()
+                if not self.injected and pending is None:
+                    self.injected = True
+                    await self._page.evaluate(
+                        """() => {
+                            document.querySelector('main').innerHTML = `
+                              <div><a href="/@candidate/post/boundary-ready">Permalink</a>
+                                <a href="/@candidate">@candidate</a>
+                                <p>A weather update</p></div>`;
+                        }"""
+                    )
+                return pending
+
+        reader = BoundaryReader(page, actor)
+        await reader.open_home()
+        started = asyncio.get_running_loop().time()
+        targets, _ = await reader._wait_for_home_targets(
+            1,
+            timeout_code="FEED_INITIAL_NOT_READY",
+        )
+        elapsed = asyncio.get_running_loop().time() - started
+        assert elapsed < 1
+        assert reader.injected
+        assert len(targets) == 1
+        assert targets[0].url == url
+
+    _run_offline_page(feed_html, exercise)
+
+
+def test_attended_wait_can_extend_then_stop_without_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actor = "offline.operator"
+    feed_html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main></main></body></html>"""
+    monkeypatch.setattr(reader_module, "_READINESS_TIMEOUT_MS", 150)
+    monkeypatch.setattr(reader_module, "_READINESS_RECHECK_INTERVAL_MS", 30)
+
+    with tempfile.TemporaryDirectory(prefix="threads-browser-recovery-stop-") as root:
+        synthetic_root = Path(root)
+        profile = synthetic_root / "profile"
+        profile.mkdir()
+        account = AccountStore(synthetic_root / "data").add("offline", actor, profile)
+        store = CheckpointStore(synthetic_root / "data")
+        prompt_calls: list[tuple[str, int]] = []
+
+        async def readiness_prompt(stage: str, retry: int) -> bool:
+            prompt_calls.append((stage, retry))
+            return len(prompt_calls) == 1
+
+        async def exercise(page) -> None:
+            with pytest.raises(UiReadError) as caught:
+                await workflow.run_page_workflow(
+                    page,
+                    account,
+                    store,
+                    max_posts=1,
+                    terms=("hiring",),
+                    readiness_prompt=readiness_prompt,
+                )
+            assert caught.value.code == "FEED_INITIAL_NOT_READY"
+            assert prompt_calls == [("FEED_INITIAL", 2), ("FEED_INITIAL", 3)]
+
+        _run_offline_page(feed_html, exercise)
+        policy = policy_fingerprint(canonical_terms(("hiring",)))
+        checkpoint = store.load(account.account_id, policy)
+        assert checkpoint.completed_runs == 0
+        assert checkpoint.scroll_attempts == 0
+        assert checkpoint.scrolls == 0
+        assert checkpoint.detail_reads == 0
+
+
 def test_delayed_wheel_and_detail_hydration_return_to_home() -> None:
     actor = "offline.operator"
     detail_url = "https://www.threads.com/@candidate/post/ready-detail"
@@ -481,13 +685,24 @@ window.addEventListener("wheel", event => {{
   <p>Two identities in one card.</p>
 </div></main></body></html>"""
 
+    provenance_prompts: list[tuple[str, int]] = []
+
+    async def provenance_prompt(stage: str, retry: int) -> bool:
+        provenance_prompts.append((stage, retry))
+        return True
+
     async def malformed_exercise(page) -> None:
-        reader = ThreadsHomeReader(page, actor)
+        reader = ThreadsHomeReader(
+            page,
+            actor,
+            readiness_prompt=provenance_prompt,
+        )
         await reader.open_home()
         with pytest.raises(UiReadError) as caught:
             await reader.sample_and_scroll(2)
         assert caught.value.code == "POST_PROVENANCE_UNVERIFIED"
         assert reader.scroll_attempts == 0
+        assert provenance_prompts == []
 
     _run_offline_page(malformed_html, malformed_exercise)
 
@@ -545,8 +760,18 @@ window.addEventListener("wheel", event => {{
     readers: list[ThreadsHomeReader] = []
 
     class TrackingReader(ThreadsHomeReader):
-        def __init__(self, page, expected_actor: str) -> None:
-            super().__init__(page, expected_actor)
+        def __init__(
+            self,
+            page,
+            expected_actor: str,
+            *,
+            readiness_prompt=None,
+        ) -> None:
+            super().__init__(
+                page,
+                expected_actor,
+                readiness_prompt=readiness_prompt,
+            )
             readers.append(self)
 
     monkeypatch.setattr(workflow, "ThreadsHomeReader", TrackingReader)
@@ -642,7 +867,7 @@ window.addEventListener("pageshow", () => {{
                     max_posts=2,
                     terms=("hiring", "engineer"),
                 )
-            assert caught.value.code == "RETURN_UNVERIFIED"
+            assert caught.value.code == "FOR_YOU_STATE_CHANGED"
             assert await page.get_by_text(detail_body, exact=True).is_visible()
 
         _run_offline_page(feed_html, exercise)

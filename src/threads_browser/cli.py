@@ -61,6 +61,23 @@ def _format_result(result: object) -> str:
         f"checkpoint_runs={result.checkpoint_runs}"
     )
 
+
+async def _prompt_readiness_extension(stage: str, retry: int) -> bool:
+    while True:
+        try:
+            answer = input(
+                f"Stage {stage} is still waiting (retry={retry}). "
+                "Enter to wait again, q to stop safely: "
+            )
+        except EOFError:
+            return False
+        if not answer.strip():
+            return True
+        if answer.strip().casefold() in {"q", "quit"}:
+            return False
+        print("Enter to wait again, q to stop safely.")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
@@ -91,10 +108,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                             CheckpointStore(data_root),
                             max_posts=args.max_posts,
                             terms=tuple(args.term),
+                            readiness_prompt=(
+                                _prompt_readiness_extension
+                                if sys.stdin.isatty() and sys.stdout.isatty()
+                                else None
+                            ),
                         )
                     )
                 except UiReadError as error:
-                    print(f"ERROR {error.code}", file=sys.stderr)
+                    print(f"STOP {error.code}", file=sys.stderr)
                     return 1
                 print(_format_result(result))
                 return 0

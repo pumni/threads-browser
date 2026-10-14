@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from hashlib import sha256
 
@@ -55,13 +56,18 @@ async def run_page_workflow(
     *,
     max_posts: int,
     terms: tuple[str, ...],
+    readiness_prompt: Callable[[str, int], Awaitable[bool]] | None = None,
 ) -> NurtureResult:
     if not 1 <= max_posts <= 20:
         raise UiReadError("POST_LIMIT_INVALID")
     normalized_terms = canonical_terms(terms)
     fingerprint = policy_fingerprint(normalized_terms)
     checkpoint = checkpoint_store.load(account.account_id, fingerprint)
-    reader = ThreadsHomeReader(page, account.expected_actor)
+    reader = ThreadsHomeReader(
+        page,
+        account.expected_actor,
+        readiness_prompt=readiness_prompt,
+    )
     await reader.open_home()
     sample = await reader.sample_and_scroll(max_posts)
     targets = sample.observed_targets
@@ -170,6 +176,7 @@ async def run_browser_nurture(
     *,
     max_posts: int,
     terms: tuple[str, ...],
+    readiness_prompt: Callable[[str, int], Awaitable[bool]] | None = None,
 ) -> NurtureResult:
     ensure_safe_browser_profile(account.profile_directory)
     try:
@@ -186,6 +193,7 @@ async def run_browser_nurture(
                     checkpoint_store,
                     max_posts=max_posts,
                     terms=terms,
+                    readiness_prompt=readiness_prompt,
                 )
             finally:
                 await context.close()
