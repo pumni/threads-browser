@@ -6,6 +6,7 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 from hashlib import sha256
+from typing import Literal
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from playwright.async_api import (
@@ -166,61 +167,57 @@ class ThreadsHomeReader:
         self._home_url = self._page.url
         await self.verify_actor()
     async def verify_actor(self) -> None:
-        links = await self._visible_profile_controls("link")
-        buttons = await self._visible_profile_controls("button")
-        if len(links) + len(buttons) > 1:
-            raise UiReadError("ACTOR_UI_AMBIGUOUS")
-        if links:
-            await self._open_profile_link(links[0])
-            return
-        if not buttons:
-            raise UiReadError("ACTOR_UI_UNVERIFIED")
+        controls = await self._visible_navigation_controls("link")
+        controls.extend(await self._visible_navigation_controls("button"))
+        if len(controls) > 1:
+            raise UiReadError("PROFILE_CONTROL_AMBIGUOUS")
+        if not controls:
+            controls = await self._visible_navigation_profile_text()
+        if len(controls) > 1:
+            raise UiReadError("PROFILE_CONTROL_AMBIGUOUS")
+        if not controls:
+            raise UiReadError("PROFILE_CONTROL_NOT_FOUND")
+        await self._follow_profile_control(controls[0])
 
-        current_url = self._page.url
-        try:
-            await buttons[0].click(timeout=_READINESS_TIMEOUT_MS)
-        except PlaywrightTimeoutError:
-            raise UiReadError("ACTOR_UI_UNVERIFIED") from None
-        if self._page.url != current_url:
-            await self._verify_current_profile_route()
-            await self._go_back_to_home()
-            return
-
-        profile_links = self._page.get_by_role("link", name=_PROFILE_NAME)
-        try:
-            await profile_links.first.wait_for(
-                state="visible",
-                timeout=_READINESS_TIMEOUT_MS,
-            )
-        except PlaywrightTimeoutError:
-            if self._page.url != current_url:
-                await self._verify_current_profile_route()
-                await self._go_back_to_home()
-                return
-            raise UiReadError("ACTOR_UI_UNVERIFIED") from None
-        links = await self._visible_profile_controls("link")
-        if len(links) != 1:
-            code = "ACTOR_UI_AMBIGUOUS" if len(links) > 1 else "ACTOR_UI_UNVERIFIED"
-            raise UiReadError(code)
-        await self._open_profile_link(links[0])
-
-    async def _visible_profile_controls(self, role: str) -> list[Locator]:
-        controls = self._page.get_by_role(role, name=_PROFILE_NAME)
+    async def _visible_navigation_controls(
+        self,
+        role: Literal["link", "button"],
+    ) -> list[Locator]:
+        navigations = self._page.get_by_role("navigation")
         matches: list[Locator] = []
-        for index in range(await controls.count()):
-            control = controls.nth(index)
-            if await control.is_visible():
-                matches.append(control)
+        for index in range(await navigations.count()):
+            navigation = navigations.nth(index)
+            if not await navigation.is_visible():
+                continue
+            controls = navigation.get_by_role(role, name=_PROFILE_NAME)
+            for control_index in range(await controls.count()):
+                control = controls.nth(control_index)
+                if await control.is_visible():
+                    matches.append(control)
         return matches
 
-    async def _open_profile_link(self, link: Locator) -> None:
-        href = await link.get_attribute("href")
+    async def _visible_navigation_profile_text(self) -> list[Locator]:
+        navigations = self._page.get_by_role("navigation")
+        matches: list[Locator] = []
+        for index in range(await navigations.count()):
+            navigation = navigations.nth(index)
+            if not await navigation.is_visible():
+                continue
+            labels = navigation.get_by_text("Profile", exact=True)
+            for label_index in range(await labels.count()):
+                label = labels.nth(label_index)
+                if await label.is_visible():
+                    matches.append(label)
+        return matches
+
+    async def _follow_profile_control(self, control: Locator) -> None:
+        href = await control.get_attribute("href")
         destination = None if href is None else urljoin(self._page.url, href)
         if destination is not None and not _same_home_origin(destination):
             raise UiReadError("OFF_ORIGIN_REDIRECT")
         current_url = self._page.url
         try:
-            await link.click(timeout=_READINESS_TIMEOUT_MS)
+            await control.click(timeout=_READINESS_TIMEOUT_MS)
             await self._page.wait_for_url(
                 lambda url: url != current_url,
                 timeout=_READINESS_TIMEOUT_MS,
@@ -228,7 +225,7 @@ class ThreadsHomeReader:
         except PlaywrightTimeoutError:
             await self._check_blocker()
             if self._page.url == current_url:
-                raise UiReadError("ACTOR_UI_UNVERIFIED") from None
+                raise UiReadError("PROFILE_CLICK_NO_NAVIGATION") from None
         await self._verify_current_profile_route()
         await self._go_back_to_home()
 
@@ -239,14 +236,14 @@ class ThreadsHomeReader:
         try:
             path = urlsplit(self._page.url).path.casefold()
         except ValueError:
-            raise UiReadError("ACTOR_UI_UNVERIFIED") from None
+            raise UiReadError("PROFILE_ROUTE_UNVERIFIED") from None
         if "challenge" in path or "checkpoint" in path:
             raise UiReadError("CHALLENGE_REQUIRED")
         if path in {"/login", "/accounts/login"}:
             raise UiReadError("LOGIN_REQUIRED")
         actor = _profile_author(self._page.url)
         if actor is None:
-            raise UiReadError("ACTOR_UI_UNVERIFIED")
+            raise UiReadError("PROFILE_ROUTE_UNVERIFIED")
         if actor != self._expected_actor:
             raise UiReadError("ACTOR_MISMATCH")
 

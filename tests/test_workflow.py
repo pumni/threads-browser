@@ -12,6 +12,7 @@ import pytest
 from playwright.async_api import Route
 from playwright.async_api import async_playwright as real_async_playwright
 
+from threads_browser import reader as reader_module
 from threads_browser import workflow
 from threads_browser.cli import main
 from threads_browser.reader import (
@@ -376,36 +377,79 @@ def test_for_you_click_must_leave_an_active_marker_or_route() -> None:
     _run_offline_page(html, exercise)
 
 
-def test_actor_verification_supports_global_profile_link_and_fails_closed() -> None:
+def test_actor_verification_scopes_sidebar_profile_text_and_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     for_you = '<a aria-current="page" aria-label="For you" href="/">For you</a>'
     outside_navigation = f"""<!doctype html><html><body>
 <nav aria-label="Main" role="navigation">{for_you}</nav>
-<a aria-label="Your profile" href="/@offline.operator">Profile</a>
+<main><div>Profile</div></main>
 </body></html>"""
 
-    async def successful_profile_route(page) -> None:
+    async def profile_text_outside_sidebar_stops(page) -> None:
+        with pytest.raises(UiReadError) as caught:
+            await ThreadsHomeReader(page, "offline.operator").open_home()
+        assert caught.value.code == "PROFILE_CONTROL_NOT_FOUND"
+        assert page.url == HOME_URL
+
+    _run_offline_page(outside_navigation, profile_text_outside_sidebar_stops)
+
+    no_navigation = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">{for_you}
+  <div><span>Profile</span></div>
+</nav></body></html>"""
+
+    async def profile_click_without_navigation_stops(page) -> None:
+        with pytest.raises(UiReadError) as caught:
+            await ThreadsHomeReader(page, "offline.operator").open_home()
+        assert caught.value.code == "PROFILE_CLICK_NO_NAVIGATION"
+
+    with monkeypatch.context() as short_timeout:
+        short_timeout.setattr(reader_module, "_READINESS_TIMEOUT_MS", 100)
+        _run_offline_page(no_navigation, profile_click_without_navigation_stops)
+
+    sidebar_text = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">{for_you}
+  <div onclick="window.location.href='/@offline.operator'"><span>Profile</span></div>
+</nav></body></html>"""
+
+    async def sidebar_text_opens_and_verifies_profile(page) -> None:
         await ThreadsHomeReader(page, "offline.operator").open_home()
         assert page.url == HOME_URL
 
-    _run_offline_page(outside_navigation, successful_profile_route)
+    _run_offline_page(sidebar_text, sidebar_text_opens_and_verifies_profile)
+
+    unsupported_route = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">{for_you}
+  <div onclick="history.pushState({{}}, '', '/settings')"><span>Profile</span></div>
+</nav></body></html>"""
+
+    async def unsupported_profile_route_stops(page) -> None:
+        with pytest.raises(UiReadError) as caught:
+            await ThreadsHomeReader(page, "offline.operator").open_home()
+        assert caught.value.code == "PROFILE_ROUTE_UNVERIFIED"
+        assert page.url.endswith("/settings")
+
+    _run_offline_page(unsupported_route, unsupported_profile_route_stops)
 
     ambiguous = f"""<!doctype html><html><body>
 <nav aria-label="Main" role="navigation">{for_you}
-  <a aria-label="Profile" href="/@offline.operator">Profile</a>
-</nav><a aria-label="Account" href="/@other.operator">Account</a>
+  <div><span>Profile</span></div><div><span>Profile</span></div>
+</nav>
 </body></html>"""
 
-    async def ambiguous_profile_controls(page) -> None:
+    async def ambiguous_sidebar_text_stops(page) -> None:
         with pytest.raises(UiReadError) as caught:
             await ThreadsHomeReader(page, "offline.operator").open_home()
-        assert caught.value.code == "ACTOR_UI_AMBIGUOUS"
+        assert caught.value.code == "PROFILE_CONTROL_AMBIGUOUS"
         assert page.url == HOME_URL
 
-    _run_offline_page(ambiguous, ambiguous_profile_controls)
+    _run_offline_page(ambiguous, ambiguous_sidebar_text_stops)
 
     mismatched = f"""<!doctype html><html><body>
-<nav aria-label="Main" role="navigation">{for_you}</nav>
-<a aria-label="Your profile" href="/@other.operator">Profile</a>
+<nav aria-label="Main" role="navigation">{for_you}
+  <div onclick="window.location.href='/@other.operator'"><span>Profile</span></div>
+</nav>
 </body></html>"""
 
     async def mismatched_profile_route(page) -> None:
