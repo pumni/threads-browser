@@ -58,6 +58,7 @@ def _format_result(result: object) -> str:
         f"detail_reads={result.detail_reads} "
         f"scroll_attempts={result.scroll_attempts} "
         f"scrolls={result.scrolls} "
+        f"skipped_unverified={result.skipped_unverified} "
         f"checkpoint_runs={result.checkpoint_runs}"
     )
 

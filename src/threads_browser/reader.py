@@ -52,6 +52,26 @@ class UiReadError(Exception):
         super().__init__(code)
 
 
+class _UnverifiedFeedCandidate(UiReadError):
+    def __init__(
+        self,
+        code: str,
+        reason: Literal[
+            "CANDIDATE_AMBIGUOUS",
+            "CANDIDATE_NONCANONICAL",
+            "CANDIDATE_AUTHOR_CONFLICT",
+        ],
+        identities: tuple[str, ...],
+    ) -> None:
+        self.reason = reason
+        self.identities = frozenset(
+            sha256(identity.encode("utf-8")).hexdigest()
+            for identity in identities
+            if identity
+        )
+        super().__init__(code)
+
+
 @dataclass(frozen=True, slots=True)
 class _CardWaitSignal:
     locator: Locator
@@ -108,6 +128,7 @@ class PostTarget:
 class HomeSample:
     targets: tuple[PostTarget, ...]
     observed_targets: tuple[PostTarget, ...]
+    skipped_unverified: int = 0
 
 
 def normalize_text(value: str) -> str:
@@ -190,6 +211,27 @@ class ThreadsHomeReader:
         self.scroll_attempts = 0
         self.scrolls = 0
         self.feed_duplicates = 0
+        self._skipped_candidate_identities: set[str] = set()
+        self._reported_candidate_skips: dict[tuple[str, str], set[str]] = {}
+
+    @property
+    def skipped_unverified(self) -> int:
+        return len(self._skipped_candidate_identities)
+
+    def _record_skipped_candidate(
+        self,
+        stage: str,
+        error: _UnverifiedFeedCandidate,
+    ) -> None:
+        self._skipped_candidate_identities.update(error.identities)
+        key = (stage, error.reason)
+        identities = self._reported_candidate_skips.setdefault(key, set())
+        previous_count = len(identities)
+        identities.update(error.identities)
+        if len(identities) != previous_count:
+            print(
+                f"SKIPPED stage={stage} reason={error.reason} count={len(identities)}"
+            )
 
     async def open_home(self) -> None:
         try:
@@ -569,6 +611,7 @@ class ThreadsHomeReader:
                         max_posts,
                         visible_after_scroll=True,
                         prefer_new_fingerprints=set(before_by_fingerprint),
+                        stage="FEED_SCROLL",
                     )
                 except _CardNotReady as pending:
                     await self._wait_for_pending_card(
@@ -619,6 +662,7 @@ class ThreadsHomeReader:
         return HomeSample(
             targets=tuple(after_first[:max_posts]),
             observed_targets=tuple(after_first),
+            skipped_unverified=self.skipped_unverified,
         )
 
     @staticmethod
@@ -674,6 +718,12 @@ class ThreadsHomeReader:
         prefer_new_fingerprints: set[str] | None = None,
         stage: str | None = None,
     ) -> tuple[tuple[PostTarget, ...], dict[str, float]]:
+        stage_name = stage or {
+            "FEED_INITIAL_NOT_READY": "FEED_INITIAL",
+            "FEED_RETURN_NOT_READY": "FEED_RETURN",
+            "HOME_SCROLL_UNVERIFIED": "FEED_SCROLL",
+        }.get(timeout_code, "FEED")
+
         async def attempt(window_deadline: float) -> tuple[tuple[PostTarget, ...], dict[str, float]]:
             while True:
                 self._remaining_readiness_ms(window_deadline, timeout_code)
@@ -686,6 +736,7 @@ class ThreadsHomeReader:
                         max_posts,
                         visible_after_scroll=visible_after_scroll,
                         prefer_new_fingerprints=prefer_new_fingerprints,
+                        stage=stage_name,
                     )
                 except _CardNotReady as pending:
                     await self._wait_for_pending_card(
@@ -711,16 +762,16 @@ class ThreadsHomeReader:
                     window_deadline,
                 )
 
-        stage_name = stage or {
-            "FEED_INITIAL_NOT_READY": "FEED_INITIAL",
-            "FEED_RETURN_NOT_READY": "FEED_RETURN",
-            "HOME_SCROLL_UNVERIFIED": "FEED_SCROLL",
-        }.get(timeout_code, "FEED")
-        return await self._recoverable_stage(
-            stage_name,
-            timeout_code,
-            attempt,
-        )
+        try:
+            return await self._recoverable_stage(
+                stage_name,
+                timeout_code,
+                attempt,
+            )
+        except UiReadError as error:
+            if error.code == timeout_code:
+                print(f"STOP stage={stage_name} code={error.code}")
+            raise
 
     async def _feed_readiness_signals(self) -> _CardNotReady | None:
         signals: list[_CardWaitSignal] = []
@@ -743,9 +794,6 @@ class ThreadsHomeReader:
                 permalink = permalinks.nth(index)
                 if await self._is_outside_content_landmark(permalink):
                     continue
-                href = await permalink.get_attribute("href")
-                if href is None or _post_url(href) is None:
-                    raise UiReadError("POST_PROVENANCE_UNVERIFIED")
                 box = await permalink.bounding_box()
                 if (
                     viewport is None
@@ -866,6 +914,7 @@ class ThreadsHomeReader:
         *,
         visible_after_scroll: bool = False,
         prefer_new_fingerprints: set[str] | None = None,
+        stage: str = "FEED",
     ) -> tuple[tuple[PostTarget, ...], dict[str, float] | None]:
         articles = self._page.get_by_role("article")
         viewport = self._page.viewport_size
@@ -879,6 +928,7 @@ class ThreadsHomeReader:
                 max_posts,
                 visible_after_scroll=visible_after_scroll,
                 prefer_new_fingerprints=prefer_new_fingerprints,
+                stage=stage,
             )
         scan_limit = min(article_count, max_posts + 20)
         visible_limit = max_posts if prefer_new_fingerprints is None else max_posts + 20
@@ -896,8 +946,6 @@ class ThreadsHomeReader:
                 or box["y"] + box["height"] <= 0
             ):
                 continue
-            if scroll_anchor is None:
-                scroll_anchor = box
             try:
                 target = await self._read_card(
                     article,
@@ -907,7 +955,12 @@ class ThreadsHomeReader:
             except _CardNotReady as pending:
                 pending_cards.append(pending)
                 continue
+            except _UnverifiedFeedCandidate as error:
+                self._record_skipped_candidate(stage, error)
+                continue
             targets.append(target)
+            if scroll_anchor is None:
+                scroll_anchor = box
             if len(targets) >= visible_limit:
                 break
         if not targets and pending_cards:
@@ -983,7 +1036,11 @@ class ThreadsHomeReader:
             links = ancestor.get_by_role("link")
             link_count = await links.count()
             if link_count > _MAX_CARD_LINKS:
-                raise UiReadError("POST_PROVENANCE_UNVERIFIED")
+                raise _UnverifiedFeedCandidate(
+                    "POST_PROVENANCE_UNVERIFIED",
+                    "CANDIDATE_AMBIGUOUS",
+                    (expected_url,),
+                )
             post_authors: dict[str, str] = {}
             authors: set[str] = set()
             for index in range(link_count):
@@ -998,20 +1055,40 @@ class ThreadsHomeReader:
                     post_authors[parsed_post[0]] = parsed_post[1]
                     continue
                 if "/post/" in href:
-                    raise UiReadError("POST_PROVENANCE_UNVERIFIED")
+                    raise _UnverifiedFeedCandidate(
+                        "POST_PROVENANCE_UNVERIFIED",
+                        "CANDIDATE_NONCANONICAL",
+                        (expected_url, href),
+                    )
                 author = _profile_author(href)
                 if author is not None:
                     authors.add(author)
             if len(post_authors) > 1:
-                raise UiReadError("POST_PROVENANCE_UNVERIFIED")
+                raise _UnverifiedFeedCandidate(
+                    "POST_PROVENANCE_UNVERIFIED",
+                    "CANDIDATE_AMBIGUOUS",
+                    tuple(post_authors),
+                )
             if expected_url not in post_authors:
                 continue
             if post_authors[expected_url] != expected_author:
-                raise UiReadError("POST_AUTHOR_UNVERIFIED")
+                raise _UnverifiedFeedCandidate(
+                    "POST_AUTHOR_UNVERIFIED",
+                    "CANDIDATE_AUTHOR_CONFLICT",
+                    (expected_url,),
+                )
             if len(authors) > 1:
-                raise UiReadError("POST_PROVENANCE_UNVERIFIED")
+                raise _UnverifiedFeedCandidate(
+                    "POST_PROVENANCE_UNVERIFIED",
+                    "CANDIDATE_AMBIGUOUS",
+                    (expected_url,),
+                )
             if authors and expected_author not in authors:
-                raise UiReadError("POST_AUTHOR_UNVERIFIED")
+                raise _UnverifiedFeedCandidate(
+                    "POST_AUTHOR_UNVERIFIED",
+                    "CANDIDATE_AUTHOR_CONFLICT",
+                    (expected_url,),
+                )
 
             box = await ancestor.bounding_box()
             if box is None:
@@ -1037,7 +1114,11 @@ class ThreadsHomeReader:
             raise _CardNotReady(pending_author)
         if smallest_without_body is not None:
             return smallest_without_body
-        raise UiReadError("POST_PROVENANCE_UNVERIFIED")
+        raise _UnverifiedFeedCandidate(
+            "POST_PROVENANCE_UNVERIFIED",
+            "CANDIDATE_AMBIGUOUS",
+            (expected_url,),
+        )
 
     @staticmethod
     def _expected_profile_link_signal(root: Locator, author: str) -> Locator:
@@ -1051,6 +1132,7 @@ class ThreadsHomeReader:
         *,
         visible_after_scroll: bool,
         prefer_new_fingerprints: set[str] | None,
+        stage: str,
     ) -> tuple[tuple[PostTarget, ...], dict[str, float] | None]:
         viewport = self._page.viewport_size
         if viewport is None:
@@ -1075,7 +1157,14 @@ class ThreadsHomeReader:
             parsed_post = None if href is None else _post_url(href)
             if parsed_post is None:
                 if href is not None and "/post/" in href:
-                    raise UiReadError("POST_PROVENANCE_UNVERIFIED")
+                    self._record_skipped_candidate(
+                        stage,
+                        _UnverifiedFeedCandidate(
+                            "POST_PROVENANCE_UNVERIFIED",
+                            "CANDIDATE_NONCANONICAL",
+                            (href,),
+                        ),
+                    )
                 continue
             if parsed_post[0] in targets_by_url:
                 continue
@@ -1099,8 +1188,19 @@ class ThreadsHomeReader:
             except _CardNotReady as pending:
                 pending_cards.append(pending)
                 continue
+            except _UnverifiedFeedCandidate as error:
+                self._record_skipped_candidate(stage, error)
+                continue
             if target.url != parsed_post[0] or target.author != parsed_post[1]:
-                raise UiReadError("POST_PROVENANCE_UNVERIFIED")
+                self._record_skipped_candidate(
+                    stage,
+                    _UnverifiedFeedCandidate(
+                        "POST_PROVENANCE_UNVERIFIED",
+                        "CANDIDATE_AMBIGUOUS",
+                        (parsed_post[0], target.url),
+                    ),
+                )
+                continue
             if scroll_anchor is None:
                 scroll_anchor = box
             targets_by_url[target.url] = target
@@ -1116,6 +1216,13 @@ class ThreadsHomeReader:
         return tuple(targets), scroll_anchor
 
     async def read_detail(self, target: PostTarget) -> PostTarget:
+        try:
+            return await self._read_detail(target)
+        except UiReadError as error:
+            print(f"STOP stage=DETAIL code={error.code}")
+            raise
+
+    async def _read_detail(self, target: PostTarget) -> PostTarget:
         if not target.visible_after_scroll:
             raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED")
         deadline = self._readiness_deadline(_DETAIL_TIMEOUT_MS)
@@ -1423,7 +1530,11 @@ class ThreadsHomeReader:
                 post_links.append((parsed_post[0], parsed_post[1], link))
                 continue
             if "/post/" in href:
-                raise UiReadError("POST_PROVENANCE_UNVERIFIED")
+                raise _UnverifiedFeedCandidate(
+                    "POST_PROVENANCE_UNVERIFIED",
+                    "CANDIDATE_NONCANONICAL",
+                    (href,),
+                )
             author = _profile_author(href)
             if author is not None:
                 authors.add(author)
@@ -1432,7 +1543,11 @@ class ThreadsHomeReader:
             (item[0], item[1]) for item in post_links
         }
         if len(unique_urls) > 1 or len(unique_permalink_links) > 1 or len(authors) > 1:
-            raise UiReadError("POST_PROVENANCE_UNVERIFIED")
+            raise _UnverifiedFeedCandidate(
+                "POST_PROVENANCE_UNVERIFIED",
+                "CANDIDATE_AMBIGUOUS",
+                tuple(unique_urls or authors),
+            )
         if not post_links:
             raise _CardNotReady(article, condition="mutation")
         if not authors:
@@ -1440,11 +1555,19 @@ class ThreadsHomeReader:
                 self._expected_profile_link_signal(article, post_links[0][1])
             )
         if len(unique_urls) != 1 or len(unique_permalink_links) != 1:
-            raise UiReadError("POST_PROVENANCE_UNVERIFIED")
+            raise _UnverifiedFeedCandidate(
+                "POST_PROVENANCE_UNVERIFIED",
+                "CANDIDATE_AMBIGUOUS",
+                tuple(unique_urls),
+            )
         url, permalink_author, link = post_links[0]
         author = next(iter(authors))
         if author != permalink_author:
-            raise UiReadError("POST_AUTHOR_UNVERIFIED")
+            raise _UnverifiedFeedCandidate(
+                "POST_AUTHOR_UNVERIFIED",
+                "CANDIDATE_AUTHOR_CONFLICT",
+                (url,),
+            )
 
         body: str | None = None
         paragraphs = article.get_by_role("paragraph")

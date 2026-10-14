@@ -41,6 +41,7 @@ class NurtureResult:
     scrolls: int
     checkpoint_runs: int
     home_relevant_ratio: float | None
+    skipped_unverified: int = 0
     ui_status: str = "UNVERIFIED_LIVE_UI"
 
 
@@ -167,6 +168,7 @@ async def run_page_workflow(
         scrolls=reader.scrolls,
         checkpoint_runs=updated.completed_runs,
         home_relevant_ratio=ratio,
+        skipped_unverified=sample.skipped_unverified,
     )
 
 
