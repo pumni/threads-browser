@@ -63,7 +63,8 @@ async def run_page_workflow(
     checkpoint = checkpoint_store.load(account.account_id, fingerprint)
     reader = ThreadsHomeReader(page, account.expected_actor)
     await reader.open_home()
-    targets = await reader.sample_and_scroll(max_posts)
+    sample = await reader.sample_and_scroll(max_posts)
+    targets = sample.observed_targets
 
     previously_seen = set(checkpoint.seen_fingerprints)
     seen_this_run: set[str] = set()
@@ -72,8 +73,11 @@ async def run_page_workflow(
     relevant = 0
     irrelevant = 0
     unknown = 0
+    decisions: dict[str, str] = {}
     selected = None
     new_relevant = False
+    pending = list(checkpoint.pending_read_fingerprints)
+    pending_set = set(pending)
     for target in targets:
         is_new = target.fingerprint not in previously_seen and target.fingerprint not in seen_this_run
         if is_new:
@@ -82,33 +86,50 @@ async def run_page_workflow(
         else:
             duplicates += 1
         decision = classify_body(target.body, normalized_terms)
+        decisions[target.fingerprint] = decision
         if decision == "RELEVANT":
             relevant += 1
-            if is_new:
+            if is_new or target.fingerprint in pending_set:
                 new_relevant = True
-            if is_new and target.visible_after_scroll and selected is None:
-                selected = target
+                if target.fingerprint not in pending_set:
+                    pending.append(target.fingerprint)
+                    pending_set.add(target.fingerprint)
         elif decision == "IRRELEVANT":
             irrelevant += 1
         else:
             unknown += 1
+
+    for target in sample.targets:
+        if (
+            decisions[target.fingerprint] == "RELEVANT"
+            and target.fingerprint in pending_set
+        ):
+            selected = target
+            break
 
     detail_reads = 0
     if selected is not None:
         await reader.read_detail(selected)
         await reader.return_to_home()
         detail_reads = 1
+        pending.remove(selected.fingerprint)
+        pending_set.remove(selected.fingerprint)
         status = "COMPLETE"
-    elif new_relevant:
+    elif new_relevant or pending_set:
         status = "RELEVANT_POST_NOT_CURRENT"
     elif relevant:
         status = "NO_NEW_RELEVANT_POST"
     else:
         status = "NO_RELEVANT_POST"
 
-    seen = (*checkpoint.seen_fingerprints, *seen_this_run)
+    if len(pending) > _MAX_SEEN:
+        raise BrowserDataError("STATE_INVALID")
+    seen = list(dict.fromkeys((*checkpoint.seen_fingerprints, *seen_this_run)))
     if len(seen) > _MAX_SEEN:
-        seen = seen[-_MAX_SEEN:]
+        retained_pending = [value for value in seen if value in pending_set]
+        recent = [value for value in seen if value not in pending_set]
+        available = _MAX_SEEN - len(retained_pending)
+        seen = retained_pending + (recent[-available:] if available else [])
     updated = Checkpoint(
         account.account_id,
         fingerprint,
@@ -122,6 +143,7 @@ async def run_page_workflow(
         detail_reads=checkpoint.detail_reads + detail_reads,
         scroll_attempts=checkpoint.scroll_attempts + reader.scroll_attempts,
         scrolls=checkpoint.scrolls + reader.scrolls,
+        pending_read_fingerprints=tuple(pending),
         seen_fingerprints=tuple(seen),
     )
     checkpoint_store.save(updated)

@@ -39,6 +39,7 @@ _CHECKPOINT_KEYS = {
     "detail_reads",
     "scroll_attempts",
     "scrolls",
+    "pending_read_fingerprints",
     "seen_fingerprints",
 }
 _MAX_DOCUMENT_BYTES = 256 * 1024
@@ -366,8 +367,9 @@ class Checkpoint:
     detail_reads: int = 0
     scroll_attempts: int = 0
     scrolls: int = 0
+    pending_read_fingerprints: tuple[str, ...] = field(default=(), repr=False)
     seen_fingerprints: tuple[str, ...] = field(default=(), repr=False)
-    schema_version: int = 2
+    schema_version: int = 3
 
     def __repr__(self) -> str:
         return (
@@ -391,6 +393,7 @@ class Checkpoint:
             "detail_reads": self.detail_reads,
             "scroll_attempts": self.scroll_attempts,
             "scrolls": self.scrolls,
+            "pending_read_fingerprints": list(self.pending_read_fingerprints),
             "seen_fingerprints": list(self.seen_fingerprints),
         }
 
@@ -439,7 +442,7 @@ def _decode_checkpoint(
     if (
         set(document) != _CHECKPOINT_KEYS
         or type(document.get("schema_version")) is not int
-        or document.get("schema_version") != 2
+        or document.get("schema_version") != 3
     ):
         raise BrowserDataError("STATE_INVALID")
     if document.get("account_id") != str(expected_account):
@@ -466,11 +469,23 @@ def _decode_checkpoint(
             raise BrowserDataError("STATE_INVALID")
         counts[key] = value
     seen = document.get("seen_fingerprints")
+    pending = document.get("pending_read_fingerprints")
     if (
         not isinstance(seen, list)
         or len(seen) > _MAX_SEEN
         or any(not isinstance(value, str) or _SHA256.fullmatch(value) is None for value in seen)
         or len(set(seen)) != len(seen)
+    ):
+        raise BrowserDataError("STATE_INVALID")
+    if (
+        not isinstance(pending, list)
+        or len(pending) > _MAX_SEEN
+        or any(
+            not isinstance(value, str) or _SHA256.fullmatch(value) is None
+            for value in pending
+        )
+        or len(set(pending)) != len(pending)
+        or not set(pending).issubset(seen)
     ):
         raise BrowserDataError("STATE_INVALID")
     if (
@@ -486,6 +501,7 @@ def _decode_checkpoint(
         expected_account,
         expected_policy,
         **counts,
+        pending_read_fingerprints=tuple(pending),
         seen_fingerprints=tuple(seen),
     )
 

@@ -55,6 +55,12 @@ class PostTarget:
         return "PostTarget(<private>)"
 
 
+@dataclass(frozen=True, slots=True)
+class HomeSample:
+    targets: tuple[PostTarget, ...]
+    observed_targets: tuple[PostTarget, ...]
+
+
 def normalize_text(value: str) -> str:
     return unicodedata.normalize("NFKC", value).casefold().strip()
 
@@ -184,7 +190,7 @@ class ThreadsHomeReader:
             raise UiReadError("ACTOR_UNVERIFIED")
         if actor != self._expected_actor:
             raise UiReadError("ACTOR_MISMATCH")
-    async def sample_and_scroll(self, max_posts: int) -> tuple[PostTarget, ...]:
+    async def sample_and_scroll(self, max_posts: int) -> HomeSample:
         if not 1 <= max_posts <= 20:
             raise UiReadError("POST_LIMIT_INVALID")
         before, scroll_anchor = await self._visible_targets(max_posts)
@@ -203,7 +209,11 @@ class ThreadsHomeReader:
             await self._page.mouse.wheel(0, 850)
         except PlaywrightError:
             raise UiReadError("HOME_SCROLL_FAILED") from None
-        after, _ = await self._visible_targets(max_posts, visible_after_scroll=True)
+        after, _ = await self._visible_targets(
+            max_posts,
+            visible_after_scroll=True,
+            prefer_new_fingerprints=set(before_by_fingerprint),
+        )
         await self._require_feed_url()
         after_by_fingerprint = {target.fingerprint: target for target in after}
         self.feed_duplicates += len(after) - len(after_by_fingerprint)
@@ -214,18 +224,28 @@ class ThreadsHomeReader:
                 for fingerprint, target in after_by_fingerprint.items()
             )
         )
-        targets = dict(before_by_fingerprint)
-        for fingerprint, target in after_by_fingerprint.items():
-            if fingerprint in targets:
+        if self.scrolls == 0:
+            raise UiReadError("HOME_SCROLL_UNVERIFIED")
+        for fingerprint in after_by_fingerprint:
+            if fingerprint in before_by_fingerprint:
                 self.feed_duplicates += 1
-            targets[fingerprint] = target
-        return tuple(list(targets.values())[:max_posts])
+        after_first = list(after_by_fingerprint.values())
+        after_first.extend(
+            target
+            for fingerprint, target in before_by_fingerprint.items()
+            if fingerprint not in after_by_fingerprint
+        )
+        return HomeSample(
+            targets=tuple(after_first[:max_posts]),
+            observed_targets=tuple(after_first),
+        )
 
     async def _visible_targets(
         self,
         max_posts: int,
         *,
         visible_after_scroll: bool = False,
+        prefer_new_fingerprints: set[str] | None = None,
     ) -> tuple[tuple[PostTarget, ...], dict[str, float] | None]:
         articles = self._page.get_by_role("article")
         viewport = self._page.viewport_size
@@ -235,7 +255,7 @@ class ThreadsHomeReader:
         scroll_anchor: dict[str, float] | None = None
         article_count = await articles.count()
         scan_limit = min(article_count, max_posts + 20)
-        visible_limit = max_posts
+        visible_limit = max_posts if prefer_new_fingerprints is None else max_posts + 20
         for index in range(scan_limit):
             article = articles.nth(index)
             if not await article.is_visible():
@@ -260,6 +280,9 @@ class ThreadsHomeReader:
             )
             if len(targets) >= visible_limit:
                 break
+        if prefer_new_fingerprints is not None:
+            targets.sort(key=lambda target: target.fingerprint in prefer_new_fingerprints)
+            targets = targets[:max_posts]
         return tuple(targets), scroll_anchor
     async def read_detail(self, target: PostTarget) -> PostTarget:
         if not target.visible_after_scroll:
