@@ -235,6 +235,93 @@ def test_offline_chromium_cli_reads_once_and_resumes_without_double_counting(
     assert actor not in persisted
 
 
+def test_non_article_permalink_cards_sample_and_verify_detail() -> None:
+    actor = "offline.operator"
+    first_url = "https://www.threads.com/@candidate/post/first-div"
+    detail_url = "https://www.threads.com/@candidate/post/second-div"
+    detail_body = "Hiring a frontend engineer in Vietnam"
+    feed_html = f"""<!doctype html><html><head><style>
+.post-card {{ box-sizing: border-box; height: 760px; padding-top: 80px; }}
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+  <a href="/@navigation/post/decoy">Navigation decoy</a>
+</nav>
+<main>
+  <div class="post-card">
+    <header><a href="/@candidate/post/first-div"><time>2h</time></a>
+      <a href="/@candidate/post/first-div"><span>Permalink</span></a></header>
+    <a href="/@candidate">@candidate</a><p>A weather update</p>
+  </div>
+  <div class="post-card">
+    <header><a href="/@candidate/post/second-div"><time>1h</time></a></header>
+    <a href="/@candidate">@candidate</a><p>{detail_body}</p>
+  </div>
+</main></body></html>"""
+    detail_html = f"""<!doctype html><html><body><main>
+<div><header><a href="/@candidate/post/second-div"><time>1h</time></a></header>
+<a href="/@candidate">@candidate</a><p>{detail_body}</p></div>
+</main></body></html>"""
+
+    async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=detail_html,
+            )
+
+        await page.route(detail_url, serve_detail)
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        sample = await reader.sample_and_scroll(2)
+        assert reader.scroll_attempts == 1
+        assert reader.scrolls == 1
+        assert {target.url for target in sample.observed_targets} == {
+            first_url,
+            detail_url,
+        }
+        target = next(target for target in sample.targets if target.url == detail_url)
+        detail = await reader.read_detail(target)
+        assert detail.url == detail_url
+        assert detail.author == "candidate"
+        assert detail.body == detail_body
+        await reader.return_to_home()
+        assert page.url == HOME_URL
+
+    _run_offline_page(feed_html, exercise)
+
+
+def test_non_article_mixed_permalink_container_fails_closed() -> None:
+    html = """<!doctype html><html><head><style>
+.mixed-card { height: 900px; }
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@offline.operator">Profile</a>
+  <a href="/@navigation/post/decoy">Navigation decoy</a>
+</nav>
+<main><div class="mixed-card">
+  <a href="/@candidate/post/first"><time>2h</time></a>
+  <a href="/@candidate">@candidate</a>
+  <a href="/@quoted/post/second"><time>1h</time></a>
+  <a href="/@quoted">@quoted</a>
+  <p>Two post identities share one wrapper.</p>
+</div></main></body></html>"""
+
+    async def exercise(page) -> None:
+        reader = ThreadsHomeReader(page, "offline.operator")
+        await reader.open_home()
+        with pytest.raises(UiReadError) as caught:
+            await reader.sample_and_scroll(2)
+        assert caught.value.code == "POST_PROVENANCE_UNVERIFIED"
+        assert reader.scroll_attempts == 0
+        assert reader.scrolls == 0
+
+    _run_offline_page(html, exercise)
+
+
 def test_unread_relevant_post_resumes_after_scroll_without_second_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

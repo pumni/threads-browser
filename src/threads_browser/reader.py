@@ -26,6 +26,9 @@ _NAVIGATION_TIMEOUT_MS = 20_000
 _DETAIL_TIMEOUT_MS = 15_000
 _READINESS_TIMEOUT_MS = 8_000
 _MAX_BODY_CODEPOINTS = 10_000
+_MAX_CARD_ANCESTORS = 8
+_MAX_CARD_LINKS = 40
+_MAX_PERMALINK_CANDIDATES = 40
 _USERNAME = re.compile(r"[A-Za-z0-9._]{1,30}")
 _POST_PATH = re.compile(r"/@(?P<author>[A-Za-z0-9._]{1,30})/post/(?P<post>[A-Za-z0-9_-]{1,120})")
 _PROFILE_PATH = re.compile(r"/@(?P<author>[A-Za-z0-9._]{1,30})/?")
@@ -322,6 +325,12 @@ class ThreadsHomeReader:
         targets: list[PostTarget] = []
         scroll_anchor: dict[str, float] | None = None
         article_count = await articles.count()
+        if article_count == 0:
+            return await self._visible_permalink_targets(
+                max_posts,
+                visible_after_scroll=visible_after_scroll,
+                prefer_new_fingerprints=prefer_new_fingerprints,
+            )
         scan_limit = min(article_count, max_posts + 20)
         visible_limit = max_posts if prefer_new_fingerprints is None else max_posts + 20
         for index in range(scan_limit):
@@ -352,6 +361,173 @@ class ThreadsHomeReader:
             targets.sort(key=lambda target: target.fingerprint in prefer_new_fingerprints)
             targets = targets[:max_posts]
         return tuple(targets), scroll_anchor
+
+    @staticmethod
+    def _intersects_viewport(
+        box: dict[str, float],
+        viewport: dict[str, int],
+    ) -> bool:
+        return (
+            box["x"] < viewport["width"]
+            and box["y"] < viewport["height"]
+            and box["x"] + box["width"] > 0
+            and box["y"] + box["height"] > 0
+        )
+
+    async def _content_region(self, *, prefer_main: bool = False) -> Locator:
+        roles = ("main", "feed") if prefer_main else ("feed", "main")
+        for role in roles:
+            landmarks = self._page.get_by_role(role)
+            visible: list[Locator] = []
+            for index in range(await landmarks.count()):
+                landmark = landmarks.nth(index)
+                if await landmark.is_visible():
+                    visible.append(landmark)
+            if len(visible) > 1:
+                raise UiReadError("FEED_UI_UNVERIFIED")
+            if visible:
+                return visible[0]
+        return self._page.locator("body")
+
+    @staticmethod
+    async def _is_outside_content_landmark(link: Locator) -> bool:
+        excluded = link.locator(
+            "xpath=ancestor-or-self::*[self::nav or self::aside or self::footer "
+            "or @role='navigation' or @role='menu' or @role='complementary' "
+            "or @role='dialog' or @role='search' or @role='banner' "
+            "or @role='contentinfo']"
+        )
+        return await excluded.count() > 0
+
+    async def _resolve_permalink_card(
+        self,
+        permalink: Locator,
+        expected_url: str,
+        expected_author: str,
+    ) -> tuple[Locator, dict[str, float]]:
+        ancestor = permalink
+        smallest_without_body: tuple[Locator, dict[str, float]] | None = None
+        for _ in range(_MAX_CARD_ANCESTORS):
+            ancestor = ancestor.locator("xpath=..")
+            if await ancestor.count() == 0:
+                break
+            if (
+                await ancestor.get_attribute("role") in {"feed", "main"}
+                or await ancestor.locator("xpath=self::main").count() > 0
+            ):
+                break
+            if not await ancestor.is_visible():
+                continue
+
+            links = ancestor.get_by_role("link")
+            link_count = await links.count()
+            if link_count > _MAX_CARD_LINKS:
+                raise UiReadError("POST_PROVENANCE_UNVERIFIED")
+            post_authors: dict[str, str] = {}
+            authors: set[str] = set()
+            for index in range(link_count):
+                link = links.nth(index)
+                if await self._is_outside_content_landmark(link):
+                    continue
+                href = await link.get_attribute("href")
+                if href is None:
+                    continue
+                parsed_post = _post_url(href)
+                if parsed_post is not None:
+                    post_authors[parsed_post[0]] = parsed_post[1]
+                    continue
+                author = _profile_author(href)
+                if author is not None:
+                    authors.add(author)
+            if len(post_authors) > 1:
+                raise UiReadError("POST_PROVENANCE_UNVERIFIED")
+            if expected_url not in post_authors:
+                continue
+            if post_authors[expected_url] != expected_author:
+                raise UiReadError("POST_AUTHOR_UNVERIFIED")
+            if len(authors) > 1:
+                raise UiReadError("POST_PROVENANCE_UNVERIFIED")
+            if authors and expected_author not in authors:
+                raise UiReadError("POST_AUTHOR_UNVERIFIED")
+            if not authors:
+                continue
+
+            box = await ancestor.bounding_box()
+            if box is None:
+                continue
+            candidate = (ancestor, box)
+            if smallest_without_body is None:
+                smallest_without_body = candidate
+            paragraphs = ancestor.get_by_role("paragraph")
+            paragraph_count = await paragraphs.count()
+            if paragraph_count > 1:
+                return candidate
+            if paragraph_count == 1 and await paragraphs.first.is_visible():
+                return candidate
+
+        if smallest_without_body is not None:
+            return smallest_without_body
+        raise UiReadError("POST_PROVENANCE_UNVERIFIED")
+
+    async def _visible_permalink_targets(
+        self,
+        max_posts: int,
+        *,
+        visible_after_scroll: bool,
+        prefer_new_fingerprints: set[str] | None,
+    ) -> tuple[tuple[PostTarget, ...], dict[str, float] | None]:
+        viewport = self._page.viewport_size
+        if viewport is None:
+            raise UiReadError("FEED_UI_UNVERIFIED")
+        region = await self._content_region()
+        permalinks = region.locator('a[href*="/post/"]')
+        scan_limit = min(
+            await permalinks.count(),
+            min(max_posts + 20, _MAX_PERMALINK_CANDIDATES),
+        )
+        visible_limit = max_posts if prefer_new_fingerprints is None else max_posts + 20
+        targets_by_url: dict[str, PostTarget] = {}
+        scroll_anchor: dict[str, float] | None = None
+        for index in range(scan_limit):
+            permalink = permalinks.nth(index)
+            if not await permalink.is_visible():
+                continue
+            if await self._is_outside_content_landmark(permalink):
+                continue
+            href = await permalink.get_attribute("href")
+            parsed_post = None if href is None else _post_url(href)
+            if parsed_post is None or parsed_post[0] in targets_by_url:
+                continue
+            permalink_box = await permalink.bounding_box()
+            if permalink_box is None or not self._intersects_viewport(permalink_box, viewport):
+                continue
+
+            root, box = await self._resolve_permalink_card(
+                permalink,
+                parsed_post[0],
+                parsed_post[1],
+            )
+            if not self._intersects_viewport(box, viewport):
+                continue
+            target = await self._read_card(
+                root,
+                visible_after_scroll=visible_after_scroll,
+                viewport_y=box["y"],
+            )
+            if target.url != parsed_post[0] or target.author != parsed_post[1]:
+                raise UiReadError("POST_PROVENANCE_UNVERIFIED")
+            if scroll_anchor is None:
+                scroll_anchor = box
+            targets_by_url[target.url] = target
+            if len(targets_by_url) >= visible_limit:
+                break
+
+        targets = list(targets_by_url.values())
+        if prefer_new_fingerprints is not None:
+            targets.sort(key=lambda target: target.fingerprint in prefer_new_fingerprints)
+            targets = targets[:max_posts]
+        return tuple(targets), scroll_anchor
+
     async def read_detail(self, target: PostTarget) -> PostTarget:
         if not target.visible_after_scroll:
             raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED")
@@ -373,14 +549,45 @@ class ThreadsHomeReader:
                 if parsed is not None and parsed[0] == target.url:
                     matching.append(article)
                     break
-        if len(matching) != 1:
+        if len(matching) > 1:
             raise UiReadError("DETAIL_ROOT_UNVERIFIED")
-        detail = await self._read_card(matching[0])
+        if matching:
+            root = matching[0]
+        else:
+            root = await self._detail_permalink_card(target)
+        detail = await self._read_card(root)
         if detail.url != target.url or detail.author != target.author:
             raise UiReadError("DETAIL_PROVENANCE_UNVERIFIED")
         if detail.body is None or target.body is None or detail.body != target.body:
             raise UiReadError("DETAIL_BODY_UNVERIFIED")
         return detail
+
+    async def _detail_permalink_card(self, target: PostTarget) -> Locator:
+        region = await self._content_region(prefer_main=True)
+        permalinks = region.locator('a[href*="/post/"]')
+        scan_limit = min(await permalinks.count(), _MAX_PERMALINK_CANDIDATES)
+        for index in range(scan_limit):
+            permalink = permalinks.nth(index)
+            if not await permalink.is_visible():
+                continue
+            if await self._is_outside_content_landmark(permalink):
+                continue
+            href = await permalink.get_attribute("href")
+            parsed_post = None if href is None else _post_url(href)
+            if parsed_post is None or parsed_post[0] != target.url:
+                continue
+            try:
+                root, _ = await self._resolve_permalink_card(
+                    permalink,
+                    target.url,
+                    target.author,
+                )
+            except UiReadError as error:
+                if error.code in {"POST_PROVENANCE_UNVERIFIED", "POST_AUTHOR_UNVERIFIED"}:
+                    raise UiReadError("DETAIL_ROOT_UNVERIFIED") from None
+                raise
+            return root
+        raise UiReadError("DETAIL_ROOT_UNVERIFIED")
 
     async def return_to_home(self) -> None:
         await self._go_back_to_home()
