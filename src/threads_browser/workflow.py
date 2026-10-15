@@ -13,7 +13,12 @@ from hashlib import sha256
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page, async_playwright
 
-from .feed.models import DisplayObservation, PostTarget, VisibleBodySegment
+from .feed.models import (
+    BodyReadEvidence,
+    DisplayObservation,
+    PostTarget,
+    VisibleBodySegment,
+)
 from .feed.relevance import canonical_terms, classify_body
 from .reader import (
     ThreadsHomeReader,
@@ -226,6 +231,7 @@ class NurtureResult:
     skipped_rows: int = 0
     viewport_coverage_complete: bool = True
     viewport_observations: int = 0
+    unique_provenance_identities: int = 0
     unique_verified_posts: int = 0
     unique_deferred_posts: int = 0
     unresolved_gaps: int = 0
@@ -307,23 +313,26 @@ async def run_page_workflow(
     exhaustion_reason = "MAX_SCROLLS"
     streamed_home_fingerprints: set[str] = set()
     unresolved_deferred_fingerprints: set[str] = set()
-    unresolved_deferred_without_identity = False
+    unresolved_observation_ids: set[str] = set()
+    unresolved_unrepresented_gaps: set[str] = set()
     unique_deferred_fingerprints: set[str] = set()
     fully_read_fingerprints: set[str] = set()
     checkpoint_overlap_fingerprints: set[str] = set()
     streamed_segment_ids: set[str] = set()
     visible_text_segments = 0
     consecutive_moved_no_content = 0
-    pending_scroll_baseline: tuple[float | None, float | None] | None = None
+    pending_scroll_baseline: dict[str, object] | None = None
 
     def reliability_metrics() -> dict[str, int]:
         return {
             "viewport_observations": observed_rows,
+            "unique_provenance_identities": len(provenance_verified_fingerprints),
             "unique_verified_posts": len(fully_read_fingerprints),
             "unique_deferred_posts": len(unique_deferred_fingerprints),
             "unresolved_gaps": (
                 len(unresolved_deferred_fingerprints)
-                + int(unresolved_deferred_without_identity)
+                + len(unresolved_observation_ids)
+                + len(unresolved_unrepresented_gaps)
             ),
             "visible_text_segments": visible_text_segments,
         }
@@ -331,10 +340,17 @@ async def run_page_workflow(
     async def advance_feed(*, scan_after_scroll: bool = False) -> bool:
         nonlocal pending_scroll_baseline
         attempt = reader.scroll_attempts + 1
-        baseline = (
-            reader.last_scan_counts.frontier_content_px,
-            reader.last_scan_counts.nearest_deferred_below_px,
-        )
+        baseline = {
+            "visible_text_segments": visible_text_segments,
+            "unique_verified_posts": len(fully_read_fingerprints),
+            "body_extracted": body_extracted,
+            "rows": {
+                diagnostic.observation_id: diagnostic.read_evidence
+                for diagnostic in reader.last_candidate_diagnostics
+                if diagnostic.observation_id is not None
+                and diagnostic.read_evidence is not None
+            },
+        }
         if detail:
             print(f"[SCROLL] attempt={attempt} status=REQUESTED")
         try:
@@ -388,6 +404,7 @@ async def run_page_workflow(
         viewport_fallback_targets = []
         current_unverified_rows: list[tuple[str, float]] = []
         matched_overlap_rows: set[int] = set()
+        row_target_progress_ids: set[str] = set()
         async def observe_row(
             row: _HomeRowObservation,
             *,
@@ -397,6 +414,8 @@ async def run_page_workflow(
             current_unverified_rows: list[tuple[str, float]] = current_unverified_rows,
             previous_unverified_rows: list[tuple[str, float]] = previous_unverified_rows,
             matched_overlap_rows: set[int] = matched_overlap_rows,
+            row_target_progress_ids: set[str] = row_target_progress_ids,
+            pending_scroll_baseline: dict[str, object] | None = pending_scroll_baseline,
         ) -> None:
             nonlocal body_extracted, classified, duplicates, found_relevant
             nonlocal irrelevant, next_post_number, observation_unknown, previewed_bodies
@@ -405,33 +424,94 @@ async def run_page_workflow(
             nonlocal unverified_relevant, viewport_classified, viewport_irrelevant
             nonlocal viewport_observation_unknown, viewport_relevant
             nonlocal viewport_unverified_relevant, viewport_unknown
-            nonlocal unresolved_deferred_without_identity
             nonlocal visible_text_segments
 
             diagnostic = row.diagnostic
-            if diagnostic.state in {
-                "DEFERRED_OFFSCREEN",
-                "PARTIAL_BODY",
-                "PENDING_HYDRATION",
-            }:
+            evidence = diagnostic.read_evidence
+            previous_evidence = None
+            if pending_scroll_baseline is not None and diagnostic.observation_id:
+                previous_rows = pending_scroll_baseline.get("rows", {})
+                if isinstance(previous_rows, dict):
+                    candidate_evidence = previous_rows.get(diagnostic.observation_id)
+                    if isinstance(candidate_evidence, BodyReadEvidence):
+                        previous_evidence = candidate_evidence
+            if evidence is not None and previous_evidence is not None:
+                same_scroller = (
+                    evidence.scroll_surface_key
+                    == previous_evidence.scroll_surface_key
+                    and evidence.scroller_scroll_top is not None
+                    and previous_evidence.scroller_scroll_top is not None
+                )
+                if same_scroller:
+                    scroll_top_delta = (
+                        evidence.scroller_scroll_top
+                        - previous_evidence.scroller_scroll_top
+                    )
+                    diagnostic.same_scroller_scroll_top_delta = scroll_top_delta
+                    scroller_moved = abs(scroll_top_delta) > 1
+                    closer_to_text_below = (
+                        scroller_moved
+                        and previous_evidence.closest_text_side == "BELOW"
+                        and evidence.closest_text_side == "BELOW"
+                        and previous_evidence.closest_text_distance_px is not None
+                        and evidence.closest_text_distance_px is not None
+                        and evidence.closest_text_distance_px
+                        < previous_evidence.closest_text_distance_px - 1
+                    )
+                    frontier_advanced = (
+                        scroller_moved
+                        and previous_evidence.frontier_content_px is not None
+                        and evidence.frontier_content_px is not None
+                        and evidence.frontier_content_px
+                        > previous_evidence.frontier_content_px + 1
+                    )
+                    if closer_to_text_below or frontier_advanced:
+                        row_target_progress_ids.add(diagnostic.observation_id)
+
+            if diagnostic.state == "VERIFIED":
                 if row.fingerprint is not None:
+                    unresolved_deferred_fingerprints.discard(row.fingerprint)
+                if diagnostic.observation_id is not None:
+                    unresolved_observation_ids.discard(diagnostic.observation_id)
+            elif diagnostic.state != "NON_POST":
+                if row.fingerprint is not None:
+                    if diagnostic.observation_id is not None:
+                        unresolved_observation_ids.discard(
+                            diagnostic.observation_id
+                        )
                     unresolved_deferred_fingerprints.add(row.fingerprint)
                     unique_deferred_fingerprints.add(row.fingerprint)
+                elif diagnostic.observation_id is not None:
+                    unresolved_observation_ids.add(diagnostic.observation_id)
                 else:
-                    unresolved_deferred_without_identity = True
-            elif diagnostic.state == "VERIFIED" and row.fingerprint is not None:
-                unresolved_deferred_fingerprints.discard(row.fingerprint)
-            elif diagnostic.state != "NON_POST":
-                unresolved_deferred_without_identity = True
+                    unresolved_unrepresented_gaps.add(
+                        f"row:{viewport_number}:{diagnostic.row_index}"
+                    )
             if detail:
+                observation_emitted = bool(
+                    (row.target and (row.target.body or row.target.visible_segments))
+                    or (row.display and (row.display.body or row.display.visible_segments))
+                )
+                metrics = evidence or BodyReadEvidence()
                 print(
-                    f"[ROW row={diagnostic.row_index}] root={diagnostic.root_kind} "
+                    f"[ROW row_id={diagnostic.observation_id or 'UNTRACKED'} "
+                    f"viewport_row={diagnostic.row_index}] root={diagnostic.root_kind} "
                     f"has_visible_time={str(diagnostic.has_visible_time).lower()} "
                     f"has_post_permalink={str(diagnostic.has_post_permalink).lower()} "
                     f"has_profile_author={str(diagnostic.has_profile_author).lower()} "
                     f"has_readable_body={str(diagnostic.has_readable_body).lower()} "
+                    f"root_intersects={str(metrics.root_intersects).lower()} "
+                    f"body_text_nodes_present={metrics.body_text_nodes_present} "
+                    f"render_rect_count={metrics.render_rect_count} "
+                    f"visible_text_rect_count={metrics.visible_text_rect_count} "
+                    f"deferred_above_rect_count={metrics.deferred_above_rect_count} "
+                    f"deferred_below_rect_count={metrics.deferred_below_rect_count} "
+                    f"closest_text_distance_px={'UNKNOWN' if metrics.closest_text_distance_px is None else f'{metrics.closest_text_distance_px:.1f}'} "
+                    f"root_position_band={metrics.root_position_band} "
+                    f"same_scroller_scrollTop_delta={'UNKNOWN' if diagnostic.same_scroller_scroll_top_delta is None else f'{diagnostic.same_scroller_scroll_top_delta:.1f}'} "
+                    f"body_evidence={metrics.state} "
                     f"state={diagnostic.state} reason={diagnostic.reason} "
-                    f"observation={'EMITTED' if row.target or (row.display and row.display.body) else 'RECORDED'} "
+                    f"observation={'EMITTED' if observation_emitted else 'RECORDED'} "
                     "checkpoint=PENDING",
                     flush=True,
                 )
@@ -739,60 +819,101 @@ async def run_page_workflow(
         previous_unverified_rows = current_unverified_rows
         observed_rows += scan_counts.observed_rows
         skipped_rows += scan_counts.skipped_rows
-        if not scan_counts.coverage_complete:
-            unresolved_states = {
-                row.state
-                for row in reader.last_candidate_diagnostics
-                if row.state not in {"NON_POST", "VERIFIED"}
-            }
-            known_identity_progress = bool(unresolved_states) and unresolved_states.issubset(
-                {"DEFERRED_OFFSCREEN", "PARTIAL_BODY", "PENDING_HYDRATION"}
-            ) and all(
-                row.identity_fingerprint is not None
-                for row in reader.last_candidate_diagnostics
-                if row.state
-                in {"DEFERRED_OFFSCREEN", "PARTIAL_BODY", "PENDING_HYDRATION"}
-            )
-            if not known_identity_progress:
-                unresolved_deferred_without_identity = True
+        unresolved_rows = [
+            row
+            for row in reader.last_candidate_diagnostics
+            if row.state not in {"NON_POST", "VERIFIED"}
+        ]
+        if scan_counts.roots_truncated or (
+            not scan_counts.coverage_complete and not unresolved_rows
+        ):
+            unresolved_unrepresented_gaps.add(f"viewport:{viewport_number}")
         viewport_coverage_complete = not (
-            unresolved_deferred_fingerprints or unresolved_deferred_without_identity
+            unresolved_deferred_fingerprints
+            or unresolved_observation_ids
+            or unresolved_unrepresented_gaps
         )
 
         if pending_scroll_baseline is not None:
-            previous_frontier, previous_nearest = pending_scroll_baseline
-            current_frontier = scan_counts.frontier_content_px
-            frontier_delta = (
-                None
-                if previous_frontier is None or current_frontier is None
-                else current_frontier - previous_frontier
+            baseline_segments = int(
+                pending_scroll_baseline.get("visible_text_segments", visible_text_segments)
             )
-            nearest = scan_counts.nearest_deferred_below_px
-            approached_deferred = (
-                previous_nearest is not None
-                and nearest is not None
-                and nearest < previous_nearest - 1
+            baseline_verified = int(
+                pending_scroll_baseline.get(
+                    "unique_verified_posts", len(fully_read_fingerprints)
+                )
             )
+            baseline_bodies = int(
+                pending_scroll_baseline.get("body_extracted", body_extracted)
+            )
+            new_segments = max(0, visible_text_segments - baseline_segments)
+            new_observed_bodies = max(0, body_extracted - baseline_bodies)
+            new_verified = max(
+                0,
+                len(fully_read_fingerprints) - baseline_verified,
+            )
+            frontier_deltas = [
+                diagnostic.read_evidence.frontier_content_px
+                - previous_evidence.frontier_content_px
+                for diagnostic in reader.last_candidate_diagnostics
+                if diagnostic.observation_id in row_target_progress_ids
+                and diagnostic.read_evidence is not None
+                and diagnostic.read_evidence.frontier_content_px is not None
+                and isinstance(
+                    pending_scroll_baseline.get("rows", {}).get(
+                        diagnostic.observation_id
+                    ),
+                    BodyReadEvidence,
+                )
+                and (
+                    previous_evidence := pending_scroll_baseline["rows"][
+                        diagnostic.observation_id
+                    ]
+                ).frontier_content_px
+                is not None
+            ]
+            frontier_delta = max(frontier_deltas, default=None)
+            per_row_approach = bool(row_target_progress_ids)
             made_progress = bool(
-                scan_counts.new_visible_text_segments > 0
-                or scan_counts.new_verified_rows > 0
-                or (frontier_delta is not None and frontier_delta > 1)
-                or approached_deferred
+                new_segments or new_observed_bodies or new_verified or per_row_approach
             )
             consecutive_moved_no_content = (
-                0
-                if made_progress or not reader.last_scroll_near_end
-                else consecutive_moved_no_content + 1
+                0 if made_progress else consecutive_moved_no_content + 1
             )
+            for diagnostic in reader.last_candidate_diagnostics:
+                metrics = diagnostic.read_evidence
+                if metrics is None:
+                    continue
+                print(
+                    f"[SCROLL_ROW_PROGRESS] attempt={reader.scrolls} "
+                    f"row_id={diagnostic.observation_id or 'UNTRACKED'} "
+                    f"root_intersects={str(metrics.root_intersects).lower()} "
+                    f"body_text_nodes_present={metrics.body_text_nodes_present} "
+                    f"render_rect_count={metrics.render_rect_count} "
+                    f"visible_text_rect_count={metrics.visible_text_rect_count} "
+                    f"deferred_above_rect_count={metrics.deferred_above_rect_count} "
+                    f"deferred_below_rect_count={metrics.deferred_below_rect_count} "
+                    f"closest_text_distance_px={'UNKNOWN' if metrics.closest_text_distance_px is None else f'{metrics.closest_text_distance_px:.1f}'} "
+                    f"root_position_band={metrics.root_position_band} "
+                    f"same_scroller_scrollTop_delta={'UNKNOWN' if diagnostic.same_scroller_scroll_top_delta is None else f'{diagnostic.same_scroller_scroll_top_delta:.1f}'} "
+                    f"target_approached={str(diagnostic.observation_id in row_target_progress_ids).lower()} "
+                    f"body_evidence={metrics.state}",
+                    flush=True,
+                )
             print(
                 f"[SCROLL_PROGRESS] attempt={reader.scrolls} "
                 f"state={'ADVANCED_WITH_CONTENT' if made_progress else 'MOVED_NO_NEW_CONTENT'} "
-                f"new_segments={scan_counts.new_visible_text_segments} "
-                f"new_verified={scan_counts.new_verified_rows} "
+                f"new_segments={new_segments} "
+                f"new_observed_bodies={new_observed_bodies} "
+                f"new_verified_posts={new_verified} "
+                f"tracked_rows_approaching={len(row_target_progress_ids)} "
                 f"frontier_delta_px={'UNKNOWN' if frontier_delta is None else f'{frontier_delta:.1f}'} "
-                f"deferred_above={scan_counts.deferred_above} "
-                f"deferred_below={scan_counts.deferred_below} "
-                f"nearest_below_px={'UNKNOWN' if nearest is None else f'{nearest:.1f}'} "
+                f"deferred_above_rects={scan_counts.deferred_above} "
+                f"deferred_below_rects={scan_counts.deferred_below} "
+                f"viewport_row_appearances={observed_rows} "
+                f"unique_provenance_identities={len(provenance_verified_fingerprints)} "
+                f"unique_verified_posts={len(fully_read_fingerprints)} "
+                f"unresolved_gaps={len(unresolved_deferred_fingerprints) + len(unresolved_observation_ids) + len(unresolved_unrepresented_gaps)} "
                 f"band={reader.last_scroll_band} "
                 f"end_proximity={'NEAR' if reader.last_scroll_near_end else 'FAR'} "
                 f"end_distance_px={'UNKNOWN' if reader.last_scroll_end_distance is None else f'{reader.last_scroll_end_distance:.1f}'} "
@@ -800,9 +921,23 @@ async def run_page_workflow(
                 flush=True,
             )
             pending_scroll_baseline = None
-            if consecutive_moved_no_content >= 2:
-                exhaustion_reason = "NO_NEW_CONTENT"
-                print("[SCROLL_PROGRESS] status=STOPPED reason=NO_NEW_CONTENT", flush=True)
+            if consecutive_moved_no_content >= 3:
+                if (
+                    reader.last_scroll_end_distance is not None
+                    and reader.last_scroll_end_distance <= 1
+                    and viewport_coverage_complete
+                ):
+                    exhaustion_reason = "FEED_END_REACHED"
+                else:
+                    exhaustion_reason = "READ_PROGRESS_STALLED"
+                    unresolved_unrepresented_gaps.add(
+                        f"stalled:{reader.scrolls}"
+                    )
+                    viewport_coverage_complete = False
+                print(
+                    f"[SCROLL_PROGRESS] status=STOPPED reason={exhaustion_reason}",
+                    flush=True,
+                )
                 break
         observation_status = (
             "RELEVANT_UNVERIFIED"
@@ -823,7 +958,11 @@ async def run_page_workflow(
             f"classified={viewport_classified} "
             f"observed_rows={scan_counts.observed_rows} "
             f"body_extracted={scan_counts.body_extracted} "
-            f"provenance_verified={scan_counts.verified} "
+            f"provenance_verified_current={scan_counts.identity_verified} "
+            f"body_complete_current={scan_counts.verified} "
+            f"unique_provenance_identities={len(provenance_verified_fingerprints)} "
+            f"unique_verified_posts={len(fully_read_fingerprints)} "
+            f"viewport_row_appearances={observed_rows} "
             f"unverified_relevant={viewport_unverified_relevant} "
             f"observation_status={observation_status} "
             f"skipped_rows={scan_counts.skipped_rows} "
@@ -887,10 +1026,19 @@ async def run_page_workflow(
                     **reliability_metrics(),
                 )
         if (
-            unresolved_deferred_fingerprints or unresolved_deferred_without_identity
+            unresolved_deferred_fingerprints
+            or unresolved_observation_ids
+            or unresolved_unrepresented_gaps
         ) and not (unverified_relevant and not found_relevant):
             if reader.scroll_attempts < max_scrolls and await advance_feed():
                 continue
+            if reader.scroll_attempts >= max_scrolls:
+                exhaustion_reason = "SCROLL_BUDGET_EXHAUSTED_WITH_GAP"
+                print(
+                    "COVERAGE_STOP reason=SCROLL_BUDGET_EXHAUSTED_WITH_GAP "
+                    f"unresolved_gaps={len(unresolved_deferred_fingerprints) + len(unresolved_observation_ids) + len(unresolved_unrepresented_gaps)}",
+                    flush=True,
+                )
             if detail:
                 _detail_stop("VIEWPORT_COVERAGE_INCOMPLETE")
             return NurtureResult(
@@ -980,7 +1128,15 @@ async def run_page_workflow(
                 select_verified_fallback(viewport_fallback_targets)
             break
         if reader.scroll_attempts >= max_scrolls:
-            exhaustion_reason = "MAX_SCROLLS"
+            exhaustion_reason = (
+                "SCROLL_BUDGET_EXHAUSTED_WITH_GAP"
+                if (
+                    unresolved_deferred_fingerprints
+                    or unresolved_observation_ids
+                    or unresolved_unrepresented_gaps
+                )
+                else "MAX_SCROLLS"
+            )
             select_verified_fallback(viewport_fallback_targets)
             break
         if not await advance_feed():
@@ -989,10 +1145,23 @@ async def run_page_workflow(
                 select_verified_fallback(viewport_fallback_targets)
             break
 
+    if exhaustion_reason == "SCROLL_BUDGET_EXHAUSTED_WITH_GAP":
+        print(
+            "COVERAGE_STOP reason=SCROLL_BUDGET_EXHAUSTED_WITH_GAP "
+            f"unresolved_gaps={len(unresolved_deferred_fingerprints) + len(unresolved_observation_ids) + len(unresolved_unrepresented_gaps)}",
+            flush=True,
+        )
+
     detail_reads = 0
-    if not viewport_coverage_complete and not (
+    unverified_relevance_only = bool(
         selected is None and unverified_relevant and not found_relevant
-    ):
+    )
+    if (
+        not viewport_coverage_complete
+        or unresolved_deferred_fingerprints
+        or unresolved_observation_ids
+        or unresolved_unrepresented_gaps
+    ) and not unverified_relevance_only:
         if detail:
             _detail_stop("VIEWPORT_COVERAGE_INCOMPLETE")
         else:
@@ -1296,8 +1465,10 @@ async def run_page_workflow(
         unique_deferred_posts=len(unique_deferred_fingerprints),
         unresolved_gaps=(
             len(unresolved_deferred_fingerprints)
-            + int(unresolved_deferred_without_identity)
+            + len(unresolved_observation_ids)
+            + len(unresolved_unrepresented_gaps)
         ),
+        unique_provenance_identities=len(provenance_verified_fingerprints),
         visible_text_segments=visible_text_segments,
     )
 

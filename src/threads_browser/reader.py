@@ -26,7 +26,13 @@ from playwright.async_api import (
 )
 
 from .errors import UiReadError
-from .feed.models import DisplayObservation, HomeSample, PostTarget, VisibleBodySegment
+from .feed.models import (
+    BodyReadEvidence,
+    DisplayObservation,
+    HomeSample,
+    PostTarget,
+    VisibleBodySegment,
+)
 from .feed.relevance import canonical_terms, classify_body, normalize_text
 from .feed.urls import (
     _USERNAME,
@@ -34,6 +40,7 @@ from .feed.urls import (
     THREADS_ORIGIN,
     _CandidateDiagnosticReason,
     _post_url,
+    _post_url_hint,
     _post_url_rejection_reason,
     _post_url_structure,
     _profile_author,
@@ -89,6 +96,40 @@ _FOR_YOU_NAME = re.compile(r"^for you$", re.IGNORECASE)
 _PROFILE_NAME = re.compile(r"^(?:profile|your profile|account)$", re.IGNORECASE)
 _MORE_NAME = re.compile(r"^(?:more|see more|read more)$", re.IGNORECASE)
 _ReadinessResult = TypeVar("_ReadinessResult")
+
+
+def _canonicalize_body(value: str) -> str:
+    lines = [
+        re.sub(r"[^\S\n]+", " ", line).strip()
+        for line in value.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    ]
+    return "\n".join(line for line in lines if line)
+
+
+def _canonicalize_body_block(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _body_progress_state(
+    evidence: BodyReadEvidence | None,
+    *,
+    has_readable_body: bool,
+) -> tuple[str, str]:
+    if has_readable_body:
+        return "PARTIAL_BODY", "VISIBLE_TEXT_PROGRESS"
+    state = "NO_BODY_NODES" if evidence is None else evidence.state
+    return {
+        "TEXT_BELOW": ("DEFERRED_TEXT_BELOW", "BODY_TEXT_BELOW_VIEWPORT"),
+        "TEXT_ABOVE": ("DEFERRED_TEXT_ABOVE", "BODY_TEXT_ABOVE_VIEWPORT"),
+        "MEDIA_OR_WHITESPACE_GAP": (
+            "MEDIA_OR_WHITESPACE_GAP",
+            "NO_RENDERED_BODY_TEXT_IN_VIEW",
+        ),
+        "UNSUPPORTED_STRUCTURE": (
+            "UNSUPPORTED_STRUCTURE",
+            "POST_BODY_STRUCTURE_UNSUPPORTED",
+        ),
+    }.get(state, ("PENDING_HYDRATION", "POST_BODY_PENDING"))
 
 
 class _UnverifiedFeedCandidate(UiReadError):
@@ -204,6 +245,7 @@ class _FeedScanCounts:
     url_structure_counts: dict[str, int] = field(default_factory=dict)
     structural_reasons: dict[str, int] = field(default_factory=dict)
     unsupported_roots: int = 0
+    roots_truncated: bool = False
     region_status: str = "UNSET"
     scroll_surface_status: str = "NOT_CHECKED"
 
@@ -263,6 +305,7 @@ class _VisibleBodyRead:
     nearest_deferred_below_px: float | None = None
     frontier_content_px: float | None = None
     truncated: bool = False
+    read_evidence: BodyReadEvidence = field(default_factory=BodyReadEvidence)
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,6 +336,9 @@ class _CandidateDiagnostic:
     state: str = "NON_POST"
     reason: str = "NO_POST_ROW_EVIDENCE"
     identity_fingerprint: str | None = field(default=None, repr=False)
+    observation_id: str | None = field(default=None, repr=False)
+    read_evidence: BodyReadEvidence | None = field(default=None, repr=False)
+    same_scroller_scroll_top_delta: float | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -313,6 +359,7 @@ class _FeedTargetsObservation:
     coverage_complete: bool = True
     render_signature: tuple[object, ...] = field(default=(), repr=False)
     candidate_roots: tuple[Locator, ...] = field(default=(), repr=False)
+    candidate_observation_ids: tuple[str, ...] = field(default=(), repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -325,6 +372,7 @@ class _VisibleTargets:
     signature: tuple[object, ...] = field(repr=False)
     candidate_roots: tuple[Locator, ...] = field(default=(), repr=False)
     pending_signals: tuple[_CardWaitSignal, ...] = field(default=(), repr=False)
+    candidate_observation_ids: tuple[str, ...] = field(default=(), repr=False)
 
 
 class ThreadsHomeReader:
@@ -368,7 +416,10 @@ class ThreadsHomeReader:
         self.last_scroll_stop_reason: str | None = None
         self._last_viewport_signature: tuple[object, ...] | None = None
         self._last_viewport_candidate_roots: tuple[Locator, ...] = ()
+        self._last_viewport_candidate_observation_ids: tuple[str, ...] = ()
         self._carried_viewport_candidate_roots: tuple[Locator, ...] = ()
+        self._carried_viewport_candidate_observation_ids: tuple[str, ...] = ()
+        self._carried_viewport_candidate_handles: tuple[JSHandle, ...] = ()
         self._body_text_progress: dict[str, dict[str, _BodyTextProgress]] = {}
         self._body_visibility_ranges: dict[str, set[tuple[int, int, int]]] = {}
         self._body_progress_salt = secrets.token_bytes(16)
@@ -1077,6 +1128,9 @@ class ThreadsHomeReader:
                 self.last_viewport_coverage_complete = rendered.coverage_complete
                 self.last_viewport_observed_rows = rendered.observed_rows
                 self._last_viewport_candidate_roots = rendered.candidate_roots
+                self._last_viewport_candidate_observation_ids = (
+                    rendered.candidate_observation_ids
+                )
                 return observed_delta
 
             try:
@@ -1534,6 +1588,7 @@ class ThreadsHomeReader:
             scan.coverage_complete,
             scan.signature,
             scan.candidate_roots,
+            scan.candidate_observation_ids,
         )
         return _RenderObservation(
             scan.signature,
@@ -1675,16 +1730,33 @@ class ThreadsHomeReader:
         self.last_scan_counts.coverage_complete = scan.coverage_complete
         self._last_viewport_signature = scan.signature
         self._last_viewport_candidate_roots = scan.candidate_roots
+        self._last_viewport_candidate_observation_ids = (
+            scan.candidate_observation_ids
+        )
         self.last_viewport_deferred_only = (
             not scan.coverage_complete
             and any(
-                diagnostic.state in {"DEFERRED_OFFSCREEN", "PARTIAL_BODY"}
+                diagnostic.state
+                in {
+                    "DEFERRED_OFFSCREEN",
+                    "DEFERRED_TEXT_ABOVE",
+                    "DEFERRED_TEXT_BELOW",
+                    "PARTIAL_BODY",
+                    "MEDIA_OR_WHITESPACE_GAP",
+                }
                 for diagnostic in self.last_candidate_diagnostics
             )
             and all(
                 diagnostic.identity_fingerprint is not None
                 for diagnostic in self.last_candidate_diagnostics
-                if diagnostic.state in {"DEFERRED_OFFSCREEN", "PARTIAL_BODY"}
+                if diagnostic.state
+                in {
+                    "DEFERRED_OFFSCREEN",
+                    "DEFERRED_TEXT_ABOVE",
+                    "DEFERRED_TEXT_BELOW",
+                    "PARTIAL_BODY",
+                    "MEDIA_OR_WHITESPACE_GAP",
+                }
             )
         )
         self.last_viewport_can_wheel = bool(
@@ -2054,17 +2126,19 @@ class ThreadsHomeReader:
         except PlaywrightError:
             raise UiReadError("HOME_SCROLL_UNVERIFIED") from None
 
-    async def _is_carried_viewport_candidate(self, root: Locator) -> bool:
-        for previous in self._carried_viewport_candidate_roots:
-            handle = await previous.element_handle()
-            if handle is None:
-                continue
-            try:
-                if await root.evaluate("(node, other) => node === other", handle):
-                    return True
-            finally:
-                await handle.dispose()
-        return False
+    async def _is_carried_viewport_candidate(self, root: Locator) -> str | None:
+        handles = self._carried_viewport_candidate_handles
+        if not handles:
+            return None
+        matched_index = await root.evaluate(
+            "(node, previous) => previous.findIndex(item => node === item)",
+            list(handles),
+        )
+        if matched_index < 0:
+            return None
+        if matched_index >= len(self._carried_viewport_candidate_observation_ids):
+            return None
+        return self._carried_viewport_candidate_observation_ids[matched_index]
 
     async def _visible_targets(
         self,
@@ -2117,6 +2191,7 @@ class ThreadsHomeReader:
         counts.rejection_reasons.clear()
         counts.url_structure_counts.clear()
         counts.unsupported_roots = 0
+        counts.roots_truncated = False
         counts.region_status = "UNSET"
         counts.scroll_surface_status = "NOT_CHECKED"
         counts.structural_reasons.clear()
@@ -2127,6 +2202,7 @@ class ThreadsHomeReader:
         discover_started = time.perf_counter()
         region = await self._content_region()
         roots, roots_truncated = await self._top_level_candidate_roots(region, viewport)
+        counts.roots_truncated = roots_truncated
         structures = await self._collect_structure_diagnostics(
             region,
             roots,
@@ -2155,27 +2231,8 @@ class ThreadsHomeReader:
                     )
                 )
 
-        async def defer_offscreen_body(
-            root: Locator,
-            diagnostic: _CandidateDiagnostic,
-        ) -> bool:
-            if not currently_visible:
-                return False
-            has_body_candidate, visible_body_candidate = (
-                await self._visible_body_candidate_state(root)
-            )
-            if not has_body_candidate or visible_body_candidate:
-                return False
-            counts.deferred_offscreen += 1
-            counts.skipped_rows += 1
-            self.last_scan_timings.wait_reason = "DEFERRED_OFFSCREEN"
-            diagnostic.state = "DEFERRED_OFFSCREEN"
-            diagnostic.reason = "POST_BODY_OUTSIDE_VISIBLE_SCROLLPORT"
-            await emit_row(diagnostic)
-            return True
-
         candidate_rows: list[
-            tuple[int, Locator, _CandidateStructure, bool, _CandidateDiagnostic]
+            tuple[int, Locator, _CandidateStructure, bool, _CandidateDiagnostic, str]
         ] = []
         diagnostics: list[_CandidateDiagnostic] = []
         for index, root in enumerate(roots):
@@ -2214,11 +2271,27 @@ class ThreadsHomeReader:
                 or structure.visible_times
                 or structure.visible_post_links
             ) and root_kind in {"ARTICLE", "ROLE_ARTICLE", "PRESSABLE"}
-            carried_row = await self._is_carried_viewport_candidate(root)
+            carried_observation_id = await self._is_carried_viewport_candidate(root)
+            carried_row = carried_observation_id is not None
             if has_row_cues or semantic_row or carried_row:
                 diagnostic.state = "PENDING"
                 diagnostic.reason = "POST_ROW_REQUIRES_VERIFICATION"
-                candidate_rows.append((index, root, structure, carried_row, diagnostic))
+                diagnostic.observation_id = (
+                    carried_observation_id or secrets.token_hex(8)
+                )
+                candidate_rows.append(
+                    (
+                        index,
+                        root,
+                        structure,
+                        carried_row,
+                        diagnostic,
+                        diagnostic.observation_id,
+                    )
+                )
+        for handle in self._carried_viewport_candidate_handles:
+            await handle.dispose()
+        self._carried_viewport_candidate_handles = ()
         self.last_candidate_diagnostics = tuple(diagnostics)
         counts.observed_rows = len(candidate_rows)
         counts.coverage_complete = (
@@ -2226,7 +2299,7 @@ class ThreadsHomeReader:
             and len(candidate_rows) <= max_posts
             and not any(
                 structure.visible_times > 1
-                for _, _, structure, _, _ in candidate_rows
+                for _, _, structure, _, _, _ in candidate_rows
             )
         )
         targets: list[PostTarget] = []
@@ -2235,8 +2308,9 @@ class ThreadsHomeReader:
         pending_signals: list[_CardWaitSignal] = []
         scanned_fingerprints: set[str] = set()
         candidate_by_index = {
-            index: (root, structure, carried_row, diagnostic)
-            for index, root, structure, carried_row, diagnostic in candidate_rows
+            index: (root, structure, carried_row, diagnostic, observation_id)
+            for index, root, structure, carried_row, diagnostic, observation_id
+            in candidate_rows
         }
         processed_candidates = 0
         for row_index, diagnostic in enumerate(diagnostics):
@@ -2251,7 +2325,7 @@ class ThreadsHomeReader:
                 await emit_row(diagnostic)
                 continue
             processed_candidates += 1
-            root, structure, carried_row, diagnostic = candidate
+            root, structure, carried_row, diagnostic, _ = candidate
             box = await root.bounding_box()
             if box is None:
                 counts.skipped_rows += 1
@@ -2380,10 +2454,11 @@ class ThreadsHomeReader:
                 self.last_scan_timings.read_row_ms += round(
                     (time.perf_counter() - read_started) * 1000
                 )
-                if await defer_offscreen_body(root, diagnostic):
-                    continue
                 counts.card_not_ready += 1
-                body, body_signals = await self._observe_display_body(root)
+                body, body_signals, read_evidence = await self._observe_display_body(
+                    root
+                )
+                diagnostic.read_evidence = read_evidence
                 diagnostic.has_readable_body = bool(body)
                 should_wait_for_permalink = (
                     pending.reason_code == "POST_PERMALINK_PENDING"
@@ -2412,15 +2487,22 @@ class ThreadsHomeReader:
                         signal_is_visible = True
                         break
                 if signals and not signal_is_visible:
-                    self.last_scan_timings.wait_reason = "DEFERRED_OFFSCREEN"
-                    diagnostic.state = "DEFERRED_OFFSCREEN"
-                    diagnostic.reason = "READINESS_SIGNAL_OUTSIDE_VISIBLE_SCROLLPORT"
+                    self.last_scan_timings.wait_reason = "DEFERRED_IDENTITY"
+                    if should_wait_for_permalink or should_wait_for_missing_author:
+                        diagnostic.state = "DEFERRED_IDENTITY"
+                        diagnostic.reason = "READINESS_SIGNAL_OUTSIDE_VISIBLE_SCROLLPORT"
+                    else:
+                        diagnostic.state, diagnostic.reason = _body_progress_state(
+                            read_evidence,
+                            has_readable_body=bool(body),
+                        )
                     counts.deferred_offscreen += 1
                     counts.skipped_rows += 1
                     display = DisplayObservation(
                         body,
                         "OBSERVATION_UNCERTAIN" if body is None else "OBSERVED_UNVERIFIED",
                         box["y"],
+                        read_evidence=read_evidence,
                     )
                     if body:
                         counts.body_extracted += 1
@@ -2448,18 +2530,29 @@ class ThreadsHomeReader:
                     counts.skipped_rows += 1
                     counts.uncertain_rows += 1
                 else:
-                    diagnostic.state = "REJECTED"
-                    diagnostic.reason = pending.reason_code
+                    diagnostic.state, diagnostic.reason = _body_progress_state(
+                        read_evidence,
+                        has_readable_body=False,
+                    )
                     counts.body_unknown += 1
                     counts.skipped_rows += 1
                     counts.uncertain_rows += 1
                 if body:
                     display_observations.append(
-                        DisplayObservation(body, viewport_y=box["y"])
+                        DisplayObservation(
+                            body,
+                            viewport_y=box["y"],
+                            read_evidence=read_evidence,
+                        )
                     )
                 else:
                     display_observations.append(
-                        DisplayObservation(None, "OBSERVATION_UNCERTAIN", box["y"])
+                        DisplayObservation(
+                            None,
+                            "OBSERVATION_UNCERTAIN",
+                            box["y"],
+                            read_evidence=read_evidence,
+                        )
                     )
                 wait_started = time.perf_counter()
                 if signal_is_visible:
@@ -2499,17 +2592,20 @@ class ThreadsHomeReader:
                             if display_observations:
                                 display_observations.pop()
                             diagnostic.identity_fingerprint = target.fingerprint
-                            diagnostic.state = (
-                                "VERIFIED" if target.body_complete else "PARTIAL_BODY"
-                            )
-                            diagnostic.reason = (
-                                "PROVENANCE_VERIFIED"
-                                if target.body_complete
-                                else "VISIBLE_TEXT_PROGRESS"
-                            )
+                            diagnostic.read_evidence = target.read_evidence
                             diagnostic.has_readable_body = bool(
                                 target.body and target.body.strip()
                             )
+                            if target.body_complete:
+                                diagnostic.state = "VERIFIED"
+                                diagnostic.reason = "PROVENANCE_VERIFIED"
+                            else:
+                                diagnostic.state, diagnostic.reason = (
+                                    _body_progress_state(
+                                        target.read_evidence,
+                                        has_readable_body=diagnostic.has_readable_body,
+                                    )
+                                )
                             counts.identity_verified += 1
                             counts.verified += int(target.body_complete)
                             counts.partial_body_rows += int(not target.body_complete)
@@ -2521,8 +2617,14 @@ class ThreadsHomeReader:
                                 counts.body_unknown += 1
                                 counts.uncertain_rows += 1
                                 counts.skipped_rows += 1
-                                diagnostic.state = "PENDING_HYDRATION"
-                                diagnostic.reason = "POST_BODY_UNAVAILABLE"
+                                if diagnostic.state == "UNSUPPORTED_STRUCTURE":
+                                    self._record_structure_reason(
+                                        "POST_BODY_STRUCTURE_UNSUPPORTED"
+                                    )
+                                elif diagnostic.state == "DEFERRED_TEXT_ABOVE":
+                                    counts.deferred_above += 1
+                                elif diagnostic.state == "DEFERRED_TEXT_BELOW":
+                                    counts.deferred_below += 1
                             elif target.body_complete:
                                 targets.append(target)
                             await emit_row(diagnostic, target=target)
@@ -2536,54 +2638,88 @@ class ThreadsHomeReader:
                 self.last_scan_timings.read_row_ms += round(
                     (time.perf_counter() - read_started) * 1000
                 )
-                if await defer_offscreen_body(root, diagnostic):
-                    continue
                 self._record_scan_skip(stage, error)
                 if error.diagnostic_reason == "CANDIDATE_WRAPPER_AMBIGUOUS":
-                    counts.skipped_rows += 1
-                    counts.uncertain_rows += 1
-                    diagnostic.state = "REJECTED"
-                    diagnostic.reason = error.diagnostic_reason
-                    display_observations.append(
-                        DisplayObservation(None, "OBSERVATION_UNCERTAIN", box["y"])
+                    body, body_signals, read_evidence = await self._observe_display_body(
+                        root
                     )
-                    await emit_row(diagnostic, display=display_observations[-1])
+                    diagnostic.read_evidence = read_evidence
+                    diagnostic.has_readable_body = bool(body)
+                    if body:
+                        diagnostic.state = "OBSERVED_UNVERIFIED"
+                        diagnostic.reason = error.diagnostic_reason
+                        counts.body_extracted += 1
+                    else:
+                        diagnostic.state, diagnostic.reason = _body_progress_state(
+                            read_evidence,
+                            has_readable_body=False,
+                        )
+                        if body_signals:
+                            pending_signals.extend(body_signals)
+                        counts.body_unknown += 1
+                        counts.skipped_rows += 1
+                        counts.uncertain_rows += 1
+                    display = DisplayObservation(
+                        body,
+                        "OBSERVATION_UNCERTAIN" if body is None else "OBSERVED_UNVERIFIED",
+                        box["y"],
+                        read_evidence=read_evidence,
+                    )
+                    display_observations.append(display)
+                    await emit_row(diagnostic, display=display)
                     continue
-                body, body_signals = await self._observe_display_body(root)
+                body, body_signals, read_evidence = await self._observe_display_body(
+                    root
+                )
+                diagnostic.read_evidence = read_evidence
                 diagnostic.has_readable_body = bool(body)
                 if body:
                     counts.body_extracted += 1
                     diagnostic.state = "OBSERVED_UNVERIFIED"
                     diagnostic.reason = error.diagnostic_reason or error.reason
                     display_observations.append(
-                        DisplayObservation(body, viewport_y=box["y"])
+                        DisplayObservation(
+                            body,
+                            viewport_y=box["y"],
+                            read_evidence=read_evidence,
+                        )
                     )
                 else:
                     counts.body_unknown += 1
                     counts.skipped_rows += 1
                     counts.uncertain_rows += 1
-                    diagnostic.state = (
-                        "PENDING_HYDRATION" if body_signals else "REJECTED"
-                    )
-                    diagnostic.reason = (
-                        "POST_BODY_PENDING"
-                        if body_signals
-                        else error.diagnostic_reason or error.reason
-                    )
+                    if body_signals:
+                        diagnostic.state = "PENDING_HYDRATION"
+                        diagnostic.reason = "POST_BODY_PENDING"
+                    else:
+                        diagnostic.state, diagnostic.reason = _body_progress_state(
+                            read_evidence,
+                            has_readable_body=False,
+                        )
+                        if diagnostic.state == "PENDING_HYDRATION":
+                            diagnostic.state = "REJECTED"
+                            diagnostic.reason = (
+                                error.diagnostic_reason or error.reason
+                            )
                     pending_signals.extend(body_signals)
                     display_observations.append(
-                        DisplayObservation(None, "OBSERVATION_UNCERTAIN", box["y"])
+                        DisplayObservation(
+                            None,
+                            "OBSERVATION_UNCERTAIN",
+                            box["y"],
+                            read_evidence=read_evidence,
+                        )
                     )
                 await emit_row(
                     diagnostic,
                     display=display_observations[-1],
-                    fingerprint=next(iter(error.identities), None),
                 )
                 continue
             self.last_scan_timings.read_row_ms += round(
                 (time.perf_counter() - read_started) * 1000
             )
             diagnostic.identity_fingerprint = target.fingerprint
+            diagnostic.read_evidence = target.read_evidence
             diagnostic.state = "VERIFIED" if target.body_complete else "PARTIAL_BODY"
             diagnostic.reason = (
                 "PROVENANCE_VERIFIED"
@@ -2609,9 +2745,21 @@ class ThreadsHomeReader:
                     )
             else:
                 counts.body_unknown += 1
-                self._record_structure_reason("POST_BODY_STRUCTURE_UNSUPPORTED")
-                diagnostic.state = "PENDING_HYDRATION"
-                diagnostic.reason = "POST_BODY_UNAVAILABLE"
+                diagnostic.state, diagnostic.reason = _body_progress_state(
+                    target.read_evidence,
+                    has_readable_body=False,
+                )
+                if diagnostic.state == "DEFERRED_TEXT_BELOW":
+                    counts.deferred_below += 1
+                elif diagnostic.state == "DEFERRED_TEXT_ABOVE":
+                    counts.deferred_above += 1
+                elif diagnostic.state == "UNSUPPORTED_STRUCTURE":
+                    self._record_structure_reason(
+                        "POST_BODY_STRUCTURE_UNSUPPORTED"
+                    )
+                elif diagnostic.state == "PENDING_HYDRATION":
+                    _, body_signals, _ = await self._observe_display_body(root)
+                    pending_signals.extend(body_signals)
                 counts.skipped_rows += 1
                 counts.uncertain_rows += 1
                 diagnostic.identity_fingerprint = target.fingerprint
@@ -2711,8 +2859,12 @@ class ThreadsHomeReader:
             counts.observed_rows,
             counts.coverage_complete,
             signature,
-            tuple(root for _, root, _, _, _ in candidate_rows[:max_posts]),
+            tuple(root for _, root, _, _, _, _ in candidate_rows[:max_posts]),
             tuple(pending_signals),
+            tuple(
+                observation_id
+                for _, _, _, _, _, observation_id in candidate_rows[:max_posts]
+            ),
         )
 
     @staticmethod
@@ -2927,70 +3079,189 @@ class ThreadsHomeReader:
         viewport: dict[str, int],
     ) -> tuple[list[Locator], bool]:
         candidates: list[tuple[float, Locator]] = []
-        candidate_handles: list[JSHandle] = []
+        candidate_keys: set[str] = set()
         self._carried_viewport_candidate_roots = ()
+        self._carried_viewport_candidate_observation_ids = ()
+        self._carried_viewport_candidate_handles = ()
         carried_roots: list[Locator] = []
+        carried_observation_ids: list[str] = []
         truncated = False
 
-        async def add_candidate(root: Locator, box: dict[str, float]) -> None:
-            handle = await root.element_handle()
-            if handle is None:
+        async def add_candidate(
+            root: Locator,
+            box: dict[str, float],
+            key: str | None = None,
+        ) -> None:
+            if key is None:
+                key = await root.evaluate(
+                    """node => {
+                        const path = [];
+                        for (let current = node; current;
+                             current = current.parentElement) {
+                            const parent = current.parentElement;
+                            path.push(parent ? Array.prototype.indexOf.call(
+                                parent.children, current
+                            ) : 0);
+                        }
+                        return path.reverse().join("/");
+                    }"""
+                )
+            if key in candidate_keys:
                 return
-            for existing in candidate_handles:
-                if await handle.evaluate("(node, other) => node === other", existing):
-                    await handle.dispose()
-                    return
-            candidate_handles.append(handle)
+            candidate_keys.add(key)
             candidates.append((box["y"], root))
 
         selectors = (
             'article, [role="article"]:not(article)',
             '[data-pressable-container="true"]:not(article):not([role="article"])',
         )
+        async def inspect_semantic_root(root: Locator) -> dict[str, float] | None:
+            if not await root.is_visible():
+                return None
+            if (
+                await self._is_outside_content_landmark(root)
+                or await self._is_inside_quote(root)
+            ):
+                return None
+            box = await root.bounding_box()
+            if box is None or not self._intersects_viewport(box, viewport):
+                return None
+            if await self._is_nested_feed_root(root):
+                return None
+            return box
+
         for selector in selectors:
             roots = region.locator(selector)
             available = await roots.count()
             count = min(available, _MAX_FEED_ROOTS_PER_TYPE)
             truncated = truncated or available > count
-            for index in range(count):
-                root = roots.nth(index)
-                if not await root.is_visible():
-                    continue
-                if (
-                    await self._is_outside_content_landmark(root)
-                    or await self._is_inside_quote(root)
-                ):
-                    continue
-                box = await root.bounding_box()
-                if box is None or not self._intersects_viewport(box, viewport):
-                    continue
-                if await self._is_nested_feed_root(root):
-                    continue
-                await add_candidate(root, box)
+            selected_roots = [roots.nth(index) for index in range(count)]
+            boxes = await asyncio.gather(
+                *(inspect_semantic_root(root) for root in selected_roots)
+            )
+            eligible_roots = [
+                (root, box)
+                for root, box in zip(selected_roots, boxes, strict=True)
+                if box is not None
+            ]
+            identity_keys = await asyncio.gather(
+                *(
+                    root.evaluate(
+                        """node => {
+                            const path = [];
+                            for (let current = node; current;
+                                 current = current.parentElement) {
+                                const parent = current.parentElement;
+                                path.push(parent ? Array.prototype.indexOf.call(
+                                    parent.children, current
+                                ) : 0);
+                            }
+                            return path.reverse().join("/");
+                        }"""
+                    )
+                    for root, _ in eligible_roots
+                )
+            )
+            for (root_box, identity) in zip(
+                eligible_roots,
+                identity_keys,
+                strict=True,
+            ):
+                root, box = root_box
+                await add_candidate(root, box, str(identity))
 
         region_handle = await region.element_handle()
         if region_handle is not None:
             try:
-                for root in self._last_viewport_candidate_roots:
-                    if not await root.is_visible():
-                        continue
-                    if (
-                        await self._is_outside_content_landmark(root)
-                        or await self._is_inside_quote(root)
-                        or not await root.evaluate(
-                            "(node, parent) => parent.contains(node)",
-                            region_handle,
-                        )
-                    ):
-                        continue
-                    box = await root.bounding_box()
-                    if box is None or not self._intersects_viewport(box, viewport):
+                async def inspect_carried_root(
+                    root: Locator,
+                ) -> dict[str, object] | None:
+                    return await root.evaluate(
+                        """(node, args) => {
+                            const style = getComputedStyle(node);
+                            const rect = node.getBoundingClientRect();
+                            if (style.display === "none" ||
+                                style.visibility === "hidden" ||
+                                rect.width <= 0 || rect.height <= 0 ||
+                                rect.right <= 0 || rect.bottom <= 0 ||
+                                rect.left >= args.viewport.width ||
+                                rect.top >= args.viewport.height ||
+                                node.closest(args.outside) ||
+                                node.closest(args.quote) ||
+                                !args.region.contains(node)) return null;
+                            const path = [];
+                            for (let current = node; current;
+                                 current = current.parentElement) {
+                                const parent = current.parentElement;
+                                path.push(parent ? Array.prototype.indexOf.call(
+                                    parent.children, current
+                                ) : 0);
+                            }
+                            return {
+                                y: rect.top,
+                                key: path.reverse().join("/"),
+                            };
+                        }""",
+                        {
+                            "viewport": viewport,
+                            "region": region_handle,
+                            "outside": (
+                                "nav, aside, footer, form, [contenteditable='true'], "
+                                "[role='navigation'], [role='menu'], "
+                                "[role='complementary'], [role='dialog'], "
+                                "[role='search'], [role='banner'], "
+                                "[role='contentinfo'], [role='textbox']"
+                            ),
+                            "quote": _QUOTE_SELECTOR,
+                        },
+                    )
+
+                carried_boxes = await asyncio.gather(
+                    *(
+                        inspect_carried_root(root)
+                        for root in self._last_viewport_candidate_roots
+                    )
+                )
+                for index, (root, box) in enumerate(
+                    zip(self._last_viewport_candidate_roots, carried_boxes, strict=True)
+                ):
+                    if box is None:
                         continue
                     carried_roots.append(root)
-                    await add_candidate(root, box)
+                    carried_observation_ids.append(
+                        self._last_viewport_candidate_observation_ids[index]
+                        if index < len(self._last_viewport_candidate_observation_ids)
+                        else secrets.token_hex(8)
+                    )
+                    await add_candidate(
+                        root,
+                        {"y": float(box["y"])},
+                        str(box["key"]),
+                    )
             finally:
                 await region_handle.dispose()
         self._carried_viewport_candidate_roots = tuple(carried_roots)
+        self._carried_viewport_candidate_observation_ids = tuple(
+            carried_observation_ids
+        )
+        carried_handles = await asyncio.gather(
+            *(root.element_handle() for root in carried_roots)
+        )
+        retained_carried = [
+            (handle, observation_id)
+            for handle, observation_id in zip(
+                carried_handles,
+                carried_observation_ids,
+                strict=True,
+            )
+            if handle is not None
+        ]
+        self._carried_viewport_candidate_handles = tuple(
+            handle for handle, _ in retained_carried
+        )
+        self._carried_viewport_candidate_observation_ids = tuple(
+            observation_id for _, observation_id in retained_carried
+        )
 
         # Some pages expose independent post rows only as ordinary containers.
         # Infer a root from the nearest visible ancestor that owns exactly one
@@ -2999,59 +3270,80 @@ class ThreadsHomeReader:
         time_count = await times.count()
         if time_count > _MAX_STRUCTURE_ELEMENTS:
             truncated = True
-        for index in range(min(time_count, _MAX_STRUCTURE_ELEMENTS)):
-            timestamp = times.nth(index)
-            fallback = await timestamp.evaluate(
-                """(time, args) => {
-                    const visible = element => {
-                        const style = getComputedStyle(element);
-                        const rect = element.getBoundingClientRect();
-                        if (style.display === "none" || style.visibility === "hidden" ||
-                            rect.width <= 0 || rect.height <= 0 ||
-                            rect.right <= 0 || rect.bottom <= 0 ||
-                            rect.left >= args.viewport.width ||
-                            rect.top >= args.viewport.height) return false;
-                        let left = Math.max(0, rect.left);
-                        let top = Math.max(0, rect.top);
-                        let right = Math.min(args.viewport.width, rect.right);
-                        let bottom = Math.min(args.viewport.height, rect.bottom);
-                        for (let parent = element.parentElement; parent;
-                             parent = parent.parentElement) {
-                            const style = getComputedStyle(parent);
-                            const clipX = style.overflowX !== "visible";
-                            const clipY = style.overflowY !== "visible";
-                            if (!clipX && !clipY) continue;
-                            const bounds = parent.getBoundingClientRect();
-                            const clipLeft = bounds.left + parent.clientLeft;
-                            const clipTop = bounds.top + parent.clientTop;
-                            const clipRight = clipLeft + parent.clientWidth;
-                            const clipBottom = clipTop + parent.clientHeight;
-                            if (clipX) {
-                                left = Math.max(left, clipLeft);
-                                right = Math.min(right, clipRight);
-                            }
-                            if (clipY) {
-                                top = Math.max(top, clipTop);
-                                bottom = Math.min(bottom, clipBottom);
-                            }
+        fallbacks = await times.evaluate_all(
+            """(timeNodes, args) => {
+                const visible = element => {
+                    const style = getComputedStyle(element);
+                    const rect = element.getBoundingClientRect();
+                    if (style.display === "none" || style.visibility === "hidden" ||
+                        rect.width <= 0 || rect.height <= 0 ||
+                        rect.right <= 0 || rect.bottom <= 0 ||
+                        rect.left >= args.viewport.width ||
+                        rect.top >= args.viewport.height) return false;
+                    let left = Math.max(0, rect.left);
+                    let top = Math.max(0, rect.top);
+                    let right = Math.min(args.viewport.width, rect.right);
+                    let bottom = Math.min(args.viewport.height, rect.bottom);
+                    for (let parent = element.parentElement; parent;
+                         parent = parent.parentElement) {
+                        const parentStyle = getComputedStyle(parent);
+                        const clipX = parentStyle.overflowX !== "visible";
+                        const clipY = parentStyle.overflowY !== "visible";
+                        if (!clipX && !clipY) continue;
+                        const bounds = parent.getBoundingClientRect();
+                        const clipLeft = bounds.left + parent.clientLeft;
+                        const clipTop = bounds.top + parent.clientTop;
+                        const clipRight = clipLeft + parent.clientWidth;
+                        const clipBottom = clipTop + parent.clientHeight;
+                        if (clipX) {
+                            left = Math.max(left, clipLeft);
+                            right = Math.min(right, clipRight);
                         }
-                        return right > left && bottom > top;
-                    };
-                    const outside = element => element.closest(args.outside) !== null;
-                    const insideQuote = element => element.closest(args.quote) !== null;
-                    const profileLink = element => {
-                        const href = element.getAttribute("href");
-                        if (!href) return false;
-                        try {
-                            const url = new URL(href, location.href);
-                            return url.protocol === "https:" &&
-                                url.hostname.toLowerCase() === "www.threads.com" &&
-                                !url.search && !url.hash &&
-                                /^[/]@[A-Za-z0-9._]{1,30}[/]?$/.test(url.pathname);
-                        } catch { return false; }
-                    };
+                        if (clipY) {
+                            top = Math.max(top, clipTop);
+                            bottom = Math.min(bottom, clipBottom);
+                        }
+                    }
+                    return right > left && bottom > top;
+                };
+                const outside = element => element.closest(args.outside) !== null;
+                const insideQuote = element => element.closest(args.quote) !== null;
+                const profileLink = element => {
+                    const href = element.getAttribute("href");
+                    if (!href) return false;
+                    try {
+                        const url = new URL(href, location.href);
+                        return url.protocol === "https:" &&
+                            url.hostname.toLowerCase() === "www.threads.com" &&
+                            !url.search && !url.hash &&
+                            /^[/]@[A-Za-z0-9._]{1,30}[/]?$/.test(url.pathname);
+                    } catch { return false; }
+                };
+                const postPathHint = element => {
+                    const href = element.getAttribute("href");
+                    if (!href) return false;
+                    try {
+                        return new URL(href, location.href).pathname
+                            .split("/").includes("post");
+                    } catch { return false; }
+                };
+                const identityPath = node => {
+                    const path = [];
+                    for (let current = node; current; current = current.parentElement) {
+                        const parent = current.parentElement;
+                        path.push(parent ? Array.prototype.indexOf.call(
+                            parent.children, current
+                        ) : 0);
+                    }
+                    return path.reverse().join("/");
+                };
+                const seen = new Set();
+                const results = [];
+                const limit = Math.min(timeNodes.length, args.maxTimes);
+                for (let index = 0; index < limit; index++) {
+                    const time = timeNodes[index];
                     if (outside(time) || insideQuote(time) || !visible(time) ||
-                        time.parentElement?.closest(args.roots)) return null;
+                        time.parentElement?.closest(args.roots)) continue;
                     let ancestor = time;
                     let fallback = null;
                     for (let depth = 1; depth <= args.maxAncestors; depth++) {
@@ -3075,9 +3367,7 @@ class ThreadsHomeReader:
                             .filter(element => belongs(element) && !outside(element) &&
                                 visible(element));
                         const profileCount = links.filter(profileLink).length;
-                        const postCount = links.filter(element =>
-                            (element.getAttribute("href") || "").includes("/post/")
-                        ).length;
+                        const postCount = links.filter(postPathHint).length;
                         const bodies = Array.from(
                             ancestor.querySelectorAll(args.body)
                         ).filter(element => {
@@ -3095,46 +3385,56 @@ class ThreadsHomeReader:
                         const box = ancestor.getBoundingClientRect();
                         const evidence = profileCount || postCount || bodies.length;
                         if (times.length === 1 && evidence) {
-                            fallback = {depth, y: box.top};
+                            fallback = {depth, y: box.top, identity: identityPath(ancestor)};
                             if (bodies.length) break;
                         }
                         if (times.length > 1 || profileCount > 1) {
                             if (bodies.length || postCount) {
-                                fallback = {depth, y: box.top};
+                                fallback = {
+                                    depth, y: box.top, identity: identityPath(ancestor),
+                                };
                             }
                             break;
                         }
                     }
-                    return fallback;
-                }""",
-                {
-                    "viewport": viewport,
-                    "roots": _FEED_ROOT_SELECTOR,
-                    "quote": _QUOTE_SELECTOR,
-                    "body": _BODY_TEXT_SELECTOR,
-                    "bodyExcluded": _BODY_EXCLUSION_SELECTOR,
-                    "outside": (
-                        "nav, aside, footer, form, [contenteditable='true'], "
-                        "[role='navigation'], [role='menu'], [role='complementary'], "
-                        "[role='dialog'], [role='search'], [role='banner'], "
-                        "[role='contentinfo'], [role='textbox']"
-                    ),
-                    "maxAncestors": _MAX_CARD_ANCESTORS,
-                },
+                    if (fallback === null || seen.has(fallback.identity)) continue;
+                    seen.add(fallback.identity);
+                    results.push({index, ...fallback});
+                }
+                return results;
+            }""",
+            {
+                "viewport": viewport,
+                "roots": _FEED_ROOT_SELECTOR,
+                "quote": _QUOTE_SELECTOR,
+                "body": _BODY_TEXT_SELECTOR,
+                "bodyExcluded": _BODY_EXCLUSION_SELECTOR,
+                "outside": (
+                    "nav, aside, footer, form, [contenteditable='true'], "
+                    "[role='navigation'], [role='menu'], [role='complementary'], "
+                    "[role='dialog'], [role='search'], [role='banner'], "
+                    "[role='contentinfo'], [role='textbox']"
+                ),
+                "maxAncestors": _MAX_CARD_ANCESTORS,
+                "maxTimes": _MAX_STRUCTURE_ELEMENTS,
+            },
+        )
+        for fallback in fallbacks:
+            timestamp = times.nth(fallback["index"])
+            ancestor = timestamp.locator(
+                f"xpath=ancestor::*[{fallback['depth']}]"
             )
-            if fallback is not None:
-                ancestor = timestamp.locator(
-                    f"xpath=ancestor::*[{fallback['depth']}]"
-                )
-                await add_candidate(ancestor, {"y": fallback["y"]})
+            await add_candidate(
+                ancestor,
+                {"y": fallback["y"]},
+                str(fallback["identity"]),
+            )
 
         candidates.sort(key=lambda item: item[0])
         roots = [root for _, root in candidates]
         if len(roots) > _MAX_VISIBLE_ROW_CANDIDATES:
             truncated = True
             roots = roots[:_MAX_VISIBLE_ROW_CANDIDATES]
-        for handle in candidate_handles:
-            await handle.dispose()
         return roots, truncated
 
     @staticmethod
@@ -3153,6 +3453,13 @@ class ThreadsHomeReader:
     ) -> _CandidateStructure:
         structure = await root.evaluate(
             """(root, args) => {
+                const postPathHint = value => {
+                    if (!value) return false;
+                    try {
+                        return new URL(value, location.href).pathname
+                            .split("/").includes("post");
+                    } catch { return false; }
+                };
                 const cssVisible = element => {
                     const style = getComputedStyle(element);
                     const rect = element.getBoundingClientRect();
@@ -3238,7 +3545,7 @@ class ThreadsHomeReader:
                                 visible(element.querySelector("time"))
                             ),
                         }))
-                        .filter(item => item.href && item.href.includes("/post/")),
+                        .filter(item => postPathHint(item.href)),
                     offscreen_hrefs: offscreenAnchors.map(element =>
                         element.getAttribute("href")),
                     visible_anchors: anchors.length,
@@ -3282,7 +3589,7 @@ class ThreadsHomeReader:
         )
         return _CandidateStructure(
             visible_anchors=structure["visible_anchors"],
-            visible_post_links=sum("/post/" in href for href in href_list),
+            visible_post_links=sum(_post_url_hint(href) for href in href_list),
             canonical_post_links=sum(_post_url(href) is not None for href in href_list),
             profile_anchor_candidates=sum(
                 self._profile_anchor_candidate(href) for href in href_list
@@ -3291,7 +3598,7 @@ class ThreadsHomeReader:
             body_candidates=structure["body_candidates"],
             readable_body_candidates=structure["readable_body_candidates"],
             paragraph_candidates=structure["paragraph_candidates"],
-            offscreen_post_links=sum("/post/" in href for href in offscreen_hrefs),
+            offscreen_post_links=sum(_post_url_hint(href) for href in offscreen_hrefs),
             offscreen_profile_anchors=sum(
                 self._profile_anchor_candidate(href) for href in offscreen_hrefs
             ),
@@ -3385,6 +3692,13 @@ class ThreadsHomeReader:
 
         unscoped = await region.evaluate(
             """(region, args) => {
+                const postPathHint = value => {
+                    if (!value) return false;
+                    try {
+                        return new URL(value, location.href).pathname
+                            .split("/").includes("post");
+                    } catch { return false; }
+                };
                 const outsideSelector = args.outside;
                 const visibleInPage = element => {
                     const style = getComputedStyle(element);
@@ -3439,7 +3753,7 @@ class ThreadsHomeReader:
                                 visibleInPage(element.querySelector("time"))
                             ),
                         }))
-                        .filter(item => item.href && item.href.includes("/post/")),
+                        .filter(item => postPathHint(item.href)),
                     visibleAnchors: anchors.length,
                     visibleTimes: times.length,
                     paragraphCandidates: paragraphs.length,
@@ -3581,7 +3895,7 @@ class ThreadsHomeReader:
                 if parsed_post is not None:
                     post_authors[parsed_post[0]] = parsed_post[1]
                     continue
-                if "/post/" in href:
+                if _post_url_hint(href):
                     raise _UnverifiedFeedCandidate(
                         "POST_PROVENANCE_UNVERIFIED",
                         "CANDIDATE_NONCANONICAL",
@@ -3703,7 +4017,7 @@ class ThreadsHomeReader:
             href = await permalink.get_attribute("href")
             parsed_post = None if href is None else _post_url(href)
             if parsed_post is None:
-                if href is not None and "/post/" in href:
+                if href is not None and _post_url_hint(href):
                     self._record_scan_skip(
                         stage,
                         _UnverifiedFeedCandidate(
@@ -3751,6 +4065,7 @@ class ThreadsHomeReader:
                     ),
                 )
                 continue
+            observation_id = secrets.token_hex(8)
             self.last_scan_counts.identity_verified += 1
             self.last_scan_counts.verified += int(target.body_complete)
             self.last_scan_counts.partial_body_rows += int(not target.body_complete)
@@ -3770,10 +4085,36 @@ class ThreadsHomeReader:
                 self.last_scan_counts.body_extracted += 1
             else:
                 self.last_scan_counts.body_unknown += 1
-                self._record_structure_reason("POST_BODY_STRUCTURE_UNSUPPORTED")
+                if (
+                    target.read_evidence is not None
+                    and target.read_evidence.state == "UNSUPPORTED_STRUCTURE"
+                ):
+                    self._record_structure_reason(
+                        "POST_BODY_STRUCTURE_UNSUPPORTED"
+                    )
             if not target.body_complete:
                 self.last_scan_counts.skipped_rows += 1
                 self.last_scan_counts.coverage_complete = False
+                evidence_state = (
+                    "NO_BODY_NODES"
+                    if target.read_evidence is None
+                    else target.read_evidence.state
+                )
+                state_reason = {
+                    "TEXT_BELOW": ("DEFERRED_TEXT_BELOW", "BODY_TEXT_BELOW_VIEWPORT"),
+                    "TEXT_ABOVE": ("DEFERRED_TEXT_ABOVE", "BODY_TEXT_ABOVE_VIEWPORT"),
+                    "MEDIA_OR_WHITESPACE_GAP": (
+                        "MEDIA_OR_WHITESPACE_GAP",
+                        "NO_RENDERED_BODY_TEXT_IN_VIEW",
+                    ),
+                    "UNSUPPORTED_STRUCTURE": (
+                        "UNSUPPORTED_STRUCTURE",
+                        "POST_BODY_STRUCTURE_UNSUPPORTED",
+                    ),
+                }.get(
+                    evidence_state,
+                    ("PENDING_HYDRATION", "POST_BODY_PENDING"),
+                )
                 diagnostic = _CandidateDiagnostic(
                     row_index=len(targets_by_url) + 1,
                     root_kind="CONTAINER",
@@ -3781,9 +4122,19 @@ class ThreadsHomeReader:
                     has_post_permalink=True,
                     has_profile_author=True,
                     has_readable_body=bool(target.body and target.body.strip()),
-                    state="PARTIAL_BODY",
-                    reason="VISIBLE_TEXT_PROGRESS",
+                    state=(
+                        "PARTIAL_BODY"
+                        if target.body and target.body.strip()
+                        else state_reason[0]
+                    ),
+                    reason=(
+                        "VISIBLE_TEXT_PROGRESS"
+                        if target.body and target.body.strip()
+                        else state_reason[1]
+                    ),
                     identity_fingerprint=target.fingerprint,
+                    observation_id=observation_id,
+                    read_evidence=target.read_evidence,
                 )
                 if on_row is not None:
                     await on_row(
@@ -3986,7 +4337,7 @@ class ThreadsHomeReader:
                             if parsed is not None and parsed[0] == target.url:
                                 matching.append(article)
                                 break
-                            if href is not None and "/post/" in href and parsed is None:
+                            if href is not None and _post_url_hint(href) and parsed is None:
                                 raise UiReadError("DETAIL_PROVENANCE_UNVERIFIED")
                     if len(matching) > 1:
                         raise UiReadError("DETAIL_ROOT_AMBIGUOUS")
@@ -4078,7 +4429,7 @@ class ThreadsHomeReader:
             href = await permalink.get_attribute("href")
             parsed_post = None if href is None else _post_url(href)
             if parsed_post is None:
-                if href is not None and "/post/" in href:
+                if href is not None and _post_url_hint(href):
                     raise UiReadError("DETAIL_PROVENANCE_UNVERIFIED")
                 continue
             if parsed_post[0] != target.url:
@@ -4291,13 +4642,16 @@ class ThreadsHomeReader:
         candidates = root.locator(_BODY_TEXT_SELECTOR)
         bodies: list[str] = []
         empty_candidates: list[Locator] = []
-        paragraph_bodies = 0
         count = min(await candidates.count(), _MAX_STRUCTURE_ELEMENTS)
         for index in range(count):
             candidate = candidates.nth(index)
             if not await self._safe_body_candidate(candidate, root, root_handle):
                 continue
             if not await candidate.is_visible():
+                continue
+            if await candidate.evaluate(
+                "node => node.tagName !== 'P' && Boolean(node.querySelector('p'))"
+            ):
                 continue
             has_body_candidate_ancestor = await candidate.evaluate(
                 """(node, args) => {
@@ -4321,14 +4675,11 @@ class ThreadsHomeReader:
             )
             if has_body_candidate_ancestor:
                 continue
-            text = (await candidate.inner_text()).strip()
+            text = _canonicalize_body_block(await candidate.inner_text())
             if not text:
                 empty_candidates.append(candidate)
                 continue
             bodies.append(text)
-            paragraph_bodies += int(
-                await candidate.evaluate("element => element.tagName === 'P'")
-            )
 
         if not bodies:
             if require_body:
@@ -4361,16 +4712,7 @@ class ThreadsHomeReader:
                     for candidate in empty_candidates
                 ),
             )
-        if paragraph_bodies > 1:
-            if require_body:
-                raise _CardNotReady(
-                    candidates.first,
-                    nonempty_text=True,
-                    timeout_code="DETAIL_BODY_UNVERIFIED",
-                    reason_code="POST_BODY_AMBIGUOUS",
-                )
-            return None, False, body_truncated, ()
-        body = "\n".join(bodies)
+        body = _canonicalize_body("\n".join(bodies))
         if len(body) > _MAX_BODY_CODEPOINTS:
             if require_body:
                 raise _CardNotReady(
@@ -4386,20 +4728,20 @@ class ThreadsHomeReader:
     async def _observe_display_body(
         self,
         root: Locator,
-    ) -> tuple[str | None, tuple[_CardWaitSignal, ...]]:
+    ) -> tuple[str | None, tuple[_CardWaitSignal, ...], BodyReadEvidence]:
         root_handle = await root.element_handle()
         if root_handle is None:
-            return None, ()
+            return None, (), BodyReadEvidence(state="NO_BODY_NODES")
         observed = await self._read_visible_body_progress(root, root_handle)
         if observed.has_rendered_text:
-            return observed.body, ()
+            return observed.body, (), observed.read_evidence
         candidates = root.locator(_BODY_TEXT_SELECTOR)
         signals = tuple(
             _CardWaitSignal(candidates.nth(index), "nonempty_text")
             for index in range(min(await candidates.count(), _MAX_STRUCTURE_ELEMENTS))
             if await self._safe_body_candidate(candidates.nth(index), root, root_handle)
         )
-        return None, signals
+        return None, signals, observed.read_evidence
 
     @staticmethod
     def _merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -4494,6 +4836,13 @@ class ThreadsHomeReader:
                     }
                     return clip;
                 };
+                const rootRect = root.getBoundingClientRect();
+                const rootClip = clipFor(root);
+                const rootIntersects = rootRect.right > rootClip.left &&
+                    rootRect.left < rootClip.right && rootRect.bottom > rootClip.top &&
+                    rootRect.top < rootClip.bottom;
+                const rootPositionBand = rootRect.bottom <= rootClip.top ? "ABOVE" :
+                    rootRect.top >= rootClip.bottom ? "BELOW" : "INTERSECTS";
                 const cssVisible = element => {
                     for (let current = element; current; current = current.parentElement) {
                         const style = getComputedStyle(current);
@@ -4559,34 +4908,63 @@ class ThreadsHomeReader:
                         scroller === document.documentElement;
                     if (documentScroll) {
                         return {offset: window.scrollY, top: window.scrollY,
-                            bottom: window.scrollY + window.innerHeight};
+                            bottom: window.scrollY + window.innerHeight,
+                            key: "DOCUMENT"};
                     }
                     const bounds = scroller.getBoundingClientRect();
                     const offset = scroller.scrollTop - bounds.top - scroller.clientTop;
+                    const path = [];
+                    for (let current = scroller; current && current !== document.body;
+                         current = current.parentElement) {
+                        let siblingIndex = 0;
+                        for (const sibling of current.parentElement?.children || []) {
+                            if (sibling.tagName !== current.tagName) continue;
+                            if (sibling === current) break;
+                            siblingIndex++;
+                        }
+                        path.push(`${current.tagName.toLowerCase()}:${siblingIndex}`);
+                    }
                     return {
                         offset,
                         top: scroller.scrollTop,
                         bottom: scroller.scrollTop + scroller.clientHeight,
+                        key: path.reverse().join("/"),
                     };
                 };
+                const bodyContainers = Array.from(root.querySelectorAll(args.body))
+                    .filter(element => belongs(element) && !excluded(element) &&
+                        cssVisible(element)).length;
                 const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
                 const nodes = [];
                 const blockIds = new WeakMap();
+                const renderRectKeys = new Set();
+                const visibleRectKeys = new Set();
+                const aboveRectKeys = new Set();
+                const belowRectKeys = new Set();
                 let nextBlockId = 0;
                 let totalLength = 0;
                 let rangeChecks = 0;
+                let bodyTextNodesPresent = 0;
+                let unsupportedTextNodesPresent = 0;
+                let closestTextBelow = null;
+                let closestTextAbove = null;
                 let truncated = false;
                 let node;
                 while ((node = walker.nextNode())) {
                     const parent = node.parentElement;
                     if (!parent || !belongs(parent) || excluded(parent) ||
-                        !hasBodyContainer(parent) || !cssVisible(parent)) continue;
+                        !cssVisible(parent)) continue;
                     if (!node.length) continue;
+                    if (!hasBodyContainer(parent)) {
+                        if (node.data.trim()) unsupportedTextNodesPresent++;
+                        continue;
+                    }
+                    bodyTextNodesPresent++;
                     const length = Math.min(node.length, args.maxChars - totalLength);
                     if (length <= 0) { truncated = true; break; }
                     if (length < node.length) truncated = true;
                     totalLength += length;
-                    const block = nearestBlock(parent);
+                    const block = nearestBlock(node);
                     if (!blockIds.has(block)) blockIds.set(block, nextBlockId++);
                     const clip = clipFor(parent);
                     const metrics = scrollMetrics(parent);
@@ -4610,12 +4988,38 @@ class ThreadsHomeReader:
                         );
                         if (!rects.length) return;
                         expected.push([start, end]);
-                        const states = rects.map(rect => ({
-                            visible: rect.right > clip.left && rect.left < clip.right &&
-                                rect.bottom > clip.top && rect.top < clip.bottom,
-                            fully: rect.left >= clip.left && rect.right <= clip.right &&
-                                rect.top >= clip.top && rect.bottom <= clip.bottom,
-                        }));
+                        const rectIdentity = stableNodeKey(node);
+                        const states = rects.map(rect => {
+                            const key = `${rectIdentity}:${Math.round(rect.left * 2) / 2}:` +
+                                `${Math.round(rect.top * 2) / 2}:${Math.round(rect.right * 2) / 2}:` +
+                                `${Math.round(rect.bottom * 2) / 2}`;
+                            const visible = rect.right > clip.left &&
+                                rect.left < clip.right && rect.bottom > clip.top &&
+                                rect.top < clip.bottom;
+                            renderRectKeys.add(key);
+                            if (visible) visibleRectKeys.add(key);
+                            else if (rect.bottom <= clip.top) aboveRectKeys.add(key);
+                            else if (rect.top >= clip.bottom) belowRectKeys.add(key);
+                            return {
+                                visible,
+                                fully: rect.left >= clip.left &&
+                                    rect.right <= clip.right && rect.top >= clip.top &&
+                                    rect.bottom <= clip.bottom,
+                            };
+                        });
+                        for (const rect of rects) {
+                            if (rect.top >= clip.bottom) {
+                                const distance = Math.max(0, rect.top - clip.bottom);
+                                closestTextBelow = Math.min(
+                                    closestTextBelow ?? Infinity, distance
+                                );
+                            } else if (rect.bottom <= clip.top) {
+                                const distance = Math.max(0, clip.top - rect.bottom);
+                                closestTextAbove = Math.min(
+                                    closestTextAbove ?? Infinity, distance
+                                );
+                            }
+                        }
                         if (states.every(state => state.fully)) {
                             const text = node.data.slice(start, end);
                             const top = Math.min(...rects.map(rect => rect.top));
@@ -4651,7 +5055,15 @@ class ThreadsHomeReader:
                                 bottom + metrics.offset);
                             return;
                         }
-                        const middle = start + Math.floor((end - start) / 2);
+                        let middle = start + Math.floor((end - start) / 2);
+                        if (middle > start && middle < end) {
+                            const before = node.data.charCodeAt(middle - 1);
+                            const after = node.data.charCodeAt(middle);
+                            if (before >= 0xD800 && before <= 0xDBFF &&
+                                after >= 0xDC00 && after <= 0xDFFF) {
+                                middle++;
+                            }
+                        }
                         inspect(start, middle);
                         inspect(middle, end);
                     };
@@ -4685,7 +5097,42 @@ class ThreadsHomeReader:
                     if (truncated) break;
                     if (nodes.length >= args.maxNodes) { truncated = true; break; }
                 }
-                return {nodes, truncated};
+                const closestTextSide = closestTextBelow !== null &&
+                    (closestTextAbove === null || closestTextBelow <= closestTextAbove)
+                    ? "BELOW" : closestTextAbove !== null ? "ABOVE" : "NONE";
+                const closestTextDistance = closestTextSide === "BELOW"
+                    ? closestTextBelow : closestTextSide === "ABOVE"
+                    ? closestTextAbove : null;
+                let textEvidence = "NO_BODY_NODES";
+                if (visibleRectKeys.size) textEvidence = "TEXT_IN_VIEW";
+                else if (renderRectKeys.size && belowRectKeys.size &&
+                    (!aboveRectKeys.size || closestTextBelow <= closestTextAbove)) {
+                    textEvidence = "TEXT_BELOW";
+                } else if (renderRectKeys.size && aboveRectKeys.size) {
+                    textEvidence = "TEXT_ABOVE";
+                } else if (renderRectKeys.size) {
+                    textEvidence = "MEDIA_OR_WHITESPACE_GAP";
+                } else if (bodyTextNodesPresent || bodyContainers) {
+                    textEvidence = bodyTextNodesPresent
+                        ? "MEDIA_OR_WHITESPACE_GAP" : "NO_BODY_NODES";
+                } else if (unsupportedTextNodesPresent) {
+                    textEvidence = "UNSUPPORTED_STRUCTURE";
+                }
+                return {
+                    nodes, truncated, bodyContainers, bodyTextNodesPresent,
+                    unsupportedTextNodesPresent,
+                    renderRectCount: renderRectKeys.size,
+                    visibleTextRectCount: visibleRectKeys.size,
+                    deferredAboveRectCount: aboveRectKeys.size,
+                    deferredBelowRectCount: belowRectKeys.size,
+                    closestTextDistance,
+                    closestTextSide,
+                    rootIntersects,
+                    rootPositionBand,
+                    scrollTop: scrollMetrics(root).top,
+                    scrollSurfaceKey: scrollMetrics(root).key,
+                    textEvidence,
+                };
             }""",
             {
                 "roots": _FEED_ROOT_SELECTOR,
@@ -4697,12 +5144,36 @@ class ThreadsHomeReader:
             },
         )
 
+        read_evidence = BodyReadEvidence(
+            state=str(observation["textEvidence"]),
+            body_text_nodes_present=int(observation["bodyTextNodesPresent"]),
+            render_rect_count=int(observation["renderRectCount"]),
+            visible_text_rect_count=int(observation["visibleTextRectCount"]),
+            deferred_above_rect_count=int(observation["deferredAboveRectCount"]),
+            deferred_below_rect_count=int(observation["deferredBelowRectCount"]),
+            closest_text_distance_px=(
+                None
+                if observation["closestTextDistance"] is None
+                else float(observation["closestTextDistance"])
+            ),
+            closest_text_side=str(observation["closestTextSide"]),
+            root_intersects=bool(observation["rootIntersects"]),
+            root_position_band=str(observation["rootPositionBand"]),
+            scroller_scroll_top=float(observation["scrollTop"]),
+            scroll_surface_key=str(observation["scrollSurfaceKey"]),
+        )
         state: dict[str, _BodyTextProgress] | None = None
         if fingerprint is not None:
             state = self._body_text_progress.get(fingerprint)
             if state is None:
                 if len(self._body_text_progress) >= _MAX_BODY_PROGRESS_POSTS:
-                    return _VisibleBodyRead(None, False, False, truncated=True)
+                    return _VisibleBodyRead(
+                        None,
+                        False,
+                        False,
+                        truncated=True,
+                        read_evidence=read_evidence,
+                    )
                 state = {}
                 self._body_text_progress[fingerprint] = state
         progress_state = {} if state is None else state
@@ -4859,17 +5330,23 @@ class ThreadsHomeReader:
                 for start, end in progress.expected_ranges
             )
         )
-        body_parts: list[str] = []
-        previous_block: int | None = None
+        body_blocks: list[tuple[int, list[str]]] = []
         for _identity, progress in sorted(
             progress_state.items(), key=lambda item: item[1].order
         ):
-            if previous_block is not None and progress.block != previous_block:
-                body_parts.append("\n")
+            if not body_blocks or body_blocks[-1][0] != progress.block:
+                body_blocks.append((progress.block, []))
+            block_parts = body_blocks[-1][1]
             for fragment in sorted(progress.fragments, key=lambda item: item.start):
-                body_parts.append(fragment.text)
-            previous_block = progress.block
-        body = "".join(body_parts)
+                block_parts.append(fragment.text)
+        body = "\n".join(
+            text
+            for text in (
+                _canonicalize_body_block("".join(parts))
+                for _, parts in body_blocks
+            )
+            if text
+        )
         self.last_scan_counts.new_visible_text_segments += len(new_segments)
         self.last_scan_counts.deferred_above += deferred_above
         self.last_scan_counts.deferred_below += deferred_below
@@ -4896,6 +5373,7 @@ class ThreadsHomeReader:
             nearest_deferred_below,
             frontier_content,
             bool(observation["truncated"]),
+            replace(read_evidence, frontier_content_px=frontier_content),
         )
 
     async def _read_card(
@@ -4941,7 +5419,7 @@ class ThreadsHomeReader:
                     (parsed_post[0], parsed_post[1], link, timestamp_link)
                 )
                 continue
-            if "/post/" in href:
+            if _post_url_hint(href):
                 rejected_post_links.append(
                     (href, timestamp_link, _post_url_rejection_reason(href))
                 )
@@ -5111,6 +5589,9 @@ class ThreadsHomeReader:
             body_complete=body_complete,
             body_consistent=body_consistent,
             visible_segments=body_segments,
+            read_evidence=(
+                None if visible_body is None else visible_body.read_evidence
+            ),
             currently_visible=currently_visible and permalink_visible,
             viewport_y=viewport_y,
         )

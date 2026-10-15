@@ -42,6 +42,14 @@ def _post_url(value: str) -> tuple[str, str] | None:
     return canonical, match.group("author").casefold()
 
 
+def _post_url_hint(value: str) -> bool:
+    """Identify post-like paths without mistaking query or fragment text for a path."""
+    try:
+        return "post" in urlsplit(value).path.split("/")
+    except ValueError:
+        return False
+
+
 def _post_url_structure(value: str) -> tuple[int, bool, bool, bool, bool]:
     """Return privacy-safe URL shape facts without retaining or exposing its value."""
     try:

@@ -2627,64 +2627,201 @@ def test_noncanonical_link_reasons_are_aggregate_and_privacy_safe(
     assert checkpoint.completed_runs == 0
 
 
-def test_verified_multiline_body_stays_unknown_without_private_text_logging(
-    tmp_path: Path,
+def test_query_text_does_not_make_a_profile_link_look_like_a_post_path() -> None:
+    actor = "offline.operator"
+    feed_html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main><article>
+<a href="/@candidate/?next=/post/ignored"><time>now</time></a>
+<a href="/@candidate/post/synthetic-valid">Post</a>
+<a href="/@candidate">candidate</a><p>A synthetic weather update</p>
+</article></main></body></html>"""
+
+    async def exercise(page) -> None:
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        targets = await reader.scan_viewport(1)
+        assert len(targets) == 1
+        assert targets[0].url.endswith("/post/synthetic-valid")
+        assert targets[0].author == "candidate"
+        assert reader.last_scan_counts.url_canonical_links == 1
+        assert reader.last_scan_counts.url_rejected_links == 0
+
+    _run_offline_page(feed_html, exercise)
+
+
+def test_bounded_fallback_discovery_handles_dense_synthetic_timestamp_fixture() -> None:
+    actor = "offline.operator"
+    rows = "".join(
+        f"""<div class="row"><a href="/@candidate"><time>{index}h</time></a>
+<a href="/@candidate">candidate</a><p>Weather fixture {index}</p></div>"""
+        for index in range(160)
+    )
+    feed_html = f"""<!doctype html><html><head><meta charset="utf-8"><style>
+nav {{ height: 24px; }}
+.row {{ height: 4px; overflow: visible; }}
+.row p {{ margin: 0; line-height: 1px; }}
+</style></head><body><nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main>{rows}</main></body></html>"""
+
+    async def exercise(page) -> None:
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        viewport = page.viewport_size
+        assert viewport is not None
+        region = await reader._content_region()
+        started = time.perf_counter()
+        roots, truncated = await reader._top_level_candidate_roots(region, viewport)
+        await reader._collect_structure_diagnostics(region, roots, viewport)
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        assert len(roots) == reader_module._MAX_VISIBLE_ROW_CANDIDATES
+        assert truncated
+        assert elapsed_ms < 10_000
+
+    _run_offline_page(feed_html, exercise)
+
+
+def test_home_and_detail_canonicalize_multiline_inline_body_equally_without_logging(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     actor = "offline.operator"
-    first_paragraph = "Hiring for a confidential engineering role"
-    quoted_paragraph = "Quoted context mentions a separate hiring plan"
-    feed_html = f"""<!doctype html><html><body>
+    detail_url = "https://www.threads.com/@candidate/post/multiline"
+    expected_body = (
+        "Hiring engineers 👩🏽‍💻 in Việt Nam\n"
+        "Second paragraph with inline emojis 🚀 and Unicode café."
+    )
+    feed_html = f"""<!doctype html><html><head><meta charset="utf-8"></head><body>
 <nav aria-label="Main" role="navigation">
   <a aria-current="page" aria-label="For you" href="/">For you</a>
   <a aria-label="Profile" href="/@{actor}">Profile</a>
 </nav><main><article>
   <a href="/@candidate/post/multiline"><time>1h</time></a>
   <a href="/@candidate">@candidate</a>
-  <p>{first_paragraph}</p><p>{quoted_paragraph}</p>
+  <p>
+    Hiring   <span>engineers 👩🏽‍💻</span>   in Việt Nam
+  </p>
+  <p>Second paragraph with <em>inline emojis 🚀</em> and Unicode café.</p>
 </article></main></body></html>"""
-    data_root = tmp_path / "data"
-    profile = tmp_path / "profile"
-    profile.mkdir()
-    account = AccountStore(data_root).add("offline", actor, profile)
-    store = CheckpointStore(data_root)
+    detail_html = """<!doctype html><html><head><meta charset="utf-8"></head><body><main><article>
+<a href="/@candidate/post/multiline"><time>1h</time></a>
+<a href="/@candidate">candidate</a>
+<p>  Hiring <span> engineers 👩🏽‍💻 </span> in   Việt Nam </p>
+<p>
+  Second paragraph with <em>inline emojis 🚀</em> and Unicode café.
+</p>
+</article></main></body></html>"""
 
     async def exercise(page) -> None:
-        result = await workflow.run_page_workflow(
-            page,
-            account,
-            store,
-            max_posts=1,
-            max_scrolls=0,
-            max_total_posts=10,
-            terms=("hiring",),
-            show_post_text=True,
-        )
-        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
-        assert result.home_sampled == 1
-        assert result.home_relevant == result.home_irrelevant == 0
-        assert result.home_unknown == 1
-        assert result.detail_reads == 0
-        assert result.checkpoint_runs == 0
-        assert not result.viewport_coverage_complete
+        async def serve_detail(route: Route) -> None:
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=detail_html,
+            )
+
+        await page.route(detail_url, serve_detail)
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        targets = await reader.scan_viewport(1)
+        assert len(targets) == 1
+        target = targets[0]
+        assert target.body == expected_body
+        assert target.body_complete
+        detail = await reader.read_detail(target)
+        assert detail.body == target.body == expected_body
+        assert detail.url == detail_url
+        await reader.return_to_home()
+        assert page.url == HOME_URL
 
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
-    assert (
-        "SCANNING viewport=1 verified=1 relevant=0 skipped=0 visible_links=1 "
-        "inspected=1 body_read=0 body_unknown=1 classified=1 observed_rows=1 "
-        "body_extracted=0 provenance_verified=1"
-    ) in output
-    assert "viewport_coverage_complete=false" in output
-    assert first_paragraph not in output
-    assert quoted_paragraph not in output
-    assert "POST_TEXT viewport=1 status=UNKNOWN" in output
-    checkpoint = store.load(
-        account.account_id,
-        policy_fingerprint(canonical_terms(("hiring",))),
-    )
-    assert checkpoint.completed_runs == 0
-    assert checkpoint.home_unknown == 0
+    assert expected_body not in output
+    assert "READY stage=DETAIL state=DETAIL_VERIFIED" in output
+
+
+def test_visible_body_segments_keep_utf16_surrogate_pairs_intact() -> None:
+    actor = "offline.operator"
+    emoji = "👩🏽‍💻"
+    body = "A" * 4095 + emoji + "B" * 4090
+    feed_html = f"""<!doctype html><html><head><meta charset="utf-8"><style>
+nav {{ height: 32px; }}
+article {{ position: relative; height: 1400px; margin: 0; }}
+article p {{ position: absolute; top: 0; left: 0; width: 1280px; margin: 0;
+font: 16px/18px monospace; overflow-wrap: anywhere; }}
+</style></head><body><nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main><article><a href="/@candidate/post/utf16"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>{body}</p></article></main></body></html>"""
+
+    async def exercise(page) -> None:
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        rows = []
+
+        async def record(row) -> None:
+            rows.append(row)
+
+        await reader.scan_viewport(1, on_row=record)
+        target = next(row.target for row in rows if row.target is not None)
+        assert target.body is not None
+        assert not target.body_complete
+        assert emoji in target.body
+        assert target.visible_segments
+        assert all(
+            not 0xD800 <= ord(character) <= 0xDFFF
+            for segment in target.visible_segments
+            for character in segment.text
+        )
+
+    _run_offline_page(feed_html, exercise)
+
+
+def test_body_text_changing_during_the_home_read_stays_unverified() -> None:
+    actor = "offline.operator"
+    initial_body = "Synthetic hiring fixture alpha text."
+    changed_body = "Synthetic hiring fixture bravo text."
+    feed_html = f"""<!doctype html><html><head><meta charset="utf-8"></head><body>
+<nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main><article><a href="/@candidate/post/changing"><time>now</time></a>
+<a href="/@candidate">candidate</a><p id="body">{initial_body}</p>
+</article></main></body></html>"""
+
+    async def exercise(page) -> None:
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        original_read = reader._read_card
+        read_count = 0
+
+        async def change_after_first_read(root, **kwargs):
+            nonlocal read_count
+            target = await original_read(root, **kwargs)
+            read_count += 1
+            if read_count == 1:
+                await page.locator("#body").evaluate(
+                    "(node, value) => node.textContent = value",
+                    changed_body,
+                )
+            return target
+
+        reader._read_card = change_after_first_read
+        targets = await reader.scan_viewport(1)
+        assert not targets
+        assert read_count >= 2
+        assert reader.last_candidate_diagnostics[0].reason == (
+            "ROW_CONTENT_CHANGED_DURING_READ"
+        )
+        assert reader.last_candidate_diagnostics[0].state == "OBSERVED_UNVERIFIED"
+        assert reader.last_viewport_can_wheel
+        assert page.url == HOME_URL
+
+    _run_offline_page(feed_html, exercise)
 
 
 def test_irrelevant_posts_exhaust_scroll_budget_as_completed_read_only_search(
@@ -3427,7 +3564,8 @@ article {{ box-sizing: border-box; height: 680px; padding-top: 430px; }}
 
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
-    assert "state=PENDING_HYDRATION" in output
+    assert "state=DEFERRED_TEXT_BELOW" in output
+    assert "reason=BODY_TEXT_BELOW_VIEWPORT" in output
     assert f"| {body}" in output
     assert output.count(f"| {body}") == 2
     assert "[BACK] post=1 status=FAILED anchor=CHANGED" in output
@@ -3649,7 +3787,7 @@ window.addEventListener('scroll', () => {{
     )
 
 
-def test_moved_wheels_without_new_content_stop_with_a_bounded_reason(
+def test_moved_wheels_without_new_content_stop_with_a_bounded_gap(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -3687,17 +3825,23 @@ nav {{ height: 36px; }}
             terms=("hiring",),
             detail=True,
         )
-        assert result.status == "VERIFIED_IRRELEVANT"
+        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
         assert result.scroll_attempts == result.scrolls == 3
-        assert result.viewport_coverage_complete
-        assert result.unresolved_gaps == 0
+        assert not result.viewport_coverage_complete
+        assert result.unresolved_gaps == 1
+        assert result.checkpoint_runs == 0
 
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
     assert "state=MOVED_NO_NEW_CONTENT" in output
-    assert "status=STOPPED reason=NO_NEW_CONTENT" in output
+    assert "status=STOPPED reason=READ_PROGRESS_STALLED" in output
     assert "[DETAIL]" not in output
-    assert "[CHECKPOINT] status=SAVED completed_runs=1" in output
+    assert "[CHECKPOINT] status=NOT_SAVED reason=VIEWPORT_COVERAGE_INCOMPLETE" in output
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert checkpoint.completed_runs == 0
 
 
 def test_pending_pressable_waits_for_missing_permalink_and_rescans() -> None:
@@ -3818,7 +3962,7 @@ nav {{ height: 32px; }} .card {{ height: 150px; }}
     output = capsys.readouterr().out
     assert "state=PENDING_HYDRATION reason=POST_PERMALINK_PENDING" in output
     assert "verified_body_extracted=3" in output
-    assert "scan=NOT_COMMITTED" in output
+    assert "scan=PARTIAL wheel=ALLOWED" in output
     assert "[CHECKPOINT] status=NOT_SAVED reason=VIEWPORT_COVERAGE_INCOMPLETE" in output
     assert f"| {unverified_body}" in output
     assert "status=OBSERVED_UNVERIFIED" in output
@@ -3830,6 +3974,154 @@ nav {{ height: 32px; }} .card {{ height: 150px; }}
     )
     assert checkpoint.completed_runs == 0
     assert checkpoint.home_sampled == checkpoint.detail_reads == 0
+
+
+def test_observed_unverified_row_does_not_block_a_measured_native_wheel(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    unverified_body = "Hiring a synthetic engineer in Vietnam."
+    feed_html = f"""<!doctype html><html><head><style>
+html, body {{ height: 100%; margin: 0; overflow: hidden; }}
+nav {{ height: 36px; }}
+#scroll-port {{ height: 300px; overflow-y: auto; margin-top: 8px; }}
+.card {{ position: relative; height: 1000px; }}
+.body {{ position: absolute; top: 70px; left: 12px; }}
+</style></head><body><nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main id="scroll-port"><div class="card" data-pressable-container="true">
+<a href="https://invalid.synthetic/@candidate/post/unverified"><time>now</time></a>
+<a href="/@candidate">candidate</a><p class="body">{unverified_body}</p>
+</div></main><script>
+window.nativeWheelCount = 0;
+window.addEventListener("wheel", () => window.nativeWheelCount++);
+</script></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "synthetic-profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+
+    async def exercise(page) -> None:
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=1,
+            max_scrolls=1,
+            max_total_posts=5,
+            terms=("hiring", "engineer"),
+            detail=True,
+        )
+        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
+        assert result.scroll_attempts == result.scrolls == 1
+        assert result.unverified_relevant == 1
+        assert result.detail_reads == 0
+        assert not result.viewport_coverage_complete
+        assert await page.evaluate("window.nativeWheelCount") == 1
+
+    _run_offline_page(feed_html, exercise)
+    output = capsys.readouterr().out
+    assert "state=OBSERVED_UNVERIFIED" in output
+    assert "status=ADVANCED observed=1 delta_px=" in output
+    assert "[DETAIL]" not in output
+    assert "[BACK]" not in output
+    assert "[CHECKPOINT] status=NOT_SAVED reason=VIEWPORT_COVERAGE_INCOMPLETE" in output
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring", "engineer"))),
+    )
+    assert checkpoint.completed_runs == 0
+    assert checkpoint.detail_reads == 0
+
+
+def test_ephemeral_gap_upgrades_only_its_attached_row_and_keeps_other_gap_open(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    eligible_body = "Hiring a synthetic engineer in Vietnam."
+    unrelated_body = "Synthetic weather row remains unresolved."
+    feed_html = f"""<!doctype html><html><head><meta charset="utf-8"><style>
+html, body {{ height: 100%; margin: 0; overflow: hidden; }}
+nav {{ height: 36px; }}
+#scroll-port {{ height: 260px; overflow-y: auto; margin-top: 8px; }}
+.card {{ position: relative; height: 260px; }}
+.body {{ position: absolute; top: 180px; left: 12px; line-height: 24px; }}
+#filler {{ height: 720px; }}
+</style></head><body><nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main id="scroll-port">
+<div id="upgrade" class="card" data-pressable-container="true">
+<time>now</time><a href="/@candidate">candidate</a>
+<p class="body">{eligible_body}</p></div>
+<div id="unrelated" class="card" data-pressable-container="true">
+<a href="/@candidate/post/unrelated/extra"><time>1h</time></a>
+<a href="/@candidate">candidate</a><p class="body">{unrelated_body}</p></div>
+<div id="filler"></div></main><script>
+window.nativeWheelCount = 0;
+window.addEventListener("wheel", () => {{
+  window.nativeWheelCount += 1;
+  if (window.nativeWheelCount !== 1) return;
+  const timestamp = document.querySelector("#upgrade time");
+  const permalink = document.createElement("a");
+  permalink.href = "/@candidate/post/upgraded-row";
+  timestamp.replaceWith(permalink);
+  permalink.append(timestamp);
+}});
+</script></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "synthetic-profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+
+    async def exercise(page) -> None:
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=2,
+            max_scrolls=1,
+            max_total_posts=5,
+            terms=("hiring", "engineer"),
+            detail=True,
+        )
+        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
+        assert result.scroll_attempts == result.scrolls == 1
+        assert result.unresolved_gaps == 1
+        assert result.detail_reads == 0
+        assert result.checkpoint_runs == 0
+        assert not result.viewport_coverage_complete
+        assert await page.evaluate("window.nativeWheelCount") == 1
+
+    _run_offline_page(feed_html, exercise)
+    output = capsys.readouterr().out
+    records = re.findall(
+        r"\[ROW row_id=([0-9a-f]+).*?state=([A-Z_]+)",
+        output,
+    )
+    upgraded_id = next(
+        row_id for row_id, state in records if state == "PENDING_HYDRATION"
+    )
+    assert (upgraded_id, "VERIFIED") in records
+    assert any(
+        row_id != upgraded_id and state == "DEFERRED_TEXT_BELOW"
+        for row_id, state in records
+    )
+    assert "reason=SCROLL_BUDGET_EXHAUSTED_WITH_GAP" in output
+    assert "[DETAIL]" not in output
+    assert "[BACK]" not in output
+    assert "[CHECKPOINT] status=NOT_SAVED reason=VIEWPORT_COVERAGE_INCOMPLETE" in output
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring", "engineer"))),
+    )
+    assert checkpoint.completed_runs == 0
+    assert checkpoint.detail_reads == 0
 
 
 def test_carried_candidate_status_is_kept_per_row() -> None:

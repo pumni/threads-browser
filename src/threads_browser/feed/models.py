@@ -21,6 +21,28 @@ class VisibleBodySegment:
 
 
 @dataclass(frozen=True, slots=True, repr=False)
+class BodyReadEvidence:
+    """Structural evidence about where rendered body text is located."""
+
+    state: str = "UNKNOWN"
+    body_text_nodes_present: int = 0
+    render_rect_count: int = 0
+    visible_text_rect_count: int = 0
+    deferred_above_rect_count: int = 0
+    deferred_below_rect_count: int = 0
+    closest_text_distance_px: float | None = None
+    closest_text_side: str = "NONE"
+    frontier_content_px: float | None = field(default=None, repr=False)
+    root_intersects: bool = False
+    root_position_band: str = "UNKNOWN"
+    scroller_scroll_top: float | None = field(default=None, repr=False)
+    scroll_surface_key: str = field(default="", repr=False)
+
+    def __repr__(self) -> str:
+        return f"BodyReadEvidence(state={self.state!r}, structural_counts=<safe>)"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class PostTarget:
     url: str = field(repr=False)
     author: str = field(repr=False)
@@ -34,6 +56,7 @@ class PostTarget:
     body_complete: bool = field(default=True, repr=False)
     body_consistent: bool = field(default=True, repr=False)
     visible_segments: tuple[VisibleBodySegment, ...] = field(default=(), repr=False)
+    read_evidence: BodyReadEvidence | None = field(default=None, repr=False)
 
     def __repr__(self) -> str:
         return "PostTarget(<private>)"
@@ -54,6 +77,7 @@ class DisplayObservation:
     status: str = "OBSERVED_UNVERIFIED"
     viewport_y: float = field(default=0.0, repr=False)
     visible_segments: tuple[VisibleBodySegment, ...] = field(default=(), repr=False)
+    read_evidence: BodyReadEvidence | None = field(default=None, repr=False)
 
     def __repr__(self) -> str:
         return f"DisplayObservation(status={self.status!r}, body=<private>)"
