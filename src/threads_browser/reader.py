@@ -61,7 +61,11 @@ from .browser_ui.loading import (
     RenderObservation as _RenderObservation,
 )
 from .browser_ui.scrolling import NativeWheelScrollEngine, ScrollGestureResult
-from .browser_ui.session import HomeSession
+from .browser_ui.session import (
+    HomeSession,
+    classify_playwright_failure,
+    emit_failure_diagnostic,
+)
 from .errors import UiReadError
 from .feed.models import (
     BodyReadEvidence,
@@ -218,6 +222,8 @@ class ThreadsHomeReader:
         self._expected_actor = None if expected_actor is None else expected_actor.casefold()
         self._readiness_prompt = readiness_prompt
         self._detail_mode = detail_mode
+        self._failure_phase = "INITIALIZING"
+        self._failure_operation = "SETTLE"
         self._home_url: str | None = None
         self._verified_actor_route: str | None = None
         self._last_ui_transition_at: float | None = None
@@ -266,6 +272,10 @@ class ThreadsHomeReader:
 
     def _mark_ui_transition(self) -> None:
         self._last_ui_transition_at = time.monotonic()
+
+    def set_failure_context(self, phase: str, operation: str) -> None:
+        self._failure_phase = phase
+        self._failure_operation = operation
 
     @property
     def skipped_unverified(self) -> int:
@@ -883,10 +893,23 @@ class ThreadsHomeReader:
                 )
                 self.last_scroll_gesture = gesture
                 self._mark_ui_transition()
-            except PlaywrightError:
+            except PlaywrightError as error:
+                failure = classify_playwright_failure(self._page, error)
+                emit_failure_diagnostic(
+                    phase=self._failure_phase,
+                    operation="SCROLL",
+                    error_class=failure.error_class,
+                    page_closed=failure.page_closed,
+                    context_closed=failure.context_closed,
+                )
                 if not self._detail_mode:
                     print(f"SCROLL attempt={self.scroll_attempts} observed=0")
-                raise UiReadError("HOME_SCROLL_FAILED") from None
+                code = (
+                    "BROWSER_SESSION_UNAVAILABLE"
+                    if failure.error_class == "TARGET_CLOSED"
+                    else "UI_READ_UNVERIFIED"
+                )
+                raise UiReadError(code) from None
             observed_delta = gesture.observed_delta
             if observed_delta <= 1:
                 if not self._detail_mode:
@@ -950,6 +973,7 @@ class ThreadsHomeReader:
                     "HOME_SCROLL",
                     "HOME_SCROLL_UNVERIFIED",
                     observe_scroll,
+                    operation="SETTLE",
                 )
             except UiReadError:
                 if not self._detail_mode:
@@ -1070,14 +1094,39 @@ class ThreadsHomeReader:
         attempt: Callable[[float], Awaitable[_ReadinessResult]],
         *,
         recoverable_codes: tuple[str, ...] | None = None,
+        operation: str | None = None,
     ) -> _ReadinessResult:
         allowed_codes = recoverable_codes or (timeout_code,)
         window = 0
         final_code = timeout_code
+        dom_change_retried = False
+        failure_operation = operation or self._failure_operation
         while True:
             deadline = self._readiness_deadline(_READINESS_TIMEOUT_MS)
             try:
                 result = await attempt(deadline)
+            except PlaywrightError as error:
+                failure = classify_playwright_failure(self._page, error)
+                emit_failure_diagnostic(
+                    phase=self._failure_phase,
+                    operation=failure_operation,
+                    error_class=failure.error_class,
+                    page_closed=failure.page_closed,
+                    context_closed=failure.context_closed,
+                )
+                if failure.error_class == "TARGET_CLOSED":
+                    raise UiReadError("BROWSER_SESSION_UNAVAILABLE") from None
+                if (
+                    failure.error_class == "DOM_DETACHED"
+                    and failure_operation in {"SCAN_ROW", "SETTLE"}
+                ):
+                    if dom_change_retried:
+                        raise UiReadError("DOM_CHANGED_DURING_SCAN") from None
+                    dom_change_retried = True
+                    window += 1
+                    print(f"WAITING stage={stage} retry={window}")
+                    continue
+                raise UiReadError("UI_READ_UNVERIFIED") from None
             except UiReadError as error:
                 if error.code not in allowed_codes:
                     raise
@@ -1507,6 +1556,7 @@ class ThreadsHomeReader:
             timeout_code,
             attempt,
             recoverable_codes=(timeout_code,),
+            operation="SCAN_ROW",
         )
         self.last_display_observations = scan.display_observations
         self.last_viewport_coverage_complete = scan.coverage_complete
@@ -1544,7 +1594,17 @@ class ThreadsHomeReader:
             )
         )
         self.last_viewport_can_wheel = bool(
-            not scan.coverage_complete and scan.observed_rows <= self._last_viewport_limit
+            not scan.coverage_complete
+            and scan.observed_rows <= self._last_viewport_limit
+            and not any(
+                diagnostic.reason
+                in {
+                    "POST_ROOT_UNRESOLVED",
+                    "POST_ROOT_IDENTITY_CHANGED",
+                    "ROW_PROVENANCE_UNRESOLVED",
+                }
+                for diagnostic in self.last_candidate_diagnostics
+            )
         )
         self.last_deferred_fingerprints = frozenset(
             diagnostic.identity_fingerprint
@@ -2489,80 +2549,205 @@ class ThreadsHomeReader:
                 )
                 continue
             except _UnverifiedFeedCandidate as error:
-                self.last_scan_timings.read_row_ms += round(
-                    (time.perf_counter() - read_started) * 1000
-                )
-                self._record_scan_skip(stage, error)
-                if error.diagnostic_reason == "CANDIDATE_WRAPPER_AMBIGUOUS":
+                if (
+                    error.diagnostic_reason == "CANDIDATE_WRAPPER_AMBIGUOUS"
+                    and currently_visible
+                ):
+                    try:
+                        target, body_stable = await self._recover_ambiguous_visible_card(
+                            root,
+                            root_handle,
+                            viewport_y=box["y"],
+                            cached_body_fingerprints=prefer_new_fingerprints,
+                        )
+                    except _CardNotReady as pending:
+                        self._record_scan_skip(stage, error)
+                        identity_changed = (
+                            pending.reason_code == "POST_ROOT_DOM_IDENTITY_CHANGED"
+                            or not await self._same_dom_element(root, root_handle)
+                        )
+                        if identity_changed:
+                            diagnostic.observation_id = secrets.token_hex(8)
+                            diagnostic.identity_fingerprint = None
+                            candidate_prior_fingerprints[row_index] = None
+                            carried_row = False
+                            diagnostic.state = "REJECTED"
+                            diagnostic.reason = "POST_ROOT_IDENTITY_CHANGED"
+                            read_evidence = BodyReadEvidence(state="NO_BODY_NODES")
+                            body = None
+                        else:
+                            observed = await self._read_visible_body_progress(root, root_handle)
+                            read_evidence = observed.read_evidence
+                            body = observed.body if observed.has_rendered_text else None
+                            diagnostic.state = (
+                                "OBSERVED_UNVERIFIED" if body else "REJECTED"
+                            )
+                            diagnostic.reason = "ROW_PROVENANCE_UNRESOLVED"
+                            self._record_structure_reason("ROW_PROVENANCE_UNRESOLVED")
+                        diagnostic.read_evidence = read_evidence
+                        diagnostic.has_readable_body = bool(body)
+                        counts.coverage_complete = False
+                        counts.uncertain_rows += 1
+                        counts.skipped_rows += 1
+                        if body:
+                            counts.body_extracted += 1
+                        else:
+                            counts.body_unknown += 1
+                        display = DisplayObservation(
+                            body,
+                            "OBSERVATION_UNCERTAIN"
+                            if body is None
+                            else "OBSERVED_UNVERIFIED",
+                            box["y"],
+                            read_evidence=read_evidence,
+                        )
+                        display_observations.append(display)
+                        self.last_scan_timings.read_row_ms += round(
+                            (time.perf_counter() - read_started) * 1000
+                        )
+                        await emit_row(diagnostic, display=display)
+                        continue
+                    except (_CardDeferredOffscreen, _UnverifiedFeedCandidate):
+                        self._record_scan_skip(stage, error)
+                        identity_changed = not await self._same_dom_element(root, root_handle)
+                        if identity_changed:
+                            diagnostic.observation_id = secrets.token_hex(8)
+                            diagnostic.identity_fingerprint = None
+                            candidate_prior_fingerprints[row_index] = None
+                            carried_row = False
+                            diagnostic.state = "REJECTED"
+                            diagnostic.reason = "POST_ROOT_IDENTITY_CHANGED"
+                            read_evidence = BodyReadEvidence(state="NO_BODY_NODES")
+                            body = None
+                        else:
+                            observed = await self._read_visible_body_progress(root, root_handle)
+                            read_evidence = observed.read_evidence
+                            body = observed.body if observed.has_rendered_text else None
+                            diagnostic.state = (
+                                "OBSERVED_UNVERIFIED" if body else "REJECTED"
+                            )
+                            diagnostic.reason = "ROW_PROVENANCE_UNRESOLVED"
+                            self._record_structure_reason("ROW_PROVENANCE_UNRESOLVED")
+                        diagnostic.read_evidence = read_evidence
+                        diagnostic.has_readable_body = bool(body)
+                        counts.coverage_complete = False
+                        counts.uncertain_rows += 1
+                        counts.skipped_rows += 1
+                        if body:
+                            counts.body_extracted += 1
+                        else:
+                            counts.body_unknown += 1
+                        display = DisplayObservation(
+                            body,
+                            "OBSERVATION_UNCERTAIN"
+                            if body is None
+                            else "OBSERVED_UNVERIFIED",
+                            box["y"],
+                            read_evidence=read_evidence,
+                        )
+                        display_observations.append(display)
+                        self.last_scan_timings.read_row_ms += round(
+                            (time.perf_counter() - read_started) * 1000
+                        )
+                        await emit_row(diagnostic, display=display)
+                        continue
+                    if not body_stable:
+                        diagnostic.identity_fingerprint = target.fingerprint
+                        candidate_prior_fingerprints[row_index] = target.fingerprint
+                        diagnostic.read_evidence = target.read_evidence
+                        diagnostic.has_readable_body = bool(target.body and target.body.strip())
+                        diagnostic.state = "OBSERVED_UNVERIFIED"
+                        diagnostic.reason = "ROW_CONTENT_CHANGED_DURING_READ"
+                        counts.identity_verified += 1
+                        counts.uncertain_rows += 1
+                        counts.skipped_rows += 1
+                        counts.coverage_complete = False
+                        if target.body:
+                            counts.body_extracted += 1
+                        else:
+                            counts.body_unknown += 1
+                        display = DisplayObservation(
+                            target.body,
+                            "OBSERVATION_UNCERTAIN"
+                            if not target.body
+                            else "OBSERVED_UNVERIFIED",
+                            box["y"],
+                            read_evidence=target.read_evidence,
+                        )
+                        display_observations.append(display)
+                        await emit_row(
+                            diagnostic,
+                            target=target,
+                            display=display,
+                            fingerprint=target.fingerprint,
+                        )
+                        continue
+                else:
+                    self._record_scan_skip(stage, error)
                     body, body_signals, read_evidence = await self._observe_display_body(root)
                     diagnostic.read_evidence = read_evidence
                     diagnostic.has_readable_body = bool(body)
                     if body:
-                        diagnostic.state = "OBSERVED_UNVERIFIED"
-                        diagnostic.reason = error.diagnostic_reason
                         counts.body_extracted += 1
-                    else:
-                        diagnostic.state, diagnostic.reason = _body_progress_state(
-                            read_evidence,
-                            has_readable_body=False,
+                        diagnostic.state = "OBSERVED_UNVERIFIED"
+                        diagnostic.reason = (
+                            "ROW_PROVENANCE_UNRESOLVED"
+                            if error.diagnostic_reason == "CANDIDATE_WRAPPER_AMBIGUOUS"
+                            else error.diagnostic_reason or error.reason
                         )
-                        if body_signals:
-                            pending_signals.extend(body_signals)
+                        if error.diagnostic_reason == "CANDIDATE_WRAPPER_AMBIGUOUS":
+                            counts.coverage_complete = False
+                            counts.uncertain_rows += 1
+                            counts.skipped_rows += 1
+                            self._record_structure_reason("ROW_PROVENANCE_UNRESOLVED")
+                        display_observations.append(
+                            DisplayObservation(
+                                body,
+                                viewport_y=box["y"],
+                                read_evidence=read_evidence,
+                            )
+                        )
+                    else:
                         counts.body_unknown += 1
                         counts.skipped_rows += 1
                         counts.uncertain_rows += 1
-                    display = DisplayObservation(
-                        body,
-                        "OBSERVATION_UNCERTAIN" if body is None else "OBSERVED_UNVERIFIED",
-                        box["y"],
-                        read_evidence=read_evidence,
+                        if error.diagnostic_reason == "CANDIDATE_WRAPPER_AMBIGUOUS":
+                            counts.coverage_complete = False
+                            self._record_structure_reason("ROW_PROVENANCE_UNRESOLVED")
+                        if body_signals:
+                            diagnostic.state = "PENDING_HYDRATION"
+                            diagnostic.reason = "POST_BODY_PENDING"
+                        else:
+                            diagnostic.state, diagnostic.reason = _body_progress_state(
+                                read_evidence,
+                                has_readable_body=False,
+                            )
+                            if diagnostic.state == "PENDING_HYDRATION":
+                                diagnostic.state = "REJECTED"
+                                diagnostic.reason = error.diagnostic_reason or error.reason
+                        pending_signals.extend(body_signals)
+                        display_observations.append(
+                            DisplayObservation(
+                                None,
+                                "OBSERVATION_UNCERTAIN",
+                                box["y"],
+                                read_evidence=read_evidence,
+                            )
+                        )
+                    self.last_scan_timings.read_row_ms += round(
+                        (time.perf_counter() - read_started) * 1000
                     )
-                    display_observations.append(display)
-                    await emit_row(diagnostic, display=display)
+                    await emit_row(diagnostic, display=display_observations[-1])
                     continue
-                body, body_signals, read_evidence = await self._observe_display_body(root)
-                diagnostic.read_evidence = read_evidence
-                diagnostic.has_readable_body = bool(body)
-                if body:
-                    counts.body_extracted += 1
-                    diagnostic.state = "OBSERVED_UNVERIFIED"
-                    diagnostic.reason = error.diagnostic_reason or error.reason
-                    display_observations.append(
-                        DisplayObservation(
-                            body,
-                            viewport_y=box["y"],
-                            read_evidence=read_evidence,
-                        )
+                if (
+                    error.diagnostic_reason != "CANDIDATE_WRAPPER_AMBIGUOUS"
+                    or not currently_visible
+                ):
+                    self.last_scan_timings.read_row_ms += round(
+                        (time.perf_counter() - read_started) * 1000
                     )
-                else:
-                    counts.body_unknown += 1
-                    counts.skipped_rows += 1
-                    counts.uncertain_rows += 1
-                    if body_signals:
-                        diagnostic.state = "PENDING_HYDRATION"
-                        diagnostic.reason = "POST_BODY_PENDING"
-                    else:
-                        diagnostic.state, diagnostic.reason = _body_progress_state(
-                            read_evidence,
-                            has_readable_body=False,
-                        )
-                        if diagnostic.state == "PENDING_HYDRATION":
-                            diagnostic.state = "REJECTED"
-                            diagnostic.reason = error.diagnostic_reason or error.reason
-                    pending_signals.extend(body_signals)
-                    display_observations.append(
-                        DisplayObservation(
-                            None,
-                            "OBSERVATION_UNCERTAIN",
-                            box["y"],
-                            read_evidence=read_evidence,
-                        )
-                    )
-                await emit_row(
-                    diagnostic,
-                    display=display_observations[-1],
-                )
-                continue
+                    await emit_row(diagnostic, display=display_observations[-1])
+                    continue
             self.last_scan_timings.read_row_ms += round((time.perf_counter() - read_started) * 1000)
             diagnostic.identity_fingerprint = target.fingerprint
             if candidate_prior_fingerprints.get(row_index) not in {None, target.fingerprint}:
@@ -2838,16 +3023,30 @@ class ThreadsHomeReader:
         element: Locator,
         root: Locator,
         root_handle: JSHandle,
+        *,
+        isolated_scope: bool = False,
     ) -> bool:
-        return await self._feed_rows._belongs_to_card(element, root, root_handle)
+        return await self._feed_rows._belongs_to_card(
+            element,
+            root,
+            root_handle,
+            isolated_scope=isolated_scope,
+        )
 
     async def _safe_body_candidate(
         self,
         element: Locator,
         root: Locator,
         root_handle: JSHandle,
+        *,
+        isolated_scope: bool = False,
     ) -> bool:
-        return await self._feed_rows._safe_body_candidate(element, root, root_handle)
+        return await self._feed_rows._safe_body_candidate(
+            element,
+            root,
+            root_handle,
+            isolated_scope=isolated_scope,
+        )
 
     async def _safe_unscoped_text_candidate(self, element: Locator) -> bool:
         return await self._feed_rows._safe_unscoped_text_candidate(element)
@@ -3527,6 +3726,246 @@ class ThreadsHomeReader:
     def _expected_profile_link_signal(root: Locator, author: str) -> Locator:
         return root.locator(f'a[href$="/@{author}" i], a[href$="/@{author}/" i]').first
 
+    async def _recover_ambiguous_visible_card(
+        self,
+        root: Locator,
+        root_handle: JSHandle,
+        *,
+        viewport_y: float,
+        cached_body_fingerprints: set[str] | None,
+        allow_hydration_retry: bool = True,
+    ) -> tuple[PostTarget, bool]:
+        """Recover only when one visible timestamp permalink maps to one inner row."""
+        if (
+            not await root.is_visible()
+            or not await self._is_in_visible_scrollports(root)
+            or not await self._same_dom_element(root, root_handle)
+        ):
+            raise _CardNotReady(root, reason_code="POST_ROOT_DOM_IDENTITY_CHANGED")
+
+        links = root.locator("a")
+        link_count = await links.count()
+        if link_count > _MAX_CARD_LINKS:
+            raise _UnverifiedFeedCandidate(
+                "POST_PROVENANCE_UNVERIFIED",
+                "CANDIDATE_AMBIGUOUS",
+                (),
+                diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
+            )
+        timestamp_candidates: list[tuple[str, str, Locator, JSHandle]] = []
+        rejected_post_links: list[tuple[str, bool, str]] = []
+        hydration_signals: list[_CardWaitSignal] = []
+        try:
+            for index in range(link_count):
+                link = links.nth(index)
+                if not await self._belongs_to_card(link, root, root_handle):
+                    continue
+                if await self._is_outside_content_landmark(link) or not await link.is_visible():
+                    continue
+                if not await self._is_in_visible_scrollports(link):
+                    continue
+                href = await link.get_attribute("href")
+                if href is None or not _post_url_hint(href):
+                    continue
+                times = link.locator("time")
+                has_timestamp = await times.count() > 0
+                visible_timestamp = any(
+                    [await times.nth(time_index).is_visible() for time_index in range(await times.count())]
+                )
+                parsed = _post_url(href)
+                if parsed is None:
+                    rejected_post_links.append(
+                        (href, has_timestamp, _post_url_rejection_reason(href))
+                    )
+                    if not hydration_signals:
+                        hydration_signals.append(_CardWaitSignal(link, "retry"))
+                    continue
+                if visible_timestamp:
+                    handle = await link.element_handle()
+                    if handle is not None:
+                        timestamp_candidates.append((parsed[0], parsed[1], link, handle))
+                else:
+                    hydration_signals.append(_CardWaitSignal(link, "retry"))
+
+            blocking_invalid = next(
+                (
+                    item
+                    for item in rejected_post_links
+                    if _rejected_post_link_blocks_candidate(
+                        timestamp_link=item[1], reason=item[2]
+                    )
+                ),
+                None,
+            )
+            if blocking_invalid is not None:
+                _, _, reason = blocking_invalid
+                raise _UnverifiedFeedCandidate(
+                    "POST_PROVENANCE_UNVERIFIED",
+                    "CANDIDATE_NONCANONICAL",
+                    (),
+                    diagnostic_reason=reason,
+                )
+            if len(timestamp_candidates) > 1:
+                raise _UnverifiedFeedCandidate(
+                    "POST_PROVENANCE_UNVERIFIED",
+                    "CANDIDATE_AMBIGUOUS",
+                    (),
+                    diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
+                )
+            if not timestamp_candidates:
+                if not hydration_signals:
+                    raise _UnverifiedFeedCandidate(
+                        "POST_PROVENANCE_UNVERIFIED",
+                        "CANDIDATE_AMBIGUOUS",
+                        (),
+                        diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
+                    )
+                if allow_hydration_retry:
+                    await self._wait_for_verified_feed(
+                        self._readiness_deadline(_READINESS_TIMEOUT_MS),
+                        timeout_code="HOME_UI_UNVERIFIED",
+                    )
+                    changed = await self._wait_for_pending_card(
+                        _CardNotReady(signals=tuple(hydration_signals)),
+                        self._readiness_deadline(_CARD_HYDRATION_WAIT_MS),
+                        max_wait_ms=_CARD_HYDRATION_WAIT_MS,
+                    )
+                    if changed:
+                        if not await self._same_dom_element(root, root_handle):
+                            raise _CardNotReady(
+                                root,
+                                reason_code="POST_ROOT_DOM_IDENTITY_CHANGED",
+                            )
+                        return await self._recover_ambiguous_visible_card(
+                            root,
+                            root_handle,
+                            viewport_y=viewport_y,
+                            cached_body_fingerprints=cached_body_fingerprints,
+                            allow_hydration_retry=False,
+                        )
+                raise _UnverifiedFeedCandidate(
+                    "POST_PROVENANCE_UNVERIFIED",
+                    "CANDIDATE_AMBIGUOUS",
+                    (),
+                    diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
+                )
+
+            expected_url, expected_author, permalink, permalink_handle = timestamp_candidates[0]
+            pending_signals: list[_CardWaitSignal] = []
+            ancestor = permalink.locator("xpath=..")
+            for _ in range(_MAX_CARD_ANCESTORS):
+                if not await self._same_dom_element(root, root_handle):
+                    raise _CardNotReady(root, reason_code="POST_ROOT_DOM_IDENTITY_CHANGED")
+                if await ancestor.count() == 0:
+                    break
+                candidate_handle = await ancestor.element_handle()
+                if candidate_handle is None:
+                    break
+                try:
+                    contained = bool(
+                        await root_handle.evaluate(
+                            "(outer, node) => outer === node || outer.contains(node)",
+                            candidate_handle,
+                        )
+                    )
+                    is_outer = bool(
+                        await root_handle.evaluate(
+                            "(outer, node) => outer === node",
+                            candidate_handle,
+                        )
+                    )
+                    if not contained or is_outer:
+                        break
+                    semantic = bool(
+                        await candidate_handle.evaluate(
+                            "node => node.matches('article, [role=\"article\"], "
+                            "[data-pressable-container=\"true\"]')"
+                        )
+                    )
+                    if await ancestor.is_visible() and await self._is_in_visible_scrollports(ancestor):
+                        try:
+                            target, body_stable = await self._read_stable_visible_card(
+                                ancestor,
+                                viewport_y=viewport_y,
+                                cached_body_fingerprints=cached_body_fingerprints,
+                                expected_root_handle=candidate_handle,
+                                isolated_scope=not semantic,
+                            )
+                        except _CardNotReady as pending:
+                            if pending.reason_code == "POST_ROOT_DOM_IDENTITY_CHANGED":
+                                raise _CardNotReady(
+                                    root,
+                                    reason_code="POST_ROOT_DOM_IDENTITY_CHANGED",
+                                ) from None
+                            pending_signals.extend(pending.signals)
+                        except (_CardDeferredOffscreen, _UnverifiedFeedCandidate):
+                            pass
+                        else:
+                            same_permalink = bool(
+                                await candidate_handle.evaluate(
+                                    "(candidate, expected) => candidate.contains(expected)",
+                                    permalink_handle,
+                                )
+                            )
+                            if (
+                                same_permalink
+                                and target.url == expected_url
+                                and target.author == expected_author
+                                and target.currently_visible
+                                and await self._same_dom_element(root, root_handle)
+                            ):
+                                return target, body_stable
+                finally:
+                    await candidate_handle.dispose()
+                ancestor = ancestor.locator("xpath=..")
+
+            if allow_hydration_retry:
+                pending_signals.append(_CardWaitSignal(permalink, "retry"))
+                visible_signals_list: list[_CardWaitSignal] = []
+                for signal in pending_signals:
+                    if await self._is_in_visible_scrollports(signal.locator):
+                        visible_signals_list.append(signal)
+                visible_signals = tuple(visible_signals_list)
+                if visible_signals:
+                    await self._wait_for_verified_feed(
+                        self._readiness_deadline(_READINESS_TIMEOUT_MS),
+                        timeout_code="HOME_UI_UNVERIFIED",
+                    )
+                    changed = await self._wait_for_pending_card(
+                        _CardNotReady(signals=visible_signals),
+                        self._readiness_deadline(_CARD_HYDRATION_WAIT_MS),
+                        max_wait_ms=_CARD_HYDRATION_WAIT_MS,
+                    )
+                    if changed:
+                        if not await self._same_dom_element(root, root_handle):
+                            raise _CardNotReady(
+                                root,
+                                reason_code="POST_ROOT_DOM_IDENTITY_CHANGED",
+                            )
+                        if not await permalink_handle.evaluate(
+                            "node => node.isConnected"
+                        ):
+                            raise _CardNotReady(
+                                root,
+                                reason_code="POST_ROOT_DOM_IDENTITY_CHANGED",
+                            )
+                        return await self._recover_ambiguous_visible_card(
+                            root,
+                            root_handle,
+                            viewport_y=viewport_y,
+                            cached_body_fingerprints=cached_body_fingerprints,
+                            allow_hydration_retry=False,
+                        )
+            raise _UnverifiedFeedCandidate(
+                "POST_PROVENANCE_UNVERIFIED",
+                "CANDIDATE_AMBIGUOUS",
+                (expected_url,),
+                diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
+            )
+        finally:
+            for _, _, _, handle in timestamp_candidates:
+                await handle.dispose()
+
     async def _visible_permalink_targets(
         self,
         max_posts: int,
@@ -3845,12 +4284,18 @@ class ThreadsHomeReader:
         root_handle: JSHandle,
         *,
         require_body: bool,
+        isolated_scope: bool = False,
     ) -> tuple[str | None, bool, bool, tuple[_CardWaitSignal, ...]]:
         buttons = root.get_by_role("button", name=_MORE_NAME)
         body_truncated = False
         for index in range(min(await buttons.count(), _MAX_CARD_LINKS)):
             button = buttons.nth(index)
-            if await self._belongs_to_card(button, root, root_handle) and await button.is_visible():
+            if await self._belongs_to_card(
+                button,
+                root,
+                root_handle,
+                isolated_scope=isolated_scope,
+            ) and await button.is_visible():
                 body_truncated = True
                 break
 
@@ -3860,7 +4305,12 @@ class ThreadsHomeReader:
         count = min(await candidates.count(), _MAX_STRUCTURE_ELEMENTS)
         for index in range(count):
             candidate = candidates.nth(index)
-            if not await self._safe_body_candidate(candidate, root, root_handle):
+            if not await self._safe_body_candidate(
+                candidate,
+                root,
+                root_handle,
+                isolated_scope=isolated_scope,
+            ):
                 continue
             if not await candidate.is_visible():
                 continue
@@ -3963,12 +4413,14 @@ class ThreadsHomeReader:
         root_handle: JSHandle,
         *,
         fingerprint: str | None = None,
+        isolated_scope: bool = False,
     ) -> _VisibleBodyRead:
         return await self._body_text._read_visible_body_progress(
             root,
             root_handle,
             fingerprint=fingerprint,
             scan_counts=self.last_scan_counts,
+            isolated_scope=isolated_scope,
         )
 
     async def _read_card(
@@ -3981,6 +4433,7 @@ class ThreadsHomeReader:
         cached_body_fingerprints: set[str] | None = None,
         visible_text_progress: bool = False,
         expected_root_handle: JSHandle | None = None,
+        isolated_scope: bool = False,
     ) -> PostTarget:
         if not await root.is_visible():
             raise _CardNotReady(root)
@@ -4006,7 +4459,12 @@ class ThreadsHomeReader:
             )
         for index in range(link_count):
             link = links.nth(index)
-            if not await self._belongs_to_card(link, root, root_handle):
+            if not await self._belongs_to_card(
+                link,
+                root,
+                root_handle,
+                isolated_scope=isolated_scope,
+            ):
                 continue
             if await self._is_outside_content_landmark(link) or not await link.is_visible():
                 continue
@@ -4125,13 +4583,19 @@ class ThreadsHomeReader:
                 buttons = root.get_by_role("button", name=_MORE_NAME)
                 for index in range(min(await buttons.count(), _MAX_CARD_LINKS)):
                     button = buttons.nth(index)
-                    if await self._belongs_to_card(button, root, root_handle) and await button.is_visible():
+                    if await self._belongs_to_card(
+                        button,
+                        root,
+                        root_handle,
+                        isolated_scope=isolated_scope,
+                    ) and await button.is_visible():
                         body_truncated = True
                         break
                 visible_body = await self._read_visible_body_progress(
                     root,
                     root_handle,
                     fingerprint=fingerprint,
+                    isolated_scope=isolated_scope,
                 )
             else:
                 has_body_candidate, body_fully_visited = await self._visible_body_candidate_state(
@@ -4162,6 +4626,7 @@ class ThreadsHomeReader:
                 root,
                 root_handle,
                 require_body=require_body,
+                isolated_scope=isolated_scope,
             )
             if not body_available and body_signals:
                 raise _CardNotReady(
@@ -4214,6 +4679,7 @@ class ThreadsHomeReader:
         cached_body_fingerprints: set[str] | None,
         expected_root_handle: JSHandle | None = None,
         allow_hydration_retry: bool = False,
+        isolated_scope: bool = False,
     ) -> tuple[PostTarget, bool]:
         """Require the same row identity and body across a bounded dwell."""
         if expected_root_handle is None:
@@ -4227,6 +4693,7 @@ class ThreadsHomeReader:
             cached_body_fingerprints=cached_body_fingerprints,
             visible_text_progress=True,
             expected_root_handle=expected_root_handle,
+            isolated_scope=isolated_scope,
         )
         for attempt in range(2):
             # Measure stability between completed samples. DOM extraction can
@@ -4240,6 +4707,7 @@ class ThreadsHomeReader:
                 cached_body_fingerprints=cached_body_fingerprints,
                 visible_text_progress=True,
                 expected_root_handle=expected_root_handle,
+                isolated_scope=isolated_scope,
             )
             body_same = (
                 _canonicalize_body(target.body or "") == _canonicalize_body(settled.body or "")
@@ -4267,6 +4735,7 @@ class ThreadsHomeReader:
                     cached_body_fingerprints=cached_body_fingerprints,
                     visible_text_progress=True,
                     expected_root_handle=expected_root_handle,
+                    isolated_scope=isolated_scope,
                 )
                 continue
             return settled, False

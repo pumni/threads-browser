@@ -6,8 +6,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from hashlib import sha256
 
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
 
+from ..browser_ui.session import classify_playwright_failure, emit_failure_diagnostic
 from ..feed.models import BodyReadEvidence, PostTarget
 from ..feed.relevance import canonical_terms, classify_body
 from ..reader import ThreadsHomeReader, UiReadError, _HomeRowObservation
@@ -31,6 +33,31 @@ from .state import (
 )
 
 _MAX_SEEN = 5_000
+
+
+def _reader_playwright_error(
+    page: Page,
+    error: PlaywrightError,
+    *,
+    phase: str,
+    operation: str,
+) -> UiReadError:
+    failure = classify_playwright_failure(page, error)
+    emit_failure_diagnostic(
+        phase=phase,
+        operation=operation,
+        error_class=failure.error_class,
+        page_closed=failure.page_closed,
+        context_closed=failure.context_closed,
+    )
+    code = (
+        "BROWSER_SESSION_UNAVAILABLE"
+        if failure.error_class == "TARGET_CLOSED"
+        else "DOM_CHANGED_DURING_SCAN"
+        if failure.error_class == "DOM_DETACHED" and operation == "SCAN_ROW"
+        else "UI_READ_UNVERIFIED"
+    )
+    return UiReadError(code)
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,13 +130,24 @@ async def run_page_workflow(
         readiness_prompt=readiness_prompt,
         detail_mode=detail,
     )
+    reader.set_failure_context("INITIALIZING", "SETTLE")
     try:
         await reader.open_home()
-    except UiReadError as error:
+    except (UiReadError, PlaywrightError) as raw_error:
+        error = (
+            raw_error
+            if isinstance(raw_error, UiReadError)
+            else _reader_playwright_error(
+                page,
+                raw_error,
+                phase=state.phase.value,
+                operation="SETTLE",
+            )
+        )
         state.stop(error.code)
         if detail:
             print(f"[HOME] status=FAILED code={error.code}")
-        raise
+        raise error from None
     state.transition(WorkflowPhase.OBSERVING)
     if detail:
         print("[HOME] status=READY account=VERIFIED source=FOR_YOU")
@@ -145,13 +183,24 @@ async def run_page_workflow(
         if detail:
             print(f"[SCROLL] attempt={attempt} status=REQUESTED")
         state.transition(WorkflowPhase.SCROLLING)
+        reader.set_failure_context(state.phase.value, "SCROLL")
         try:
             advanced = await reader.advance_feed(scan_after_scroll=scan_after_scroll)
-        except UiReadError as error:
+        except (UiReadError, PlaywrightError) as raw_error:
+            error = (
+                raw_error
+                if isinstance(raw_error, UiReadError)
+                else _reader_playwright_error(
+                    page,
+                    raw_error,
+                    phase=state.phase.value,
+                    operation="SCROLL",
+                )
+            )
             state.stop(error.code)
             if detail:
                 print(f"[SCROLL] attempt={attempt} status=FAILED code={error.code}")
-            raise
+            raise error from None
         if detail:
             gesture = reader.last_scroll_gesture
             wheel_steps = 0 if gesture is None else len(gesture.wheel_deltas)
@@ -180,14 +229,24 @@ async def run_page_workflow(
         for target in targets:
             try:
                 current = await reader.actionable_now(target)
-            except UiReadError as error:
+            except (UiReadError, PlaywrightError) as raw_error:
+                error = (
+                    raw_error
+                    if isinstance(raw_error, UiReadError)
+                    else _reader_playwright_error(
+                        page,
+                        raw_error,
+                        phase=state.phase.value,
+                        operation="SCAN_ROW",
+                    )
+                )
                 if error.code not in {
                     "DETAIL_NAVIGATION_UNVERIFIED",
                     "DETAIL_PROVENANCE_UNVERIFIED",
                     "POST_AUTHOR_UNVERIFIED",
                     "POST_PROVENANCE_UNVERIFIED",
                 }:
-                    raise
+                    raise error from None
                 actionability_rejected_codes.add(error.code)
                 if detail:
                     print(f"[ACTIONABILITY] status=REJECTED code={error.code}")
@@ -618,13 +677,24 @@ async def run_page_workflow(
 
         state.transition(WorkflowPhase.WAITING_FOR_CONTENT)
         state.transition(WorkflowPhase.VERIFYING)
+        reader.set_failure_context(state.phase.value, "SCAN_ROW")
         try:
             await reader.scan_viewport(
                 min(max_posts, remaining),
                 scanned_fingerprints=dedupe.seen_this_run,
                 on_row=observe_row,
             )
-        except UiReadError as error:
+        except (UiReadError, PlaywrightError) as raw_error:
+            error = (
+                raw_error
+                if isinstance(raw_error, UiReadError)
+                else _reader_playwright_error(
+                    page,
+                    raw_error,
+                    phase=state.phase.value,
+                    operation="SCAN_ROW",
+                )
+            )
             state.stop(error.code)
             counts = reader.last_scan_counts
             rejection_reasons = (
@@ -696,7 +766,7 @@ async def run_page_workflow(
                 )
             if detail:
                 print(f"[VIEWPORT] status=FAILED code={error.code}")
-            raise
+            raise error from None
         state.transition(WorkflowPhase.OBSERVING)
         scan_counts = reader.last_scan_counts
         unverified_observation_cap_exceeded = (
@@ -1157,13 +1227,24 @@ async def run_page_workflow(
                     "decision=VERIFIED_FALLBACK reason=NO_RELEVANT_MATCH"
                 )
         state.transition(WorkflowPhase.DETAIL)
+        reader.set_failure_context(state.phase.value, "DETAIL")
         try:
             detail_target = await reader.read_detail(selected)
-        except UiReadError as error:
+        except (UiReadError, PlaywrightError) as raw_error:
+            error = (
+                raw_error
+                if isinstance(raw_error, UiReadError)
+                else _reader_playwright_error(
+                    page,
+                    raw_error,
+                    phase=state.phase.value,
+                    operation="DETAIL",
+                )
+            )
             state.stop(error.code)
             if detail:
                 print(f"[DETAIL] post={selected_number} status=FAILED")
-            raise
+            raise error from None
         if detail:
             home_body = " ".join((selected.body or "").split())
             expanded_body = " ".join((detail_target.body or "").split())
@@ -1190,9 +1271,20 @@ async def run_page_workflow(
         if detail:
             print(f"[BACK] post={selected_number} status=REQUESTED")
         state.transition(WorkflowPhase.BACK)
+        reader.set_failure_context(state.phase.value, "BACK")
         try:
             await reader.return_to_home()
-        except UiReadError as error:
+        except (UiReadError, PlaywrightError) as raw_error:
+            error = (
+                raw_error
+                if isinstance(raw_error, UiReadError)
+                else _reader_playwright_error(
+                    page,
+                    raw_error,
+                    phase=state.phase.value,
+                    operation="BACK",
+                )
+            )
             state.stop(error.code)
             if detail:
                 anchor_status = (
@@ -1202,7 +1294,7 @@ async def run_page_workflow(
                     f"[BACK] post={selected_number} status=FAILED "
                     f"anchor={anchor_status} code={error.code}"
                 )
-            raise
+            raise error from None
         if detail:
             print(f"[BACK] post={selected_number} status=RESTORED anchor=MATCHED")
         detail_reads = 1

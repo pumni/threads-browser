@@ -22,6 +22,13 @@ class WorkflowPhase(StrEnum):
     STOPPED = "STOPPED"
 
 
+class InvalidWorkflowTransition(ValueError):
+    def __init__(self, phase: WorkflowPhase, requested_phase: WorkflowPhase) -> None:
+        self.phase = phase
+        self.requested_phase = requested_phase
+        super().__init__(f"invalid nurture transition: {phase} -> {requested_phase}")
+
+
 _ALLOWED_TRANSITIONS: dict[WorkflowPhase, frozenset[WorkflowPhase]] = {
     WorkflowPhase.INITIALIZING: frozenset({WorkflowPhase.OBSERVING, WorkflowPhase.STOPPED}),
     WorkflowPhase.OBSERVING: frozenset(
@@ -83,7 +90,7 @@ class NurtureRunState:
 
     def transition(self, phase: WorkflowPhase) -> None:
         if phase not in _ALLOWED_TRANSITIONS[self.phase]:
-            raise ValueError(f"invalid nurture transition: {self.phase} -> {phase}")
+            raise InvalidWorkflowTransition(self.phase, phase)
         self.phase = phase
 
     def stop(self, reason: str) -> None:

@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Protocol
 from urllib.parse import urljoin, urlsplit
 
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Locator, Page, expect
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
@@ -15,6 +17,111 @@ from ..feed.urls import _profile_author, _same_home_origin
 from .loading import CardNotReady as _CardNotReady
 
 _FOR_YOU_NAME = re.compile(r"^for you$", re.IGNORECASE)
+_DOM_CHANGE_MARKERS = (
+    "not attached to the dom",
+    "detached from the frame",
+    "node is detached",
+    "execution context was destroyed",
+    "cannot find context with specified id",
+)
+_TARGET_CLOSED_MARKERS = (
+    "target closed",
+    "target page, context or browser has been closed",
+    "browser has been closed",
+    "context has been closed",
+    "page has been closed",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class PlaywrightFailure:
+    error_class: str
+    page_closed: bool | None
+    context_closed: bool | None
+
+
+def classify_playwright_failure(page: Page | None, error: PlaywrightError) -> PlaywrightFailure:
+    """Classify Playwright failures without retaining or exposing exception text."""
+    message = str(error).casefold()
+    page_closed: bool | None = page is None
+    context_closed: bool | None = None
+    browser_connected: bool | None = None
+    if page is not None:
+        try:
+            page_closed = page.is_closed()
+        except PlaywrightError:
+            page_closed = None
+        try:
+            browser = page.context.browser
+            if browser is not None:
+                browser_connected = browser.is_connected()
+        except PlaywrightError:
+            browser_connected = None
+
+    if "context has been closed" in message:
+        context_closed = True
+    error_name = type(error).__name__.casefold()
+    if (
+        page_closed is True
+        or browser_connected is False
+        or error_name in {"targetclosederror", "browserclosederror", "contextclosederror"}
+        or any(marker in message for marker in _TARGET_CLOSED_MARKERS)
+    ):
+        return PlaywrightFailure("TARGET_CLOSED", page_closed, context_closed)
+    if any(marker in message for marker in _DOM_CHANGE_MARKERS):
+        return PlaywrightFailure("DOM_DETACHED", page_closed, context_closed)
+    return PlaywrightFailure("OTHER", page_closed, context_closed)
+
+
+def emit_failure_diagnostic(
+    *,
+    phase: str,
+    operation: str,
+    error_class: str,
+    page_closed: bool | None,
+    context_closed: bool | None,
+) -> None:
+    """Print bounded, privacy-safe failure metadata only."""
+    phases = {
+        "INITIALIZING",
+        "OBSERVING",
+        "SCROLLING",
+        "WAITING_FOR_CONTENT",
+        "VERIFYING",
+        "SELECTING",
+        "DETAIL",
+        "BACK",
+        "CHECKPOINTING",
+        "STOPPED",
+    }
+    operations = {
+        "SCAN_ROW",
+        "SETTLE",
+        "SCROLL",
+        "DETAIL",
+        "BACK",
+        "LAUNCH_SESSION",
+        "STATE_TRANSITION",
+        "OTHER",
+    }
+
+    def flag(value: bool | None) -> str:
+        return "unknown" if value is None else str(value).lower()
+
+    safe_phase = phase if phase in phases else "UNKNOWN"
+    safe_operation = operation if operation in operations else "OTHER"
+    safe_error = error_class if error_class in {
+        "TARGET_CLOSED",
+        "DOM_DETACHED",
+        "STATE_INVALID",
+        "OTHER",
+    } else "OTHER"
+    print(
+        f"[FAILURE_DIAGNOSTIC] phase={safe_phase} operation={safe_operation} "
+        f"error_class={safe_error} page_closed={flag(page_closed)} "
+        f"context_closed={flag(context_closed)}",
+        flush=True,
+    )
 
 
 class HomeSessionHost(Protocol):

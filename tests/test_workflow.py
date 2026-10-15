@@ -10,6 +10,7 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Route
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright as real_async_playwright
@@ -22,6 +23,8 @@ from threads_browser.browser_ui.scrolling import (
     NativeWheelScrollEngine,
 )
 from threads_browser.cli import main
+from threads_browser.nurture import state as nurture_state
+from threads_browser.nurture.state import WorkflowPhase
 from threads_browser.reader import (
     HOME_URL,
     ThreadsHomeReader,
@@ -2000,6 +2003,370 @@ def test_unresolved_post_root_keeps_coverage_incomplete_and_blocks_checkpoint(
     assert checkpoint.detail_reads == 0
     output = capsys.readouterr().out
     assert "POST_ROOT_UNRESOLVED:1" in output
+
+
+def test_ambiguous_pressable_row_recovers_only_its_timestamp_author_and_body() -> None:
+    actor = "offline.operator"
+    primary_body = "Hiring a backend engineer in Vietnam"
+    html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main><article id="ambiguous-wrapper">
+  <div id="primary-post">
+    <a href="/@candidate/post/primary"><time>now</time></a>
+    <a href="/@candidate">candidate</a>
+    <p>{primary_body}</p>
+    <a href="/@candidate/post/secondary?source=synthetic">secondary link</a>
+  </div>
+  <div id="related-post">
+    <a href="/@candidate/post/related">related link</a>
+    <p>Weather text from a related card</p>
+  </div>
+  <blockquote>
+    <a href="/@candidate/post/quoted"><time>2h</time></a>
+    <p>Quoted text from another post</p>
+  </blockquote>
+  <div data-pressable-container="true" id="media-card">
+    <a href="/@candidate/post/media"><time>3h</time></a>
+    <a href="/@candidate">candidate</a><p>Media card text</p>
+  </div>
+</article></main></body></html>"""
+
+    async def exercise(page) -> None:
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        targets = await reader.scan_viewport(2)
+
+        assert len(targets) == 1
+        assert targets[0].url.endswith("/post/primary")
+        assert targets[0].author == "candidate"
+        assert targets[0].body == primary_body
+        assert targets[0].currently_visible
+        assert reader.last_scan_counts.coverage_complete
+        assert reader.last_scan_counts.wrapper_ambiguous == 0
+        assert not reader.last_scan_counts.structural_reasons.get(
+            "ROW_PROVENANCE_UNRESOLVED"
+        )
+        assert reader.last_candidate_diagnostics[0].reason == "PROVENANCE_VERIFIED"
+
+    _run_offline_page(html, exercise)
+
+
+def test_unresolved_ambiguous_row_is_one_gap_and_stops_before_scroll_or_checkpoint(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main>
+<article id="unresolved-wrapper">
+  <a href="/@candidate/post/ambiguous"><time>now</time></a>
+  <a href="/@candidate/post/related">related link</a>
+  <a href="/@candidate">candidate</a>
+  <p>Hiring body whose post boundary is not isolated</p>
+</article>
+<article id="clean-row">
+  <a href="/@candidate/post/clean-row"><time>1h</time></a>
+  <a href="/@candidate">candidate</a>
+  <p>A synthetic weather update</p>
+</article>
+</main></body></html>"""
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(tmp_path / "data").add("offline", actor, profile)
+    store = CheckpointStore(tmp_path / "data")
+
+    async def exercise(page) -> None:
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=2,
+            max_scrolls=4,
+            terms=("hiring",),
+        )
+        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
+        assert result.unresolved_gaps == 1
+        assert result.scroll_attempts == 0
+        assert result.detail_reads == 0
+        assert result.checkpoint_runs == 0
+
+    _run_offline_page(html, exercise)
+    output = capsys.readouterr().out
+    assert "ROW_PROVENANCE_UNRESOLVED:1" in output
+    assert "POST_ROOT_UNRESOLVED:1" not in output
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert checkpoint.completed_runs == 0
+
+
+def test_removed_ambiguous_row_gets_a_new_observation_identity() -> None:
+    actor = "offline.operator"
+    html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main><article id="row-to-remove">
+  <a href="/@candidate/post/primary"><time>now</time></a>
+  <a href="/@candidate/post/related">related link</a>
+  <a href="/@candidate">candidate</a>
+  <p>A synthetic row removed during recovery</p>
+</article></main></body></html>"""
+
+    class RemoveRowReader(ThreadsHomeReader):
+        original_observation_id: str | None = None
+
+        async def _recover_ambiguous_visible_card(self, root, root_handle, **kwargs):
+            self.original_observation_id = self.last_candidate_diagnostics[0].observation_id
+            await root.evaluate("node => node.remove()")
+            raise reader_module._CardNotReady(
+                root,
+                reason_code="POST_ROOT_DOM_IDENTITY_CHANGED",
+            )
+
+    async def exercise(page) -> None:
+        reader = RemoveRowReader(page, actor)
+        await reader.open_home()
+        targets = await reader.scan_viewport(1)
+
+        assert targets == ()
+        assert reader.original_observation_id is not None
+        assert len(reader.last_candidate_diagnostics) == 1
+        diagnostic = reader.last_candidate_diagnostics[0]
+        assert diagnostic.reason == "POST_ROOT_IDENTITY_CHANGED"
+        assert diagnostic.observation_id != reader.original_observation_id
+        assert not reader.last_viewport_can_wheel
+
+    _run_offline_page(html, exercise)
+
+
+@pytest.mark.parametrize("close_context", [False, True], ids=["page", "context"])
+def test_closed_session_during_scan_is_classified_without_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    close_context: bool,
+) -> None:
+    actor = "offline.operator"
+    html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main><article><a href="/@candidate/post/closed-scan"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>A synthetic weather update</p></article></main>
+</body></html>"""
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(tmp_path / "data").add("offline", actor, profile)
+    store = CheckpointStore(tmp_path / "data")
+
+    class ClosedDuringScanReader(ThreadsHomeReader):
+        async def scan_viewport(self, *args, **kwargs):
+            if close_context:
+                await self._page.context.close()
+            else:
+                await self._page.close()
+            await self._page.title()
+
+    monkeypatch.setattr(workflow, "ThreadsHomeReader", ClosedDuringScanReader)
+
+    async def exercise(page) -> None:
+        with pytest.raises(UiReadError) as caught:
+            await workflow.run_page_workflow(
+                page,
+                account,
+                store,
+                max_posts=1,
+                max_scrolls=0,
+                terms=("hiring",),
+            )
+        assert caught.value.code == "BROWSER_SESSION_UNAVAILABLE"
+
+    _run_offline_page(html, exercise)
+    output = capsys.readouterr().out
+    assert (
+        "[FAILURE_DIAGNOSTIC] phase=VERIFYING operation=SCAN_ROW "
+        "error_class=TARGET_CLOSED page_closed=true context_closed=unknown"
+    ) in output
+    assert output.count("[FAILURE_DIAGNOSTIC]") == 1
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert checkpoint.completed_runs == 0
+
+
+def test_transient_row_detachment_is_retried_after_session_reverification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main><article><a href="/@candidate/post/detached-row"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>A synthetic weather update</p></article></main>
+</body></html>"""
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(tmp_path / "data").add("offline", actor, profile)
+    store = CheckpointStore(tmp_path / "data")
+
+    class DetachOnceReader(ThreadsHomeReader):
+        detached = False
+
+        async def _visible_targets(self, *args, **kwargs):
+            if not self.detached:
+                self.detached = True
+                await self._page.locator("main > article").evaluate(
+                    "node => node.replaceWith(node.cloneNode(true))"
+                )
+                raise PlaywrightError("Element is not attached to the DOM PRIVATE_MARKER")
+            return await super()._visible_targets(*args, **kwargs)
+
+    monkeypatch.setattr(workflow, "ThreadsHomeReader", DetachOnceReader)
+
+    async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body="""<!doctype html><html><body><article>
+<a href="/@candidate/post/detached-row"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>A synthetic weather update</p>
+</article></body></html>""",
+            )
+
+        await page.route("**/post/detached-row", serve_detail)
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=1,
+            max_scrolls=0,
+            terms=("hiring",),
+        )
+        assert result.status == "COMPLETE"
+        assert result.home_sampled == 1
+        assert result.detail_reads == 1
+
+    _run_offline_page(html, exercise)
+    output = capsys.readouterr().out
+    assert (
+        "[FAILURE_DIAGNOSTIC] phase=VERIFYING operation=SCAN_ROW "
+        "error_class=DOM_DETACHED page_closed=false context_closed=unknown"
+    ) in output
+    assert "RECOVERED stage=FEED_INITIAL retry=1" in output
+    assert "PRIVATE_MARKER" not in output
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert checkpoint.completed_runs == 1
+
+
+def test_invalid_workflow_transition_is_not_mapped_to_browser_loss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+</body></html>"""
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(tmp_path / "data").add("offline", actor, profile)
+    store = CheckpointStore(tmp_path / "data")
+    monkeypatch.setitem(
+        nurture_state._ALLOWED_TRANSITIONS,
+        WorkflowPhase.INITIALIZING,
+        frozenset(),
+    )
+
+    async def exercise(page) -> None:
+        with pytest.raises(UiReadError) as caught:
+            await workflow.run_page_workflow(
+                page,
+                account,
+                store,
+                max_posts=1,
+                max_scrolls=0,
+                terms=("hiring",),
+            )
+        assert caught.value.code == "INTERNAL_STATE_ERROR"
+
+    _run_offline_page(html, exercise)
+    output = capsys.readouterr().out
+    assert (
+        "[FAILURE_DIAGNOSTIC] phase=INITIALIZING operation=STATE_TRANSITION "
+        "error_class=STATE_INVALID page_closed=false context_closed=unknown"
+    ) in output
+    assert "BROWSER_SESSION_UNAVAILABLE" not in output
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert checkpoint.completed_runs == 0
+
+
+def test_other_playwright_scan_error_is_not_mapped_to_browser_loss(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+</body></html>"""
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(tmp_path / "data").add("offline", actor, profile)
+    store = CheckpointStore(tmp_path / "data")
+
+    class OtherErrorReader(ThreadsHomeReader):
+        async def scan_viewport(self, *args, **kwargs):
+            raise PlaywrightError("synthetic protocol failure PRIVATE_MARKER")
+
+    monkeypatch.setattr(workflow, "ThreadsHomeReader", OtherErrorReader)
+
+    async def exercise(page) -> None:
+        with pytest.raises(UiReadError) as caught:
+            await workflow.run_page_workflow(
+                page,
+                account,
+                store,
+                max_posts=1,
+                max_scrolls=0,
+                terms=("hiring",),
+            )
+        assert caught.value.code == "UI_READ_UNVERIFIED"
+
+    _run_offline_page(html, exercise)
+    output = capsys.readouterr().out
+    assert (
+        "[FAILURE_DIAGNOSTIC] phase=VERIFYING operation=SCAN_ROW "
+        "error_class=OTHER page_closed=false context_closed=unknown"
+    ) in output
+    assert "PRIVATE_MARKER" not in output
+    assert output.count("[FAILURE_DIAGNOSTIC]") == 1
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert checkpoint.completed_runs == 0
 
 
 def test_detail_does_not_auto_scroll_an_offscreen_target() -> None:

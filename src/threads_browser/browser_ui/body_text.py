@@ -143,6 +143,7 @@ class BodyTextReader:
         *,
         fingerprint: str | None = None,
         scan_counts: _FeedScanCounts,
+        isolated_scope: bool = False,
     ) -> _VisibleBodyRead:
         observation = await root.evaluate(
             _with_scrollport_geometry("""(root, args) => {
@@ -165,6 +166,10 @@ class BodyTextReader:
                 const belongs = element => {
                     const nearest = element.parentElement?.closest(args.roots);
                     if (root.matches(args.roots)) return nearest === root;
+                    if (args.isolatedScope) {
+                        const owner = root.parentElement?.closest(args.roots);
+                        return root.contains(element) && (!nearest || nearest === owner);
+                    }
                     return root.contains(element) && !nearest;
                 };
                 const excluded = element =>
@@ -431,6 +436,7 @@ class BodyTextReader:
                 "maxChars": _MAX_BODY_CODEPOINTS,
                 "maxNodes": _MAX_BODY_TEXT_NODES,
                 "maxRangeChecks": _MAX_BODY_RANGE_CHECKS,
+                "isolatedScope": isolated_scope,
             },
         )
 

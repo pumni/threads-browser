@@ -137,6 +137,8 @@ class FeedRowScanner:
         element: Locator,
         root: Locator,
         root_handle: JSHandle,
+        *,
+        isolated_scope: bool = False,
     ) -> bool:
 
         return bool(
@@ -153,6 +155,15 @@ class FeedRowScanner:
 
                     }
 
+                    if (args.isolatedScope) {
+
+                        const owner = args.root.parentElement?.closest(args.selector);
+
+                        return args.root.contains(node) &&
+                            (!nearest || nearest === owner);
+
+                    }
+
                     return args.root.contains(node) && nearest === null;
 
                 }""",
@@ -160,6 +171,7 @@ class FeedRowScanner:
                     "selector": _FEED_ROOT_SELECTOR,
                     "quote": _QUOTE_SELECTOR,
                     "root": root_handle,
+                    "isolatedScope": isolated_scope,
                 },
             )
         )
@@ -582,6 +594,8 @@ class FeedRowScanner:
         element: Locator,
         root: Locator,
         root_handle: JSHandle,
+        *,
+        isolated_scope: bool = False,
     ) -> bool:
 
         return bool(
@@ -608,6 +622,13 @@ class FeedRowScanner:
 
                         if (nearestRoot !== args.root) return false;
 
+                    } else if (args.isolatedScope) {
+
+                        const owner = args.root.parentElement?.closest(args.roots);
+
+                        if (!args.root.contains(node) ||
+                            (nearestRoot && nearestRoot !== owner)) return false;
+
                     } else if (!args.root.contains(node) || nearestRoot) {
 
                         return false;
@@ -625,6 +646,7 @@ class FeedRowScanner:
                     "root": root_handle,
                     "roots": _FEED_ROOT_SELECTOR,
                     "excluded": _BODY_EXCLUSION_SELECTOR,
+                    "isolatedScope": isolated_scope,
                 },
             )
         )
