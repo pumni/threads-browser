@@ -56,6 +56,7 @@ _DETAIL_TIMEOUT_MS = 15_000
 _READINESS_TIMEOUT_MS = 8_000
 _AUTOMATIC_READINESS_WINDOWS = 2
 _READINESS_RECHECK_INTERVAL_MS = 200
+_CARD_HYDRATION_WAIT_MS = 800
 _RENDER_MIN_DWELL_MS = 600
 _RENDER_SETTLE_INTERVAL_MS = 300
 _RENDER_STABLE_OBSERVATIONS = 2
@@ -125,6 +126,7 @@ class _CardNotReady(Exception):
         timeout_code: str | None = None,
         condition: Literal["visible", "retry"] = "visible",
         signals: tuple[_CardWaitSignal, ...] | None = None,
+        reason_code: str = "READINESS_SIGNAL_PENDING",
     ) -> None:
         if signals is None:
             if locator is None:
@@ -139,6 +141,7 @@ class _CardNotReady(Exception):
             (signal.timeout_code for signal in signals if signal.timeout_code),
             None,
         )
+        self.reason_code = reason_code
         super().__init__()
 
     @classmethod
@@ -186,7 +189,20 @@ class _CandidateStructure:
     profile_anchor_candidates: int = 0
     visible_times: int = 0
     body_candidates: int = 0
+    readable_body_candidates: int = 0
     paragraph_candidates: int = 0
+
+
+@dataclass(slots=True)
+class _CandidateDiagnostic:
+    row_index: int
+    root_kind: str
+    has_visible_time: bool
+    has_post_permalink: bool
+    has_profile_author: bool
+    has_readable_body: bool
+    state: str = "NON_POST"
+    reason: str = "NO_POST_ROW_EVIDENCE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,7 +234,7 @@ class _VisibleTargets:
     coverage_complete: bool
     signature: tuple[object, ...] = field(repr=False)
     candidate_roots: tuple[Locator, ...] = field(default=(), repr=False)
-    pending_roots: tuple[Locator, ...] = field(default=(), repr=False)
+    pending_signals: tuple[_CardWaitSignal, ...] = field(default=(), repr=False)
 
 
 class ThreadsHomeReader:
@@ -245,6 +261,7 @@ class ThreadsHomeReader:
         self.scrolls = 0
         self.feed_duplicates = 0
         self.last_scan_counts = _FeedScanCounts()
+        self.last_candidate_diagnostics: tuple[_CandidateDiagnostic, ...] = ()
         self.last_display_observations: tuple[DisplayObservation, ...] = ()
         self.last_scroll_targets: tuple[PostTarget, ...] = ()
         self.last_viewport_coverage_complete = True
@@ -1364,13 +1381,13 @@ class ThreadsHomeReader:
             return None
         duplicate_delta = self.feed_duplicates - duplicate_count_before
         self.feed_duplicates = duplicate_count_before
-        if scan.pending_roots:
-            pending = _CardNotReady(
-                signals=tuple(
-                    _CardWaitSignal(root, "retry") for root in scan.pending_roots
-                )
-            )
-            if await self._wait_for_pending_card(pending, deadline):
+        if scan.pending_signals:
+            pending = _CardNotReady(signals=scan.pending_signals)
+            if await self._wait_for_pending_card(
+                pending,
+                deadline,
+                max_wait_ms=_CARD_HYDRATION_WAIT_MS,
+            ):
                 return None
         if not scan.observed_rows:
             pending = await self._feed_readiness_signals()
@@ -1505,11 +1522,6 @@ class ThreadsHomeReader:
         if viewport is None:
             return None
         region = await self._content_region()
-        roots, _ = await self._top_level_candidate_roots(region, viewport)
-        for root in roots:
-            structure = await self._inspect_candidate_root(root, viewport)
-            if not structure.body_candidates:
-                signals.append(_CardWaitSignal(root, "retry"))
 
         permalinks = region.locator('a[href*="/post/"]')
         for index in range(min(await permalinks.count(), _MAX_PERMALINK_CANDIDATES)):
@@ -1524,18 +1536,22 @@ class ThreadsHomeReader:
 
         if not signals:
             return None
-        signals.append(_CardWaitSignal(self._page.locator("body"), "retry"))
         return _CardNotReady(signals=tuple(signals))
 
     async def _wait_for_pending_card(
         self,
         pending: _CardNotReady,
         deadline: float,
+        *,
+        max_wait_ms: int | None = None,
     ) -> bool:
         remaining = int((deadline - time.monotonic()) * 1000)
         if remaining <= 0:
             return False
-        wait_ms = min(remaining, _READINESS_RECHECK_INTERVAL_MS)
+        wait_ms = min(
+            remaining,
+            max_wait_ms or _READINESS_RECHECK_INTERVAL_MS,
+        )
 
         async def wait_for_signal(signal: _CardWaitSignal) -> bool:
             try:
@@ -1873,6 +1889,7 @@ class ThreadsHomeReader:
         counts.region_status = "UNSET"
         counts.scroll_surface_status = "NOT_CHECKED"
         counts.structural_reasons.clear()
+        self.last_candidate_diagnostics = ()
         region = await self._content_region()
         roots, roots_truncated = await self._top_level_candidate_roots(region, viewport)
         structures = await self._collect_structure_diagnostics(
@@ -1880,45 +1897,69 @@ class ThreadsHomeReader:
             roots,
             viewport,
         )
-        candidate_rows: list[tuple[int, Locator, _CandidateStructure]] = []
+        candidate_rows: list[
+            tuple[int, Locator, _CandidateStructure, bool, _CandidateDiagnostic]
+        ] = []
+        diagnostics: list[_CandidateDiagnostic] = []
         for index, root in enumerate(roots):
             structure = structures[index]
+            root_kind = await self._candidate_root_kind(root)
+            diagnostic = _CandidateDiagnostic(
+                row_index=index + 1,
+                root_kind=root_kind,
+                has_visible_time=structure.visible_times > 0,
+                has_post_permalink=structure.visible_post_links > 0,
+                has_profile_author=structure.profile_anchor_candidates > 0,
+                has_readable_body=structure.readable_body_candidates > 0,
+            )
+            diagnostics.append(diagnostic)
             has_row_cues = structure.visible_times and (
                 structure.profile_anchor_candidates
                 or structure.visible_post_links
                 or structure.body_candidates
             )
-            semantic_row = (
+            semantic_evidence = (
                 structure.body_candidates
                 and (
                     structure.visible_times
                     or structure.profile_anchor_candidates
                     or structure.visible_post_links
                 )
-                and await root.evaluate(
-                "node => node.matches('article, [role=\"article\"], "
-                "[data-pressable-container=\"true\"]')"
-                )
             )
+            semantic_row = semantic_evidence and (
+                root_kind != "PRESSABLE"
+                or structure.visible_times
+                or structure.visible_post_links
+            ) and root_kind in {"ARTICLE", "ROLE_ARTICLE", "PRESSABLE"}
             carried_row = await self._is_carried_viewport_candidate(root)
             if has_row_cues or semantic_row or carried_row:
-                candidate_rows.append((index, root, structure))
+                diagnostic.state = "PENDING"
+                diagnostic.reason = "POST_ROW_REQUIRES_VERIFICATION"
+                candidate_rows.append((index, root, structure, carried_row, diagnostic))
+        self.last_candidate_diagnostics = tuple(diagnostics)
         counts.observed_rows = len(candidate_rows)
         counts.coverage_complete = (
             not roots_truncated
             and len(candidate_rows) <= max_posts
-            and not any(structure.visible_times > 1 for _, _, structure in candidate_rows)
+            and not any(
+                structure.visible_times > 1
+                for _, _, structure, _, _ in candidate_rows
+            )
         )
         targets: list[PostTarget] = []
         scroll_anchor: dict[str, float] | None = None
         display_observations: list[DisplayObservation] = []
-        pending_roots: list[Locator] = []
+        pending_signals: list[_CardWaitSignal] = []
         scanned_fingerprints: set[str] = set()
-        for row_index, root, structure in candidate_rows[:max_posts]:
+        for row_index, root, structure, carried_row, diagnostic in candidate_rows[
+            :max_posts
+        ]:
             box = await root.bounding_box()
             if box is None:
                 counts.skipped_rows += 1
                 counts.uncertain_rows += 1
+                diagnostic.state = "UNCERTAIN"
+                diagnostic.reason = "POST_ROOT_NOT_VISIBLE"
                 display_observations.append(
                     DisplayObservation(None, "OBSERVATION_UNCERTAIN")
                 )
@@ -1932,6 +1973,8 @@ class ThreadsHomeReader:
             ) and not carried_row:
                 counts.skipped_rows += 1
                 counts.uncertain_rows += 1
+                diagnostic.state = "UNCERTAIN"
+                diagnostic.reason = "DISPLAY_ROW_CUES_INSUFFICIENT"
                 self._record_structure_reason("DISPLAY_ROW_CUES_INSUFFICIENT")
                 display_observations.append(
                     DisplayObservation(None, "OBSERVATION_UNCERTAIN", box["y"])
@@ -1942,6 +1985,8 @@ class ThreadsHomeReader:
             ):
                 counts.skipped_rows += 1
                 counts.uncertain_rows += 1
+                diagnostic.state = "UNCERTAIN"
+                diagnostic.reason = "CANDIDATE_ROW_AMBIGUOUS"
                 self._record_structure_reason("CANDIDATE_ROW_AMBIGUOUS")
                 display_observations.append(
                     DisplayObservation(None, "OBSERVATION_UNCERTAIN", box["y"])
@@ -1953,19 +1998,54 @@ class ThreadsHomeReader:
                     currently_visible=currently_visible,
                     viewport_y=box["y"],
                 )
-            except _CardNotReady:
+            except _CardNotReady as pending:
                 counts.card_not_ready += 1
-                body = await self._observe_display_body(root)
-                if body:
+                body, body_signals = await self._observe_display_body(root)
+                diagnostic.has_readable_body = bool(body)
+                should_wait_for_permalink = (
+                    pending.reason_code == "POST_PERMALINK_PENDING"
+                    and diagnostic.root_kind
+                    in {"ARTICLE", "ROLE_ARTICLE", "PRESSABLE"}
+                )
+                should_wait_for_missing_author = (
+                    pending.reason_code == "POST_AUTHOR_PENDING"
+                )
+                signals = (
+                    pending.signals
+                    if should_wait_for_permalink or should_wait_for_missing_author
+                    else body_signals
+                )
+                if signals:
+                    pending_signals.extend(signals)
+                if should_wait_for_permalink or should_wait_for_missing_author:
+                    diagnostic.state = "PENDING"
+                    diagnostic.reason = pending.reason_code
+                    counts.skipped_rows += 1
+                    counts.uncertain_rows += 1
+                    counts.body_unknown += int(not body)
+                    if body:
+                        counts.body_extracted += 1
+                elif body:
+                    diagnostic.state = "OBSERVED_UNVERIFIED"
+                    diagnostic.reason = pending.reason_code
                     counts.body_extracted += 1
+                elif body_signals:
+                    diagnostic.state = "PENDING"
+                    diagnostic.reason = "POST_BODY_PENDING"
+                    counts.body_unknown += 1
+                    counts.skipped_rows += 1
+                    counts.uncertain_rows += 1
+                else:
+                    diagnostic.state = "UNCERTAIN"
+                    diagnostic.reason = pending.reason_code
+                    counts.body_unknown += 1
+                    counts.skipped_rows += 1
+                    counts.uncertain_rows += 1
+                if body:
                     display_observations.append(
                         DisplayObservation(body, viewport_y=box["y"])
                     )
                 else:
-                    counts.body_unknown += 1
-                    counts.skipped_rows += 1
-                    counts.uncertain_rows += 1
-                    pending_roots.append(root)
                     display_observations.append(
                         DisplayObservation(None, "OBSERVATION_UNCERTAIN", box["y"])
                     )
@@ -1975,13 +2055,18 @@ class ThreadsHomeReader:
                 if error.diagnostic_reason == "CANDIDATE_WRAPPER_AMBIGUOUS":
                     counts.skipped_rows += 1
                     counts.uncertain_rows += 1
+                    diagnostic.state = "UNCERTAIN"
+                    diagnostic.reason = error.diagnostic_reason
                     display_observations.append(
                         DisplayObservation(None, "OBSERVATION_UNCERTAIN", box["y"])
                     )
                     continue
-                body = await self._observe_display_body(root)
+                body, body_signals = await self._observe_display_body(root)
+                diagnostic.has_readable_body = bool(body)
                 if body:
                     counts.body_extracted += 1
+                    diagnostic.state = "OBSERVED_UNVERIFIED"
+                    diagnostic.reason = error.diagnostic_reason or error.reason
                     display_observations.append(
                         DisplayObservation(body, viewport_y=box["y"])
                     )
@@ -1989,7 +2074,13 @@ class ThreadsHomeReader:
                     counts.body_unknown += 1
                     counts.skipped_rows += 1
                     counts.uncertain_rows += 1
-                    pending_roots.append(root)
+                    diagnostic.state = "PENDING" if body_signals else "UNCERTAIN"
+                    diagnostic.reason = (
+                        "POST_BODY_PENDING"
+                        if body_signals
+                        else error.diagnostic_reason or error.reason
+                    )
+                    pending_signals.extend(body_signals)
                     display_observations.append(
                         DisplayObservation(None, "OBSERVATION_UNCERTAIN", box["y"])
                     )
@@ -2000,9 +2091,12 @@ class ThreadsHomeReader:
                     permalink_box is None
                     or not self._intersects_viewport(permalink_box, viewport)
                 ):
-                    body = await self._observe_display_body(root)
+                    body, _ = await self._observe_display_body(root)
                     if body:
                         counts.body_extracted += 1
+                        diagnostic.has_readable_body = True
+                        diagnostic.state = "OBSERVED_UNVERIFIED"
+                        diagnostic.reason = "POST_PERMALINK_OUTSIDE_VIEWPORT"
                         display_observations.append(
                             DisplayObservation(body, viewport_y=box["y"])
                         )
@@ -2010,7 +2104,8 @@ class ThreadsHomeReader:
                         counts.body_unknown += 1
                         counts.skipped_rows += 1
                         counts.uncertain_rows += 1
-                        pending_roots.append(root)
+                        diagnostic.state = "UNCERTAIN"
+                        diagnostic.reason = "POST_PERMALINK_OUTSIDE_VIEWPORT"
                         display_observations.append(
                             DisplayObservation(
                                 None,
@@ -2020,13 +2115,19 @@ class ThreadsHomeReader:
                         )
                     continue
             counts.verified += 1
+            diagnostic.state = "VERIFIED"
+            diagnostic.reason = "PROVENANCE_VERIFIED"
+            diagnostic.has_readable_body = bool(target.body and target.body.strip())
             if target.body and target.body.strip():
                 counts.body_read += 1
                 counts.body_extracted += 1
             else:
                 counts.body_unknown += 1
                 self._record_structure_reason("POST_BODY_STRUCTURE_UNSUPPORTED")
-                pending_roots.append(root)
+                diagnostic.state = "PENDING"
+                diagnostic.reason = "POST_BODY_UNAVAILABLE"
+                counts.skipped_rows += 1
+                counts.uncertain_rows += 1
             if (
                 target.fingerprint in scanned_fingerprints
                 or (
@@ -2087,8 +2188,8 @@ class ThreadsHomeReader:
             counts.observed_rows,
             counts.coverage_complete,
             signature,
-            tuple(root for _, root, _ in candidate_rows[:max_posts]),
-            tuple(pending_roots),
+            tuple(root for _, root, _, _, _ in candidate_rows[:max_posts]),
+            tuple(pending_signals),
         )
 
     @staticmethod
@@ -2458,6 +2559,8 @@ class ThreadsHomeReader:
                     visible_anchors: anchors.length,
                     visible_times: times,
                     body_candidates: bodies.length,
+                    readable_body_candidates: bodies.filter(element =>
+                        (element.innerText || "").trim().length > 0).length,
                     paragraph_candidates: bodies.filter(element =>
                         element.tagName === "P").length,
                 };
@@ -2489,8 +2592,20 @@ class ThreadsHomeReader:
             ),
             visible_times=structure["visible_times"],
             body_candidates=structure["body_candidates"],
+            readable_body_candidates=structure["readable_body_candidates"],
             paragraph_candidates=structure["paragraph_candidates"],
         )
+
+    @staticmethod
+    async def _candidate_root_kind(root: Locator) -> str:
+        tag = await root.evaluate("node => node.tagName.toLowerCase()")
+        if tag == "article":
+            return "ARTICLE"
+        if await root.get_attribute("role") == "article":
+            return "ROLE_ARTICLE"
+        if await root.get_attribute("data-pressable-container") == "true":
+            return "PRESSABLE"
+        return "CONTAINER"
 
     def _record_structure_reason(self, reason: str) -> None:
         counts = self.last_scan_counts
@@ -3293,7 +3408,7 @@ class ThreadsHomeReader:
         root_handle: JSHandle,
         *,
         require_body: bool,
-    ) -> tuple[str | None, bool, bool]:
+    ) -> tuple[str | None, bool, bool, tuple[_CardWaitSignal, ...]]:
         buttons = root.get_by_role("button", name=_MORE_NAME)
         body_truncated = False
         for index in range(min(await buttons.count(), _MAX_CARD_LINKS)):
@@ -3304,6 +3419,7 @@ class ThreadsHomeReader:
 
         candidates = root.locator(_BODY_TEXT_SELECTOR)
         bodies: list[str] = []
+        empty_candidates: list[Locator] = []
         paragraph_bodies = 0
         count = min(await candidates.count(), _MAX_STRUCTURE_ELEMENTS)
         for index in range(count):
@@ -3336,6 +3452,7 @@ class ThreadsHomeReader:
                 continue
             text = (await candidate.inner_text()).strip()
             if not text:
+                empty_candidates.append(candidate)
                 continue
             bodies.append(text)
             paragraph_bodies += int(
@@ -3344,20 +3461,44 @@ class ThreadsHomeReader:
 
         if not bodies:
             if require_body:
+                empty_signals = tuple(
+                    _CardWaitSignal(
+                        candidate,
+                        "nonempty_text",
+                        "DETAIL_BODY_UNVERIFIED",
+                    )
+                    for candidate in empty_candidates
+                )
+                if empty_signals:
+                    raise _CardNotReady(
+                        signals=empty_signals,
+                        timeout_code="DETAIL_BODY_UNVERIFIED",
+                        reason_code="POST_BODY_PENDING",
+                    )
                 raise _CardNotReady(
                     candidates.first,
                     nonempty_text=True,
                     timeout_code="DETAIL_BODY_UNVERIFIED",
+                    reason_code="POST_BODY_PENDING",
                 )
-            return None, False, body_truncated
+            return (
+                None,
+                False,
+                body_truncated,
+                tuple(
+                    _CardWaitSignal(candidate, "nonempty_text")
+                    for candidate in empty_candidates
+                ),
+            )
         if paragraph_bodies > 1:
             if require_body:
                 raise _CardNotReady(
                     candidates.first,
                     nonempty_text=True,
                     timeout_code="DETAIL_BODY_UNVERIFIED",
+                    reason_code="POST_BODY_AMBIGUOUS",
                 )
-            return None, False, body_truncated
+            return None, False, body_truncated, ()
         body = "\n".join(bodies)
         if len(body) > _MAX_BODY_CODEPOINTS:
             if require_body:
@@ -3366,21 +3507,27 @@ class ThreadsHomeReader:
                     nonempty_text=True,
                     timeout_code="DETAIL_BODY_UNVERIFIED",
                 )
-            return None, True, body_truncated
+            return None, True, body_truncated, ()
         if body.rstrip().endswith(("…", "...")):
             body_truncated = True
-        return body, True, body_truncated
+        return body, True, body_truncated, ()
 
-    async def _observe_display_body(self, root: Locator) -> str | None:
+    async def _observe_display_body(
+        self,
+        root: Locator,
+    ) -> tuple[str | None, tuple[_CardWaitSignal, ...]]:
         root_handle = await root.element_handle()
         if root_handle is None:
-            return None
-        body, available, _ = await self._extract_card_body(
+            return None, ()
+        body, available, _, pending_signals = await self._extract_card_body(
             root,
             root_handle,
             require_body=False,
         )
-        return body if available and body and body.strip() else None
+        return (
+            body if available and body and body.strip() else None,
+            pending_signals,
+        )
 
     async def _read_card(
         self,
@@ -3441,10 +3588,14 @@ class ThreadsHomeReader:
                 diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
             )
         if not post_links:
-            raise _CardNotReady(root, condition="retry")
+            raise _CardNotReady(
+                root.locator('a[href*="/post/"]').first,
+                reason_code="POST_PERMALINK_PENDING",
+            )
         if not authors:
             raise _CardNotReady(
-                self._expected_profile_link_signal(root, post_links[0][1])
+                self._expected_profile_link_signal(root, post_links[0][1]),
+                reason_code="POST_AUTHOR_PENDING",
             )
         if len(unique_urls) != 1 or len(unique_permalink_links) != 1:
             raise _UnverifiedFeedCandidate(
@@ -3463,11 +3614,16 @@ class ThreadsHomeReader:
                 diagnostic_reason="CANDIDATE_AUTHOR_MISMATCH",
             )
 
-        body, body_available, body_truncated = await self._extract_card_body(
+        body, body_available, body_truncated, body_signals = await self._extract_card_body(
             root,
             root_handle,
             require_body=require_body,
         )
+        if not body_available and body_signals:
+            raise _CardNotReady(
+                signals=body_signals,
+                reason_code="POST_BODY_PENDING",
+            )
         fingerprint = sha256(f"{url}\n{author}".encode()).hexdigest()
         return PostTarget(
             url,

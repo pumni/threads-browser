@@ -11,7 +11,7 @@ from hashlib import sha256
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page, async_playwright
 
-from .feed.models import DisplayObservation
+from .feed.models import DisplayObservation, PostTarget
 from .feed.relevance import canonical_terms, classify_body
 from .reader import ThreadsHomeReader, UiReadError, _FeedScanCounts
 from .storage import (
@@ -139,6 +139,18 @@ def _format_structure_diagnostics(counts: _FeedScanCounts) -> str:
     )
 
 
+def _print_candidate_diagnostics(reader: ThreadsHomeReader) -> None:
+    for row in reader.last_candidate_diagnostics:
+        print(
+            f"[ROW row={row.row_index}] root={row.root_kind} "
+            f"has_visible_time={str(row.has_visible_time).lower()} "
+            f"has_post_permalink={str(row.has_post_permalink).lower()} "
+            f"has_profile_author={str(row.has_profile_author).lower()} "
+            f"has_readable_body={str(row.has_readable_body).lower()} "
+            f"state={row.state} reason={row.reason}"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class NurtureResult:
     status: str
@@ -259,6 +271,18 @@ async def run_page_workflow(
                 )
         return advanced
 
+    def select_verified_fallback(targets: list[PostTarget]) -> None:
+        nonlocal selected
+        if found_relevant or unverified_relevant or pending_set or not targets:
+            return
+        selected = min(
+            targets,
+            key=lambda target: target.fingerprint in previously_seen,
+        )
+        if selected.fingerprint not in pending_set:
+            pending.append(selected.fingerprint)
+            pending_set.add(selected.fingerprint)
+
     while True:
         remaining = max_total_posts - len(seen_this_run)
         if remaining <= 0:
@@ -286,6 +310,13 @@ async def run_page_workflow(
                 f"{_format_structure_diagnostics(counts)}"
             )
             if detail:
+                _print_candidate_diagnostics(reader)
+                if counts.body_read or counts.body_extracted:
+                    print(
+                        f"[VIEWPORT] verified_body_extracted={counts.body_read} "
+                        f"observed_body_extracted={counts.body_extracted - counts.body_read} "
+                        "scan=NOT_COMMITTED"
+                    )
                 print(f"[VIEWPORT {viewport_number}] status=FAILED code={error.code}")
             raise
         duplicates += reader.feed_duplicates - duplicate_count_before_scan
@@ -297,6 +328,7 @@ async def run_page_workflow(
         viewport_observation_unknown = 0
         viewport_selected = None
         viewport_relevant_targets = []
+        viewport_fallback_targets = []
         scan_counts = reader.last_scan_counts
         if detail:
             print(
@@ -306,6 +338,7 @@ async def run_page_workflow(
                 "coverage="
                 f"{str(scan_counts.coverage_complete).lower()}"
             )
+            _print_candidate_diagnostics(reader)
         for target in targets:
             if target.fingerprint in seen_this_run:
                 duplicates += 1
@@ -321,6 +354,12 @@ async def run_page_workflow(
                     and target.fingerprint in pending_set
                 ):
                     viewport_relevant_targets.append(target)
+                elif (
+                    target.body
+                    and target.body.strip()
+                    and decisions_by_fingerprint.get(target.fingerprint) != "RELEVANT"
+                ):
+                    viewport_fallback_targets.append(target)
                 continue
             seen_this_run.add(target.fingerprint)
             next_post_number += 1
@@ -362,9 +401,13 @@ async def run_page_workflow(
             elif decision == "IRRELEVANT":
                 irrelevant += 1
                 viewport_irrelevant += 1
+                if target.body and target.body.strip():
+                    viewport_fallback_targets.append(target)
             else:
                 unknown += 1
                 viewport_unknown += 1
+                if target.body and target.body.strip():
+                    viewport_fallback_targets.append(target)
         current_unverified_rows: list[tuple[str, float]] = []
         matched_overlap_rows: set[int] = set()
         for observation_number, observation in enumerate(
@@ -426,7 +469,13 @@ async def run_page_workflow(
                 observation_unknown += 1
                 viewport_observation_unknown += 1
             if detail:
-                if _print_detail_body(
+                if not scan_counts.coverage_complete:
+                    print(
+                        f"[POST viewport={viewport_number} row={observation_number}] "
+                        "status=OBSERVED_UNVERIFIED body=OMITTED "
+                        "reason=SCAN_NOT_COMMITTED"
+                    )
+                elif _print_detail_body(
                     "HOME",
                     f"viewport={viewport_number} row={observation_number}",
                     "OBSERVED_UNVERIFIED",
@@ -493,6 +542,11 @@ async def run_page_workflow(
                 f"observed_rows={scan_counts.observed_rows} cap={min(max_posts, remaining)}"
             )
             if detail:
+                print(
+                    f"[VIEWPORT] verified_body_extracted={scan_counts.body_read} "
+                    f"observed_body_extracted={scan_counts.body_extracted - scan_counts.body_read} "
+                    "scan=NOT_COMMITTED"
+                )
                 _detail_stop("VIEWPORT_COVERAGE_INCOMPLETE")
             return NurtureResult(
                 status="VIEWPORT_COVERAGE_INCOMPLETE",
@@ -550,19 +604,25 @@ async def run_page_workflow(
                     continue
                 if reader.last_scroll_stop_reason == "FEED_END_REACHED":
                     exhaustion_reason = "FEED_END_REACHED"
-                    break
+                    # The current viewport was fully verified and remains in
+                    # view; use its eligible post when there is no next page.
             viewport_selected = viewport_relevant_targets[0]
         if viewport_selected is not None:
             selected = viewport_selected
             break
         if len(seen_this_run) >= max_total_posts:
             exhaustion_reason = "MAX_TOTAL_POSTS"
+            if max_scrolls == 0 or reader.scroll_attempts > 0:
+                select_verified_fallback(viewport_fallback_targets)
             break
         if reader.scroll_attempts >= max_scrolls:
             exhaustion_reason = "MAX_SCROLLS"
+            select_verified_fallback(viewport_fallback_targets)
             break
         if not await advance_feed():
             exhaustion_reason = reader.last_scroll_stop_reason or "FEED_NOT_ADVANCED"
+            if exhaustion_reason in {"FEED_END_REACHED", "FEED_NOT_SCROLLABLE"}:
+                select_verified_fallback(viewport_fallback_targets)
             break
 
     detail_reads = 0
@@ -579,11 +639,21 @@ async def run_page_workflow(
             )
     if selected is not None:
         selected_number = post_numbers[selected.fingerprint]
+        selected_decision = decisions_by_fingerprint.get(
+            selected.fingerprint,
+            "UNKNOWN",
+        )
         if detail:
-            print(
-                f"[SELECT] post={selected_number} decision=RELEVANT "
-                f"reason={'RELEVANT_PENDING' if selected.fingerprint in previously_seen else 'RELEVANT_NEW'}"
-            )
+            if selected_decision == "RELEVANT":
+                print(
+                    f"[SELECT] post={selected_number} decision=RELEVANT "
+                    f"reason={'RELEVANT_PENDING' if selected.fingerprint in previously_seen else 'RELEVANT_NEW'}"
+                )
+            else:
+                print(
+                    f"[SELECT] post={selected_number} "
+                    "decision=VERIFIED_FALLBACK reason=NO_RELEVANT_MATCH"
+                )
         try:
             detail_target = await reader.read_detail(selected)
         except UiReadError:
@@ -608,7 +678,7 @@ async def run_page_workflow(
                 "DETAIL",
                 f"post={selected_number}",
                 "VERIFIED",
-                "RELEVANT",
+                selected_decision,
                 extent,
                 detail_target.body,
             )

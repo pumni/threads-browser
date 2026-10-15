@@ -1219,11 +1219,13 @@ window.addEventListener("wheel", event => {{
             expected_actor: str,
             *,
             readiness_prompt=None,
+            detail_mode: bool = False,
         ) -> None:
             super().__init__(
                 page,
                 expected_actor,
                 readiness_prompt=readiness_prompt,
+                detail_mode=detail_mode,
             )
             readers.append(self)
 
@@ -2446,6 +2448,23 @@ window.addEventListener("wheel", event => {{
     store = CheckpointStore(data_root)
 
     async def exercise(page) -> None:
+        async def serve_verified_detail(route: Route) -> None:
+            post_id = urlsplit(route.request.url).path.rsplit("/", 1)[-1]
+            detail_body = {
+                "one": "A weather update",
+                "two": "A local event",
+                "three": "A music note",
+            }[post_id]
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=f"""<!doctype html><html><body><article>
+<a href="/@candidate/post/{post_id}"><time>now</time></a>
+<a href="/@candidate">@candidate</a><p>{detail_body}</p>
+</article></body></html>""",
+            )
+
+        await page.route("**/@candidate/post/**", serve_verified_detail)
         result = await workflow.run_page_workflow(
             page,
             account,
@@ -2454,12 +2473,13 @@ window.addEventListener("wheel", event => {{
             max_scrolls=2,
             max_total_posts=20,
             terms=("hiring",),
+            detail=True,
         )
-        assert result.status == "VERIFIED_IRRELEVANT"
+        assert result.status == "COMPLETE"
         assert result.home_sampled == 3
         assert result.home_irrelevant == 3
         assert result.home_unknown == 0
-        assert result.detail_reads == 0
+        assert result.detail_reads == 1
         assert result.scroll_attempts == result.scrolls == 2
         assert result.checkpoint_runs == 1
         assert await page.evaluate("sessionStorage.getItem('wheel-count')") == "2"
@@ -2470,8 +2490,12 @@ window.addEventListener("wheel", event => {{
     assert checkpoint.completed_runs == 1
     assert checkpoint.home_sampled == 3
     assert checkpoint.home_irrelevant == 3
+    assert checkpoint.detail_reads == 1
     assert checkpoint.scroll_attempts == checkpoint.scrolls == 2
-    assert "SEARCH_BUDGET_EXHAUSTED reason=MAX_SCROLLS viewports=3" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "decision=VERIFIED_FALLBACK reason=NO_RELEVANT_MATCH" in output
+    assert "[POST post=" in output
+    assert "decision=IRRELEVANT source=DETAIL_BODY" in output
 
 
 def test_total_scan_budget_and_zero_verified_exhaustion_are_truthful(
@@ -2540,6 +2564,7 @@ window.addEventListener("wheel", event => {{
         )
         assert result.status == "VERIFIED_IRRELEVANT"
         assert result.home_sampled == 2
+        assert result.detail_reads == 0
         assert result.scroll_attempts == result.scrolls == 0
         assert result.checkpoint_runs == 1
         assert await page.evaluate("sessionStorage.getItem('wheel-count')") is None
@@ -2551,6 +2576,7 @@ window.addEventListener("wheel", event => {{
     )
     assert valid_checkpoint.completed_runs == 1
     assert valid_checkpoint.home_sampled == 2
+    assert valid_checkpoint.detail_reads == 0
     assert valid_checkpoint.scroll_attempts == 0
     valid_output = capsys.readouterr().out
     assert "READY stage=FEED_INITIAL state=BODY_EXTRACTED" in valid_output
@@ -2816,6 +2842,338 @@ def test_delayed_permalink_hydration_recovers_before_unsupported_stop() -> None:
         assert targets[0].body == body
 
     _run_offline_page(feed_html, exercise)
+
+
+def test_body_fallback_span_rows_ignore_pressable_non_post_and_nurture_verified_post(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    target_url = "https://www.threads.com/@candidate/post/relevant"
+    bodies = (
+        "Synthetic fixture weather report.",
+        "Synthetic fixture hiring a backend engineer.",
+        "Synthetic fixture music note.",
+    )
+    rows = "".join(
+        (
+            '<div class="card" data-pressable-container="true">\n'
+            f'<a href="/@candidate/post/{name}"><time>{index}h</time></a>\n'
+            '<a href="/@candidate">@candidate</a>'
+            f'<span dir="auto">{body}</span>\n'
+            + (
+                '<button aria-label="More">More</button>\n'
+                if name == "relevant"
+                else ""
+            )
+            + "</div>"
+        )
+        for index, (name, body) in enumerate(
+            (("weather", bodies[0]), ("relevant", bodies[1]), ("music", bodies[2])),
+            start=1,
+        )
+    )
+    feed_html = f"""<!doctype html><html><head><style>
+nav {{ height: 40px; }}
+.card {{ box-sizing: border-box; height: 220px; padding: 12px; }}
+#non-post {{ position: fixed; top: 2px; right: 2px; width: 90px; height: 40px; }}
+.spacer {{ height: 500px; }}
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav>{rows}
+<div id="non-post" data-pressable-container="true"><button>Open filters</button></div>
+<div class="spacer"></div></body></html>"""
+    detail_body = f"{bodies[1]} with its expanded synthetic fixture detail."
+    detail_html = f"""<!doctype html><html><body><article>
+<a href="/@candidate/post/relevant"><time>2h</time></a>
+<a href="/@candidate">@candidate</a><span dir="auto">{detail_body}</span>
+</article></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+    detail_requests = 0
+
+    async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            nonlocal detail_requests
+            detail_requests += 1
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=detail_html,
+            )
+
+        await page.route(target_url, serve_detail)
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=5,
+            max_scrolls=1,
+            max_total_posts=10,
+            terms=("hiring", "engineer"),
+            detail=True,
+        )
+        assert result.status == "COMPLETE"
+        assert result.home_sampled == 3
+        assert result.provenance_verified >= result.home_sampled
+        assert result.detail_reads == 1
+        assert result.scroll_attempts == result.scrolls == 1
+
+    _run_offline_page(feed_html, exercise)
+    output = capsys.readouterr().out
+    assert detail_requests == 1
+    assert "region=BODY_FALLBACK" in output
+    assert "root=PRESSABLE has_visible_time=false" in output
+    assert "state=NON_POST reason=NO_POST_ROW_EVIDENCE" in output
+    assert "[SCROLL] attempt=1 status=ADVANCED" in output
+    assert "[SELECT] post=" in output
+    assert f"| {bodies[1]}" in output
+    assert f"| {detail_body}" in output
+    assert "Open filters" not in output
+    assert "@candidate" not in output
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring", "engineer"))),
+    )
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.home_sampled == 3
+    assert checkpoint.detail_reads == 1
+
+
+def test_pending_pressable_waits_for_missing_permalink_and_rescans() -> None:
+    actor = "offline.operator"
+    post_rows = "".join(
+        f"""<div class="card" data-pressable-container="true">
+  <a href="/@candidate/post/verified-{index}"><time>{index}h</time></a>
+  <a href="/@candidate">@candidate</a><span dir="auto">Verified fixture body {index}</span>
+</div>"""
+        for index in range(1, 4)
+    )
+    pending_body = "Hydrating synthetic fixture body."
+    feed_html = f"""<!doctype html><html><head><style>
+nav {{ height: 32px; }} .card {{ height: 150px; }}
+</style></head><body><nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+{post_rows}<div class="card" data-pressable-container="true" id="hydrating">
+<time>now</time><a href="/@candidate">@candidate</a>
+<span dir="auto">{pending_body}</span></div></body></html>"""
+
+    async def exercise(page) -> None:
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        waits: list[tuple[str, int, int | None]] = []
+        original_wait = reader._wait_for_pending_card
+
+        async def record_wait(pending, deadline, *, max_wait_ms=None):
+            for signal in pending.signals:
+                waits.append(
+                    (signal.condition, await signal.locator.count(), max_wait_ms)
+                )
+            return await original_wait(
+                pending,
+                deadline,
+                max_wait_ms=max_wait_ms,
+            )
+
+        reader._wait_for_pending_card = record_wait
+        original_scan = reader._visible_targets
+        scheduled = False
+
+        async def schedule_hydration(*args, **kwargs):
+            nonlocal scheduled
+            scan = await original_scan(*args, **kwargs)
+            if not scheduled:
+                scheduled = True
+                await page.evaluate(
+                    """() => setTimeout(() => {
+                        const card = document.querySelector('#hydrating');
+                        const time = card.querySelector('time');
+                        const permalink = document.createElement('a');
+                        permalink.href = '/@candidate/post/hydrated-fourth';
+                        time.replaceWith(permalink);
+                        permalink.append(time);
+                    }, 80)"""
+                )
+            return scan
+
+        reader._visible_targets = schedule_hydration
+        targets = await reader.scan_viewport(5)
+        assert len(targets) == 4
+        assert reader.last_scan_counts.verified == 4
+        assert reader.last_scan_counts.coverage_complete
+        assert any(
+            condition == "visible"
+            and count == 0
+            and wait_ms == reader_module._CARD_HYDRATION_WAIT_MS
+            for condition, count, wait_ms in waits
+        )
+        assert targets[-1].url.endswith("/post/hydrated-fourth")
+
+    _run_offline_page(feed_html, exercise)
+
+
+def test_unresolved_hydrating_pressable_reports_partial_without_detail_or_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    verified_rows = "".join(
+        f"""<div class="card" data-pressable-container="true">
+  <a href="/@candidate/post/verified-{index}"><time>{index}h</time></a>
+  <a href="/@candidate">@candidate</a>
+  <span dir="auto">{f'Hiring a synthetic fixture engineer {index}.' if index == 1 else f'Weather fixture {index}.'}</span>
+</div>"""
+        for index in range(1, 4)
+    )
+    unverified_body = "Synthetic pending body must stay unprinted."
+    feed_html = f"""<!doctype html><html><head><style>
+nav {{ height: 32px; }} .card {{ height: 150px; }}
+</style></head><body><nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+{verified_rows}<div class="card" data-pressable-container="true" id="hydrating">
+<time>now</time><a href="/@candidate">@candidate</a>
+<span dir="auto">{unverified_body}</span></div></body></html>"""
+    monkeypatch.setattr(reader_module, "_CARD_HYDRATION_WAIT_MS", 30)
+    data_root = tmp_path / "data"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+
+    async def exercise(page) -> None:
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=5,
+            max_scrolls=1,
+            max_total_posts=10,
+            terms=("hiring", "engineer"),
+            detail=True,
+        )
+        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
+        assert result.home_sampled == result.provenance_verified == 3
+        assert result.detail_reads == result.scroll_attempts == 0
+        assert not result.viewport_coverage_complete
+
+    _run_offline_page(feed_html, exercise)
+    output = capsys.readouterr().out
+    assert "state=PENDING reason=POST_PERMALINK_PENDING" in output
+    assert "verified_body_extracted=3" in output
+    assert "scan=NOT_COMMITTED" in output
+    assert "[CHECKPOINT] status=NOT_SAVED reason=VIEWPORT_COVERAGE_INCOMPLETE" in output
+    assert unverified_body not in output
+    assert "@candidate" not in output
+    assert "/post/" not in output
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring", "engineer"))),
+    )
+    assert checkpoint.completed_runs == 0
+    assert checkpoint.home_sampled == checkpoint.detail_reads == 0
+
+
+def test_carried_candidate_status_is_kept_per_row() -> None:
+    actor = "offline.operator"
+    feed_html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<div id="carried"><time>2h</time><span dir="auto">Observed synthetic body.</span></div>
+<div id="verified"><a href="/@candidate/post/verified"><time>1h</time></a>
+<a href="/@candidate">@candidate</a><span dir="auto">Synthetic weather.</span></div>
+</body></html>"""
+
+    async def exercise(page) -> None:
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+
+        async def carried_candidate(root) -> bool:
+            return await root.get_attribute("id") == "carried"
+
+        reader._is_carried_viewport_candidate = carried_candidate
+        targets = await reader.scan_viewport(5)
+        assert len(targets) == 1
+        assert reader.last_viewport_coverage_complete
+        assert reader.last_candidate_diagnostics[0].state == "OBSERVED_UNVERIFIED"
+        assert reader.last_candidate_diagnostics[1].state == "VERIFIED"
+        assert any(
+            observation.body == "Observed synthetic body."
+            for observation in reader.last_display_observations
+        )
+
+    _run_offline_page(feed_html, exercise)
+
+
+def test_relevant_visible_post_is_selected_when_initial_scroll_is_at_feed_end(
+    tmp_path: Path,
+) -> None:
+    actor = "offline.operator"
+    target_url = "https://www.threads.com/@candidate/post/at-end"
+    body = "Hiring a synthetic fixture engineer at the feed end."
+    feed_html = f"""<!doctype html><html><head><style>
+main {{ height: 320px; overflow-y: auto; }}
+.row {{ box-sizing: border-box; height: 500px; padding: 420px 10px 10px; }}
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main id="feed"><div class="row">
+<a href="/@candidate/post/at-end"><time>now</time></a>
+<a href="/@candidate">@candidate</a><span dir="auto">{body}</span>
+<button aria-label="More">More</button>
+</div></main><script>
+const feed = document.querySelector('#feed');
+feed.scrollTop = feed.scrollHeight;
+</script></body></html>"""
+    detail_body = f"{body} with a verified synthetic detail expansion."
+    detail_html = f"""<!doctype html><html><body><article>
+<a href="/@candidate/post/at-end"><time>now</time></a>
+<a href="/@candidate">@candidate</a><span dir="auto">{detail_body}</span>
+</article></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+
+    async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=detail_html,
+            )
+
+        await page.route(target_url, serve_detail)
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=5,
+            max_scrolls=1,
+            terms=("hiring", "engineer"),
+        )
+        assert result.status == "COMPLETE"
+        assert result.home_relevant == 1
+        assert result.detail_reads == 1
+        assert result.scroll_attempts == 0
+
+    _run_offline_page(feed_html, exercise)
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring", "engineer"))),
+    )
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.detail_reads == 1
 
 
 def test_unmarked_rows_keep_display_and_provenance_evidence_separate(
