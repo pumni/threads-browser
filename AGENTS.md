@@ -2,7 +2,7 @@
 
 Threads Browser is an independent local Playwright CLI. Browser runs are foreground, headed, bounded, and read-only; there is no official API client or LLM runtime.
 
-**Hard boundaries:** No automatic engagement, stealth, CAPTCHA bypass, private GraphQL/XHR, credential extraction, profile copying, or official API dependencies. Preserve actor/post provenance, profile isolation, scan limits, and checkpoint privacy. Never inspect operator profiles or expose profile paths, actor handles, post bodies, cookies, or raw post URLs in logs, tests, or PRs.
+**Hard boundaries:** No automatic engagement, stealth, CAPTCHA bypass, private GraphQL/XHR, credential extraction, profile copying, or official API dependencies. Preserve actor/post provenance, profile isolation, scan limits, and checkpoint privacy. Never inspect operator profiles or expose profile paths, actor handles, post bodies, cookies, or raw post URLs in logs, test output, or PRs.
 
 **Find context on demand:** `docs/ARCHITECTURE.md` maps module ownership; `README.md` documents CLI behavior. Read task-relevant code and tests rather than loading the entire repository.
 
