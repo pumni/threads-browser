@@ -1803,6 +1803,23 @@ def test_post_text_preview_escapes_terminal_and_bidi_controls() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("character", "escaped"),
+    [
+        ("\u200b", "\\u200B"),
+        ("\u206a", "\\u206A"),
+        ("\u206f", "\\u206F"),
+    ],
+)
+def test_post_text_preview_escapes_unicode_format_characters(
+    character: str,
+    escaped: str,
+) -> None:
+    assert workflow._terminal_safe_post_text(f"before{character}after") == (
+        f"before{escaped}after"
+    )
+
+
 def test_noncanonical_first_viewport_can_advance_to_verified_relevant_post(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1974,7 +1991,7 @@ def test_noncanonical_link_reasons_are_aggregate_and_privacy_safe(
         "POST_LINK_HAS_QUERY_OR_FRAGMENT:2,POST_ORIGIN_INVALID:1,"
         "POST_PATH_SHAPE_INVALID:1"
     ) in output
-    assert "POST_TEXT status=NONE verified=0" in output
+    assert "POST_TEXT status=NONE verified_posts=0 extracted=0" in output
     assert all(value not in output for value in private_values)
     assert all(body not in output for body in rejected_bodies)
 
@@ -2029,7 +2046,7 @@ def test_verified_multiline_body_stays_unknown_without_private_text_logging(
     assert first_paragraph not in output
     assert quoted_paragraph not in output
     assert "POST_TEXT viewport=1 status=UNKNOWN" in output
-    assert "POST_TEXT status=NONE verified=0" in output
+    assert "POST_TEXT status=NONE verified_posts=1 extracted=0" in output
     checkpoint = store.load(
         account.account_id,
         policy_fingerprint(canonical_terms(("hiring",))),
@@ -2223,4 +2240,4 @@ window.addEventListener("wheel", event => {{
     output = capsys.readouterr().out
     assert "SEARCH_BUDGET_EXHAUSTED reason=MAX_TOTAL_POSTS viewports=2" in output
     assert "SEARCH_BUDGET_EXHAUSTED reason=MAX_SCROLLS viewports=3" in output
-    assert "POST_TEXT status=NONE verified=0" in output
+    assert "POST_TEXT status=NONE verified_posts=0 extracted=0" in output

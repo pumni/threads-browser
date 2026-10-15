@@ -26,9 +26,6 @@ from .storage import (
 )
 
 _MAX_SEEN = 5_000
-_BIDI_CONTROL_CODEPOINTS = frozenset(
-    {0x061C, 0x200E, 0x200F, *range(0x202A, 0x202F), *range(0x2066, 0x206A)}
-)
 
 
 def _terminal_safe_post_text(body: str) -> str:
@@ -40,8 +37,7 @@ def _terminal_safe_post_text(body: str) -> str:
         elif character == "\t":
             safe.append("\\t")
         elif (
-            unicodedata.category(character) in {"Cc", "Cs", "Zl", "Zp"}
-            or codepoint in _BIDI_CONTROL_CODEPOINTS
+            unicodedata.category(character) in {"Cc", "Cf", "Cs", "Zl", "Zp"}
         ):
             safe.append(
                 f"\\u{codepoint:04X}"
@@ -254,7 +250,10 @@ async def run_page_workflow(
         status = "COMPLETE"
     elif len(seen_this_run) == 0:
         if show_post_text and previewed_bodies == 0:
-            print("POST_TEXT status=NONE verified=0")
+            print(
+                "POST_TEXT status=NONE "
+                f"verified_posts={len(seen_this_run)} extracted={previewed_bodies}"
+            )
         return NurtureResult(
             status="NO_VERIFIED_POSTS_IN_BUDGET",
             home_sampled=0,
@@ -307,7 +306,10 @@ async def run_page_workflow(
     )
     checkpoint_store.save(updated)
     if show_post_text and previewed_bodies == 0:
-        print("POST_TEXT status=NONE verified=0")
+        print(
+            "POST_TEXT status=NONE "
+            f"verified_posts={len(seen_this_run)} extracted={previewed_bodies}"
+        )
     ratio = None if not seen_this_run else relevant / len(seen_this_run)
     return NurtureResult(
         status=status,
