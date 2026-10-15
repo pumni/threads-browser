@@ -45,10 +45,15 @@ def _parser() -> argparse.ArgumentParser:
         help="print verified extracted post text to an interactive terminal",
     )
     run.add_argument(
+        "--show-observed-text",
+        action="store_true",
+        help="print identity-unverified observed text to an interactive terminal",
+    )
+    run.add_argument(
         "--max-posts",
         required=True,
         type=int,
-        help="maximum verified posts to classify per viewport (1-20)",
+        help="maximum visible post rows to account for per viewport (1-20)",
     )
     run.add_argument(
         "--max-scrolls",
@@ -89,7 +94,16 @@ def _format_result(result: object) -> str:
         f"scroll_attempts={result.scroll_attempts} "
         f"scrolls={result.scrolls} "
         f"skipped_unverified={result.skipped_unverified} "
-        f"checkpoint_runs={result.checkpoint_runs}"
+        f"checkpoint_runs={result.checkpoint_runs} "
+        f"observed_rows={getattr(result, 'observed_rows', 0)} "
+        f"body_extracted={getattr(result, 'body_extracted', 0)} "
+        f"provenance_verified={getattr(result, 'provenance_verified', 0)} "
+        f"classified={getattr(result, 'classified', 0)} "
+        f"observation_unknown={getattr(result, 'observation_unknown', 0)} "
+        f"unverified_relevant={getattr(result, 'unverified_relevant', 0)} "
+        f"skipped_rows={getattr(result, 'skipped_rows', 0)} "
+        "viewport_coverage_complete="
+        f"{str(getattr(result, 'viewport_coverage_complete', True)).lower()}"
     )
 
 
@@ -130,16 +144,28 @@ def main(argv: Sequence[str] | None = None) -> int:
     if (
         args.command == "nurture"
         and args.nurture_command == "run"
-        and args.show_post_text
+        and (args.show_post_text or args.show_observed_text)
     ):
         if not _has_interactive_terminal():
-            print("ERROR POST_TEXT_TTY_REQUIRED", file=sys.stderr)
+            error = (
+                "OBSERVED_TEXT_TTY_REQUIRED"
+                if args.show_observed_text
+                else "POST_TEXT_TTY_REQUIRED"
+            )
+            print(f"ERROR {error}", file=sys.stderr)
             return 1
-        print(
-            "WARNING POST_TEXT_LOCAL_ONLY terminal scrollback may retain content; "
-            "do not paste preview text into PRs or chats.",
-            file=sys.stderr,
-        )
+        if args.show_post_text:
+            print(
+                "WARNING POST_TEXT_LOCAL_ONLY terminal scrollback may retain content; "
+                "do not paste preview text into PRs or chats.",
+                file=sys.stderr,
+            )
+        if args.show_observed_text:
+            print(
+                "WARNING OBSERVED_TEXT_LOCAL_ONLY identity is unverified and terminal "
+                "scrollback may retain content; do not paste preview text into PRs or chats.",
+                file=sys.stderr,
+            )
     try:
         data_root = resolve_data_root()
         accounts = AccountStore(data_root)
@@ -200,6 +226,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             max_scrolls=args.max_scrolls,
                             max_total_posts=args.max_total_posts,
                             show_post_text=args.show_post_text,
+                            show_observed_text=args.show_observed_text,
                             readiness_prompt=(
                                 _prompt_readiness_extension
                                 if _has_interactive_terminal()
