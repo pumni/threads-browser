@@ -714,35 +714,76 @@ def test_observation_rechecks_readiness_missed_before_wait_registration(
     monkeypatch.setattr(reader_module, "_READINESS_RECHECK_INTERVAL_MS", 100)
 
     async def exercise(page) -> None:
-        class BoundaryReader(ThreadsHomeReader):
-            injected = False
-
-            async def _feed_readiness_signals(self):
-                pending = await super()._feed_readiness_signals()
-                if not self.injected and pending is None:
-                    self.injected = True
-                    await self._page.evaluate(
-                        """() => {
-                            document.querySelector('main').innerHTML = `
-                              <div><a href="/@candidate/post/boundary-ready">Permalink</a>
-                                <a href="/@candidate">@candidate</a>
-                                <p>A weather update</p></div>`;
-                        }"""
-                    )
-                return pending
-
-        reader = BoundaryReader(page, actor)
+        reader = ThreadsHomeReader(page, actor)
         await reader.open_home()
+
+        async def inject_delayed_post() -> None:
+            await asyncio.sleep(0.05)
+            await page.locator("main").evaluate(
+                """main => {
+                    main.innerHTML = `<div>
+                      <a href="/@candidate/post/boundary-ready">Permalink</a>
+                      <a href="/@candidate">@candidate</a>
+                      <p>A weather update</p>
+                    </div>`;
+                }"""
+            )
+
+        injection = asyncio.create_task(inject_delayed_post())
         started = asyncio.get_running_loop().time()
         targets, _ = await reader._wait_for_home_targets(
             1,
             timeout_code="FEED_INITIAL_NOT_READY",
         )
         elapsed = asyncio.get_running_loop().time() - started
+        await injection
         assert elapsed < 3.5
-        assert reader.injected
         assert len(targets) == 1
         assert targets[0].url == url
+
+    _run_offline_page(feed_html, exercise)
+
+
+def test_streamed_row_survives_discovery_deadline_overrun_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actor = "offline.operator"
+    body = "Synthetic weather update remains emitted after slow discovery."
+    feed_html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main><article>
+  <a href="/@candidate/post/slow-discovery"><time>1h</time></a>
+  <a href="/@candidate">@candidate</a><p>{body}</p>
+</article></main></body></html>"""
+
+    async def exercise(page) -> None:
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        monkeypatch.setattr(reader_module, "_READINESS_TIMEOUT_MS", 250)
+        original_discovery = reader._top_level_candidate_roots
+
+        async def slow_discovery(region, viewport):
+            await asyncio.sleep(0.4)
+            return await original_discovery(region, viewport)
+
+        monkeypatch.setattr(reader, "_top_level_candidate_roots", slow_discovery)
+        emitted: list[str] = []
+
+        async def capture(row) -> None:
+            if row.target is not None and row.target.body is not None:
+                emitted.append(row.target.body)
+
+        targets, _ = await reader._wait_for_home_targets(
+            1,
+            timeout_code="FEED_INITIAL_NOT_READY",
+            currently_visible=True,
+            on_row=capture,
+        )
+        assert [target.body for target in targets] == [body]
+        assert emitted == [body]
+        assert reader.last_scan_timings.discover_ms >= 350
 
     _run_offline_page(feed_html, exercise)
 
@@ -2327,7 +2368,7 @@ def test_post_text_preview_escapes_unicode_format_characters(
     )
 
 
-def test_noncanonical_first_viewport_can_advance_to_verified_relevant_post(
+def test_unverified_candidate_allows_wheel_but_blocks_detail_and_checkpoint(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -2371,9 +2412,12 @@ window.addEventListener("wheel", event => {{
     profile.mkdir()
     account = AccountStore(data_root).add("offline", actor, profile)
     store = CheckpointStore(data_root)
+    detail_requests = 0
 
     async def exercise(page) -> None:
         async def serve_detail(route: Route) -> None:
+            nonlocal detail_requests
+            detail_requests += 1
             await route.fulfill(
                 status=200,
                 content_type="text/html",
@@ -2390,17 +2434,19 @@ window.addEventListener("wheel", event => {{
             max_total_posts=10,
             terms=("hiring", "engineer"),
         )
-        assert result.status == "COMPLETE"
+        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
         assert result.home_sampled == result.home_new == 1
         assert result.home_relevant == 1
         assert result.skipped_unverified == 1
-        assert result.scroll_attempts == result.scrolls == 1
-        assert result.detail_reads == 1
-        assert await page.evaluate("sessionStorage.getItem('wheel-count')") == "1"
+        assert result.scroll_attempts == result.scrolls
+        assert result.scroll_attempts > 0
+        assert result.detail_reads == result.checkpoint_runs == 0
+        assert int(await page.evaluate("sessionStorage.getItem('wheel-count')")) == result.scrolls
         assert float(await page.evaluate("sessionStorage.getItem('wheel-delta')")) < 360
 
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
+    assert detail_requests == 0
     assert (
         "SKIPPED stage=FEED_INITIAL reason=CANDIDATE_NONCANONICAL count=1 "
         "cause=POST_PATH_SHAPE_INVALID"
@@ -2410,14 +2456,81 @@ window.addEventListener("wheel", event => {{
     ) in output
     assert "body_read=0 body_unknown=0 classified=1" in output
     assert "unverified_relevant=1" in output
-    assert "STOP stage=FEED_SCROLL" not in output
+    assert "SCROLL attempt=1 observed=1" in output
     assert all(value not in output for value in (*invalid_urls, "Hiring content must be skipped"))
     checkpoint = store.load(
         account.account_id,
         policy_fingerprint(canonical_terms(("hiring", "engineer"))),
     )
-    assert checkpoint.home_sampled == 1
-    assert checkpoint.home_relevant == 1
+    assert checkpoint.completed_runs == 0
+    assert checkpoint.home_sampled == 0
+
+
+def test_timestamp_permalink_accepts_safe_trailing_slash_and_ignores_bad_secondary(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    detail_url = "https://www.threads.com/@candidate/post/trailing-safe/"
+    invalid_secondary = "/@candidate/post/secondary/extra?marker=private"
+    body = "Synthetic hiring note with one safely verified timestamp permalink."
+    feed_html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main><article>
+  <a href="/@candidate/post/trailing-safe/"><time>1h</time></a>
+  <a href="{invalid_secondary}">Secondary</a>
+  <a href="/@candidate">@candidate</a><span>{body}</span>
+</article></main></body></html>"""
+    detail_html = f"""<!doctype html><html><body><article>
+  <a href="/@candidate/post/trailing-safe/"><time>1h</time></a>
+  <a href="/@candidate">@candidate</a><p>{body}</p>
+</article></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+    detail_requests = 0
+
+    async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            nonlocal detail_requests
+            detail_requests += 1
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=detail_html,
+            )
+
+        await page.route(detail_url, serve_detail)
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=3,
+            max_scrolls=0,
+            terms=("hiring",),
+            detail=True,
+        )
+        assert result.status == "COMPLETE"
+        assert result.home_sampled == result.provenance_verified == 1
+        assert result.detail_reads == 1
+        assert result.viewport_coverage_complete
+
+    _run_offline_page(feed_html, exercise)
+    output = capsys.readouterr().out
+    assert detail_requests == 1
+    assert "[URL_STRUCTURE] timestamp_primary=1 secondary_post_links=1" in output
+    assert "valid_canonical_count=1 rejected_count=1" in output
+    assert invalid_secondary not in output
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.detail_reads == 1
 
 
 def test_noncanonical_link_reasons_are_aggregate_and_privacy_safe(
@@ -3324,6 +3437,73 @@ article {{ box-sizing: border-box; height: 680px; padding-top: 430px; }}
         policy_fingerprint(canonical_terms(("hiring",))),
     )
     assert checkpoint.completed_runs == 0
+    assert checkpoint.detail_reads == 0
+
+
+def test_tall_body_requires_overlapping_wheels_before_one_read(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    body_parts = (
+        "Synthetic tall body first segment",
+        "Synthetic tall body second segment",
+        "Synthetic tall body third segment",
+        "Synthetic tall body fourth segment",
+    )
+    paragraphs = "".join(f"<p>{part}</p>" for part in body_parts)
+    feed_html = f"""<!doctype html><html><head><style>
+nav {{ height: 36px; }}
+#scroll-port {{ height: 260px; overflow-y: auto; margin-top: 8px; }}
+article {{ position: relative; height: 980px; }}
+.body {{ position: absolute; top: 35px; left: 12px; right: 12px; }}
+.body p {{ height: 54px; margin: 0 0 150px; }}
+</style></head><body><nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main id="scroll-port"><article>
+<a href="/@candidate/post/tall"><time>now</time></a>
+<a href="/@candidate">@candidate</a><div class="body">{paragraphs}</div>
+</article></main><script>
+window.wheelCount = 0;
+window.addEventListener("wheel", () => window.wheelCount++);
+</script></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+
+    async def exercise(page) -> None:
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=2,
+            max_scrolls=8,
+            max_total_posts=20,
+            terms=("hiring",),
+            detail=True,
+        )
+        assert result.home_sampled == 1
+        assert result.provenance_verified == result.body_extracted == 1
+        assert result.detail_reads == 0
+        assert result.scroll_attempts >= 2
+        assert result.viewport_coverage_complete
+        assert await page.evaluate("window.wheelCount") == result.scroll_attempts
+
+    _run_offline_page(feed_html, exercise)
+    output = capsys.readouterr().out
+    assert "reason=POST_BODY_PARTIALLY_VISIBLE" in output
+    for part in body_parts:
+        assert output.count(part) == 1
+    assert "[DETAIL]" not in output
+    assert "[BACK]" not in output
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert checkpoint.home_sampled == 1
     assert checkpoint.detail_reads == 0
 
 

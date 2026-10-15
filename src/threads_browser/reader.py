@@ -34,6 +34,7 @@ from .feed.urls import (
     _CandidateDiagnosticReason,
     _post_url,
     _post_url_rejection_reason,
+    _post_url_structure,
     _profile_author,
     _same_home_origin,
 )
@@ -169,6 +170,10 @@ class _FeedScanCounts:
     body_candidates: int = 0
     paragraph_candidates: int = 0
     url_parsed: int = 0
+    url_timestamp_links: int = 0
+    url_secondary_links: int = 0
+    url_canonical_links: int = 0
+    url_rejected_links: int = 0
     author_unverified: int = 0
     wrapper_ambiguous: int = 0
     card_not_ready: int = 0
@@ -183,6 +188,7 @@ class _FeedScanCounts:
     coverage_complete: bool = True
     skipped: int = 0
     rejection_reasons: dict[str, int] = field(default_factory=dict)
+    url_structure_counts: dict[str, int] = field(default_factory=dict)
     structural_reasons: dict[str, int] = field(default_factory=dict)
     unsupported_roots: int = 0
     region_status: str = "UNSET"
@@ -203,6 +209,7 @@ class _CandidateStructure:
     offscreen_profile_anchors: int = 0
     offscreen_times: int = 0
     offscreen_body_candidates: int = 0
+    post_url_links: tuple[tuple[str, bool], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -298,6 +305,7 @@ class ThreadsHomeReader:
         self.last_viewport_coverage_complete = True
         self.last_viewport_observed_rows = 0
         self.last_viewport_deferred_only = False
+        self.last_viewport_can_wheel = False
         self.last_deferred_fingerprints: frozenset[str] = frozenset()
         self._last_viewport_limit = 20
         self.last_scroll_delta = 0.0
@@ -305,6 +313,10 @@ class ThreadsHomeReader:
         self._last_viewport_signature: tuple[object, ...] | None = None
         self._last_viewport_candidate_roots: tuple[Locator, ...] = ()
         self._carried_viewport_candidate_roots: tuple[Locator, ...] = ()
+        self._body_visibility_ranges: dict[
+            tuple[str, int], tuple[float, float, float, list[tuple[float, float]]]
+        ] = {}
+        self._cached_home_bodies: dict[str, tuple[str, bool]] = {}
         self._detail_return_anchor: tuple[str, float] | None = None
         self._reported_render_rescans: set[tuple[str, float | None]] = set()
         self._skipped_candidate_identities: set[str] = set()
@@ -915,11 +927,6 @@ class ThreadsHomeReader:
         """Issue one read-only wheel event and require observed scroll displacement."""
         self.last_scroll_stop_reason = None
         self.last_scroll_targets = ()
-        if (
-            not self.last_viewport_coverage_complete
-            and not self.last_viewport_deferred_only
-        ):
-            raise UiReadError("VIEWPORT_COVERAGE_INCOMPLETE")
         await self._wait_for_verified_feed(
             self._readiness_deadline(_READINESS_TIMEOUT_MS),
             timeout_code="HOME_SCROLL_SURFACE_UNVERIFIED",
@@ -1500,6 +1507,24 @@ class ThreadsHomeReader:
                 stage=stage_name,
                 on_row=on_row,
             )
+            useful_observation = bool(
+                scan.targets
+                or self.last_scan_counts.body_extracted
+                or self.last_scan_counts.deferred_offscreen
+                or (
+                    self.last_scan_counts.uncertain_rows
+                    and not self.last_scan_counts.card_not_ready
+                )
+            )
+            if on_row is not None and useful_observation:
+                # Row callbacks are progressive observations. An expensive DOM
+                # discovery must not invalidate rows already emitted against a
+                # verified Home shell by consuming the readiness deadline.
+                await self._wait_for_verified_feed(
+                    self._readiness_deadline(_READINESS_TIMEOUT_MS),
+                    timeout_code=timeout_code,
+                )
+                return scan
             await self._wait_for_verified_feed(
                 deadline,
                 timeout_code=timeout_code,
@@ -1596,6 +1621,26 @@ class ThreadsHomeReader:
                 if diagnostic.state == "DEFERRED_OFFSCREEN"
             )
         )
+        unresolved_states = {
+            diagnostic.state
+            for diagnostic in self.last_candidate_diagnostics
+            if diagnostic.state not in {"VERIFIED", "NON_POST"}
+        }
+        only_observation_gaps = unresolved_states.issubset(
+            {"OBSERVED_UNVERIFIED", "DEFERRED_OFFSCREEN"}
+        ) and bool(unresolved_states)
+        deferred_rows_identified = all(
+            diagnostic.identity_fingerprint is not None
+            for diagnostic in self.last_candidate_diagnostics
+            if diagnostic.state == "DEFERRED_OFFSCREEN"
+        )
+        self.last_viewport_can_wheel = bool(
+            not scan.coverage_complete
+            and only_observation_gaps
+            and deferred_rows_identified
+            and scan.observed_rows <= self._last_viewport_limit
+            and not self.last_scan_counts.unsupported_roots
+        )
         self.last_deferred_fingerprints = frozenset(
             diagnostic.identity_fingerprint
             for diagnostic in self.last_candidate_diagnostics
@@ -1610,7 +1655,11 @@ class ThreadsHomeReader:
                 f"body_extracted={counts.body_extracted} "
                 f"viewport_coverage_complete={str(counts.coverage_complete).lower()}"
             )
-        elif counts.body_extracted and not counts.verified:
+        elif (
+            counts.body_extracted
+            and not counts.verified
+            and scan.coverage_complete
+        ):
             print(
                 f"OBSERVED stage={stage_name} "
                 "state=FEED_VISIBLE_UNVERIFIED verified=0 "
@@ -1991,6 +2040,10 @@ class ThreadsHomeReader:
         counts.body_candidates = 0
         counts.paragraph_candidates = 0
         counts.url_parsed = 0
+        counts.url_timestamp_links = 0
+        counts.url_secondary_links = 0
+        counts.url_canonical_links = 0
+        counts.url_rejected_links = 0
         counts.card_not_ready = 0
         counts.deferred_offscreen = 0
         counts.verified = 0
@@ -2003,6 +2056,7 @@ class ThreadsHomeReader:
         counts.coverage_complete = True
         counts.skipped = 0
         counts.rejection_reasons.clear()
+        counts.url_structure_counts.clear()
         counts.unsupported_roots = 0
         counts.region_status = "UNSET"
         counts.scroll_surface_status = "NOT_CHECKED"
@@ -2010,6 +2064,7 @@ class ThreadsHomeReader:
         self.last_candidate_diagnostics = ()
         self.last_display_observations = ()
         self.last_scan_timings = _FeedScanTimings()
+        self.last_viewport_can_wheel = False
         discover_started = time.perf_counter()
         region = await self._content_region()
         roots, roots_truncated = await self._top_level_candidate_roots(region, viewport)
@@ -2190,6 +2245,7 @@ class ThreadsHomeReader:
                     root,
                     currently_visible=currently_visible,
                     viewport_y=box["y"],
+                    cached_body_fingerprints=prefer_new_fingerprints,
                 )
                 if currently_visible:
                     stabilize_started = time.perf_counter()
@@ -2197,6 +2253,7 @@ class ThreadsHomeReader:
                         root,
                         currently_visible=True,
                         viewport_y=box["y"],
+                        cached_body_fingerprints=prefer_new_fingerprints,
                     )
                     self.last_scan_timings.stabilize_ms += round(
                         (time.perf_counter() - stabilize_started) * 1000
@@ -2354,6 +2411,7 @@ class ThreadsHomeReader:
                                 root,
                                 currently_visible=currently_visible,
                                 viewport_y=box["y"],
+                                cached_body_fingerprints=prefer_new_fingerprints,
                             )
                         except (_CardNotReady, _UnverifiedFeedCandidate, _CardDeferredOffscreen):
                             pass
@@ -2443,23 +2501,22 @@ class ThreadsHomeReader:
             self.last_scan_timings.read_row_ms += round(
                 (time.perf_counter() - read_started) * 1000
             )
-            if currently_visible and not await self._is_in_visible_scrollports(
-                target.permalink
-            ):
-                counts.deferred_offscreen += 1
-                counts.skipped_rows += 1
-                diagnostic.state = "DEFERRED_OFFSCREEN"
-                diagnostic.reason = "POST_PERMALINK_OUTSIDE_VISIBLE_SCROLLPORT"
-                diagnostic.identity_fingerprint = target.fingerprint
-                await emit_row(diagnostic, fingerprint=target.fingerprint)
-                continue
             counts.verified += 1
             diagnostic.state = "VERIFIED"
             diagnostic.reason = "PROVENANCE_VERIFIED"
             diagnostic.has_readable_body = bool(target.body and target.body.strip())
             if target.body and target.body.strip():
-                counts.body_read += 1
+                body_was_cached = bool(
+                    prefer_new_fingerprints is not None
+                    and target.fingerprint in prefer_new_fingerprints
+                    and target.fingerprint in self._cached_home_bodies
+                )
+                counts.body_read += int(not body_was_cached)
                 counts.body_extracted += 1
+                self._cached_home_bodies.setdefault(
+                    target.fingerprint,
+                    (target.body, target.body_truncated),
+                )
             else:
                 counts.body_unknown += 1
                 self._record_structure_reason("POST_BODY_STRUCTURE_UNSUPPORTED")
@@ -2844,66 +2901,132 @@ class ThreadsHomeReader:
             truncated = True
         for index in range(min(time_count, _MAX_STRUCTURE_ELEMENTS)):
             timestamp = times.nth(index)
-            if (
-                await self._is_outside_content_landmark(timestamp)
-                or await self._is_inside_quote(timestamp)
-                or await timestamp.evaluate(
-                    "(node, selector) => Boolean(node.parentElement?.closest(selector))",
-                    _FEED_ROOT_SELECTOR,
+            fallback = await timestamp.evaluate(
+                """(time, args) => {
+                    const visible = element => {
+                        const style = getComputedStyle(element);
+                        const rect = element.getBoundingClientRect();
+                        if (style.display === "none" || style.visibility === "hidden" ||
+                            rect.width <= 0 || rect.height <= 0 ||
+                            rect.right <= 0 || rect.bottom <= 0 ||
+                            rect.left >= args.viewport.width ||
+                            rect.top >= args.viewport.height) return false;
+                        let left = Math.max(0, rect.left);
+                        let top = Math.max(0, rect.top);
+                        let right = Math.min(args.viewport.width, rect.right);
+                        let bottom = Math.min(args.viewport.height, rect.bottom);
+                        for (let parent = element.parentElement; parent;
+                             parent = parent.parentElement) {
+                            const style = getComputedStyle(parent);
+                            const clipX = style.overflowX !== "visible";
+                            const clipY = style.overflowY !== "visible";
+                            if (!clipX && !clipY) continue;
+                            const bounds = parent.getBoundingClientRect();
+                            const clipLeft = bounds.left + parent.clientLeft;
+                            const clipTop = bounds.top + parent.clientTop;
+                            const clipRight = clipLeft + parent.clientWidth;
+                            const clipBottom = clipTop + parent.clientHeight;
+                            if (clipX) {
+                                left = Math.max(left, clipLeft);
+                                right = Math.min(right, clipRight);
+                            }
+                            if (clipY) {
+                                top = Math.max(top, clipTop);
+                                bottom = Math.min(bottom, clipBottom);
+                            }
+                        }
+                        return right > left && bottom > top;
+                    };
+                    const outside = element => element.closest(args.outside) !== null;
+                    const insideQuote = element => element.closest(args.quote) !== null;
+                    const profileLink = element => {
+                        const href = element.getAttribute("href");
+                        if (!href) return false;
+                        try {
+                            const url = new URL(href, location.href);
+                            return url.protocol === "https:" &&
+                                url.hostname.toLowerCase() === "www.threads.com" &&
+                                !url.search && !url.hash &&
+                                /^[/]@[A-Za-z0-9._]{1,30}[/]?$/.test(url.pathname);
+                        } catch { return false; }
+                    };
+                    if (outside(time) || insideQuote(time) || !visible(time) ||
+                        time.parentElement?.closest(args.roots)) return null;
+                    let ancestor = time;
+                    let fallback = null;
+                    for (let depth = 1; depth <= args.maxAncestors; depth++) {
+                        ancestor = ancestor.parentElement;
+                        if (!ancestor) break;
+                        const tag = ancestor.tagName.toLowerCase();
+                        const role = ancestor.getAttribute("role");
+                        if (["body", "html", "main"].includes(tag) ||
+                            role === "main" || role === "feed") break;
+                        if (outside(ancestor) || insideQuote(ancestor)) break;
+                        if (ancestor.matches(args.roots)) break;
+                        if (!visible(ancestor)) continue;
+                        const belongs = element => {
+                            const nearest = element.parentElement?.closest(args.roots);
+                            return ancestor.contains(element) && !nearest;
+                        };
+                        const times = Array.from(ancestor.querySelectorAll("time"))
+                            .filter(element => belongs(element) && !outside(element) &&
+                                !insideQuote(element) && visible(element));
+                        const links = Array.from(ancestor.querySelectorAll("a"))
+                            .filter(element => belongs(element) && !outside(element) &&
+                                visible(element));
+                        const profileCount = links.filter(profileLink).length;
+                        const postCount = links.filter(element =>
+                            (element.getAttribute("href") || "").includes("/post/")
+                        ).length;
+                        const bodies = Array.from(
+                            ancestor.querySelectorAll(args.body)
+                        ).filter(element => {
+                            if (!belongs(element) || !visible(element)) return false;
+                            let current = element;
+                            while (current && current !== ancestor) {
+                                if (current.matches(args.bodyExcluded)) return false;
+                                current = current.parentElement;
+                            }
+                            return current === ancestor &&
+                                !element.querySelector(
+                                    `${args.bodyExcluded}, ${args.roots}`
+                                );
+                        });
+                        const box = ancestor.getBoundingClientRect();
+                        const evidence = profileCount || postCount || bodies.length;
+                        if (times.length === 1 && evidence) {
+                            fallback = {depth, y: box.top};
+                            if (bodies.length) break;
+                        }
+                        if (times.length > 1 || profileCount > 1) {
+                            if (bodies.length || postCount) {
+                                fallback = {depth, y: box.top};
+                            }
+                            break;
+                        }
+                    }
+                    return fallback;
+                }""",
+                {
+                    "viewport": viewport,
+                    "roots": _FEED_ROOT_SELECTOR,
+                    "quote": _QUOTE_SELECTOR,
+                    "body": _BODY_TEXT_SELECTOR,
+                    "bodyExcluded": _BODY_EXCLUSION_SELECTOR,
+                    "outside": (
+                        "nav, aside, footer, form, [contenteditable='true'], "
+                        "[role='navigation'], [role='menu'], [role='complementary'], "
+                        "[role='dialog'], [role='search'], [role='banner'], "
+                        "[role='contentinfo'], [role='textbox']"
+                    ),
+                    "maxAncestors": _MAX_CARD_ANCESTORS,
+                },
+            )
+            if fallback is not None:
+                ancestor = timestamp.locator(
+                    f"xpath=ancestor::*[{fallback['depth']}]"
                 )
-                or not await self._is_in_viewport(timestamp, viewport)
-            ):
-                continue
-            ancestor = timestamp
-            fallback_candidate: tuple[Locator, dict[str, float]] | None = None
-            for _ in range(_MAX_CARD_ANCESTORS):
-                ancestor = ancestor.locator("xpath=..").first
-                if await ancestor.count() == 0:
-                    break
-                tag_and_role = await ancestor.evaluate(
-                    "node => [node.tagName.toLowerCase(), node.getAttribute('role')]"
-                )
-                if tag_and_role[0] in {"body", "html", "main"} or tag_and_role[1] in {
-                    "main",
-                    "feed",
-                }:
-                    break
-                if (
-                    await self._is_outside_content_landmark(ancestor)
-                    or await self._is_inside_quote(ancestor)
-                ):
-                    break
-                if await ancestor.evaluate(
-                    "(node, selector) => node.matches(selector)",
-                    _FEED_ROOT_SELECTOR,
-                ):
-                    # The semantic root was already collected above. A
-                    # permalink-only ancestor inside it is the same row.
-                    fallback_candidate = None
-                    break
-                box = await ancestor.bounding_box()
-                if box is None or not self._intersects_viewport(box, viewport):
-                    continue
-                structure = await self._inspect_candidate_root(ancestor, viewport)
-                if structure.visible_times == 1 and (
-                    structure.profile_anchor_candidates
-                    or structure.visible_post_links
-                    or structure.body_candidates
-                ):
-                    fallback_candidate = (ancestor, box)
-                    if structure.body_candidates:
-                        await add_candidate(ancestor, box)
-                        fallback_candidate = None
-                        break
-                if (
-                    structure.visible_times > 1
-                    or structure.profile_anchor_candidates > 1
-                ):
-                    if structure.body_candidates or structure.visible_post_links:
-                        fallback_candidate = (ancestor, box)
-                    break
-            if fallback_candidate is not None:
-                await add_candidate(fallback_candidate[0], fallback_candidate[1])
+                await add_candidate(ancestor, {"y": fallback["y"]})
 
         candidates.sort(key=lambda item: item[0])
         roots = [root for _, root in candidates]
@@ -3003,6 +3126,15 @@ class ThreadsHomeReader:
                     .slice(0, args.maxStructure);
                 return {
                     hrefs: anchors.map(element => element.getAttribute("href")),
+                    post_links: anchors
+                        .map(element => ({
+                            href: element.getAttribute("href"),
+                            timestamp: Boolean(
+                                element.querySelector("time") &&
+                                visible(element.querySelector("time"))
+                            ),
+                        }))
+                        .filter(item => item.href && item.href.includes("/post/")),
                     offscreen_hrefs: offscreenAnchors.map(element =>
                         element.getAttribute("href")),
                     visible_anchors: anchors.length,
@@ -3036,6 +3168,10 @@ class ThreadsHomeReader:
         offscreen_hrefs = tuple(
             href for href in structure["offscreen_hrefs"] if href is not None
         )
+        post_url_links = tuple(
+            (item["href"], bool(item["timestamp"]))
+            for item in structure["post_links"]
+        )
         return _CandidateStructure(
             visible_anchors=structure["visible_anchors"],
             visible_post_links=sum("/post/" in href for href in href_list),
@@ -3053,6 +3189,7 @@ class ThreadsHomeReader:
             ),
             offscreen_times=structure["offscreen_times"],
             offscreen_body_candidates=structure["offscreen_body_candidates"],
+            post_url_links=post_url_links,
         )
 
     @staticmethod
@@ -3069,6 +3206,29 @@ class ThreadsHomeReader:
     def _record_structure_reason(self, reason: str) -> None:
         counts = self.last_scan_counts
         counts.structural_reasons[reason] = counts.structural_reasons.get(reason, 0) + 1
+
+    def _record_url_structure(self, href: str, timestamp_link: bool) -> None:
+        if "/post/" not in href:
+            return
+        counts = self.last_scan_counts
+        segments, trailing_slash, has_query, has_fragment, is_relative = (
+            _post_url_structure(href)
+        )
+        canonical = _post_url(href) is not None
+        counts.url_timestamp_links += int(timestamp_link)
+        counts.url_secondary_links += int(not timestamp_link)
+        counts.url_canonical_links += int(canonical)
+        counts.url_rejected_links += int(not canonical)
+        shape = (
+            f"segments={segments},trailing_slash={int(trailing_slash)},"
+            f"query={int(has_query)},fragment={int(has_fragment)},"
+            f"relative={int(is_relative)},role="
+            f"{'TIMESTAMP' if timestamp_link else 'SECONDARY'},"
+            f"canonical={int(canonical)}"
+        )
+        counts.url_structure_counts[shape] = (
+            counts.url_structure_counts.get(shape, 0) + 1
+        )
 
     async def _collect_structure_diagnostics(
         self,
@@ -3089,6 +3249,8 @@ class ThreadsHomeReader:
             counts.pressable_roots += int(is_pressable)
             structure = await self._inspect_candidate_root(root, viewport)
             structures[index] = structure
+            for href, timestamp_link in structure.post_url_links:
+                self._record_url_structure(href, timestamp_link)
             counts.visible_anchors += structure.visible_anchors
             counts.visible_post_links += structure.visible_post_links
             counts.url_parsed += structure.canonical_post_links
@@ -3114,77 +3276,96 @@ class ThreadsHomeReader:
             ):
                 self._record_structure_reason("POST_ROOT_UNRESOLVED")
 
-        anchors = region.locator("a")
-        for index in range(min(await anchors.count(), _MAX_STRUCTURE_ELEMENTS)):
-            anchor = anchors.nth(index)
-            if await self._is_outside_content_landmark(anchor):
-                continue
-            if await self._is_nested_feed_content(anchor):
-                continue
-            if await anchor.evaluate(
-                "(node, selector) => Boolean(node.parentElement?.closest(selector))",
-                _FEED_ROOT_SELECTOR,
-            ):
-                continue
-            if not await self._is_in_viewport(anchor, viewport):
-                continue
-            counts.visible_anchors += 1
-            href = await anchor.get_attribute("href")
-            if href is None:
-                continue
-            if "/post/" in href:
-                counts.visible_post_links += 1
-                if _post_url(href) is not None:
-                    counts.url_parsed += 1
-            if self._profile_anchor_candidate(href):
-                counts.profile_anchor_candidates += 1
-
-        times = region.locator("time")
-        for index in range(min(await times.count(), _MAX_STRUCTURE_ELEMENTS)):
-            node = times.nth(index)
-            if await self._is_nested_feed_content(node):
-                continue
-            if await node.evaluate(
-                "(element, selector) => Boolean(element.parentElement?.closest(selector))",
-                _FEED_ROOT_SELECTOR,
-            ):
-                continue
-            if not await self._is_outside_content_landmark(node) and await self._is_in_viewport(
-                node,
-                viewport,
-            ):
-                counts.visible_times += 1
-
-        body_nodes = region.locator(_BODY_TEXT_SELECTOR)
-        paragraphs = region.locator("p")
-        for index in range(min(await paragraphs.count(), _MAX_STRUCTURE_ELEMENTS)):
-            node = paragraphs.nth(index)
-            if await self._is_nested_feed_content(node):
-                continue
-            if await node.evaluate(
-                "(element, selector) => Boolean(element.parentElement?.closest(selector))",
-                _FEED_ROOT_SELECTOR,
-            ):
-                continue
-            if (
-                await self._safe_unscoped_text_candidate(node)
-                and await self._is_in_viewport(node, viewport)
-            ):
-                counts.paragraph_candidates += 1
-        for index in range(min(await body_nodes.count(), _MAX_STRUCTURE_ELEMENTS)):
-            node = body_nodes.nth(index)
-            if await self._is_nested_feed_content(node):
-                continue
-            if await node.evaluate(
-                "(element, selector) => Boolean(element.parentElement?.closest(selector))",
-                _FEED_ROOT_SELECTOR,
-            ):
-                continue
-            if (
-                await self._safe_unscoped_text_candidate(node)
-                and await self._is_in_viewport(node, viewport)
-            ):
-                counts.body_candidates += 1
+        unscoped = await region.evaluate(
+            """(region, args) => {
+                const outsideSelector = args.outside;
+                const visibleInPage = element => {
+                    const style = getComputedStyle(element);
+                    const rect = element.getBoundingClientRect();
+                    return style.display !== "none" && style.visibility !== "hidden" &&
+                        rect.width > 0 && rect.height > 0 && rect.right > 0 &&
+                        rect.bottom > 0 && rect.left < args.viewport.width &&
+                        rect.top < args.viewport.height;
+                };
+                const outside = element => element.closest(outsideSelector) !== null;
+                const nested = element => {
+                    const nearest = element.parentElement?.closest(args.roots);
+                    return Boolean(nearest?.parentElement?.closest(args.roots));
+                };
+                const insideFeedRoot = element =>
+                    element.parentElement?.closest(args.roots) !== null;
+                const safeText = element => {
+                    let current = element;
+                    while (current) {
+                        if (current.matches(args.bodyExcluded)) return false;
+                        current = current.parentElement;
+                    }
+                    return !element.querySelector(args.bodyExcluded);
+                };
+                const anchors = Array.from(region.querySelectorAll("a"))
+                    .slice(0, args.maxElements)
+                    .filter(element => !outside(element) && !nested(element) &&
+                        !insideFeedRoot(element) && visibleInPage(element));
+                const times = Array.from(region.querySelectorAll("time"))
+                    .slice(0, args.maxElements)
+                    .filter(element => !outside(element) && !nested(element) &&
+                        !insideFeedRoot(element) && visibleInPage(element));
+                const paragraphs = Array.from(region.querySelectorAll("p"))
+                    .slice(0, args.maxElements)
+                    .filter(element => !outside(element) && !nested(element) &&
+                        !insideFeedRoot(element) && visibleInPage(element) &&
+                        safeText(element));
+                const bodies = Array.from(region.querySelectorAll(args.body))
+                    .slice(0, args.maxElements)
+                    .filter(element => !outside(element) && !nested(element) &&
+                        !insideFeedRoot(element) && visibleInPage(element) &&
+                        safeText(element));
+                return {
+                    profileHrefs: anchors
+                        .map(element => element.getAttribute("href"))
+                        .filter(Boolean),
+                    postLinks: anchors
+                        .map(element => ({
+                            href: element.getAttribute("href"),
+                            timestamp: Boolean(
+                                element.querySelector("time") &&
+                                visibleInPage(element.querySelector("time"))
+                            ),
+                        }))
+                        .filter(item => item.href && item.href.includes("/post/")),
+                    visibleAnchors: anchors.length,
+                    visibleTimes: times.length,
+                    paragraphCandidates: paragraphs.length,
+                    bodyCandidates: bodies.length,
+                };
+            }""",
+            {
+                "viewport": viewport,
+                "roots": _FEED_ROOT_SELECTOR,
+                "outside": (
+                    "nav, aside, footer, form, [contenteditable='true'], "
+                    "[role='navigation'], [role='menu'], [role='complementary'], "
+                    "[role='dialog'], [role='search'], [role='banner'], "
+                    "[role='contentinfo'], [role='textbox']"
+                ),
+                "body": _BODY_TEXT_SELECTOR,
+                "bodyExcluded": _BODY_EXCLUSION_SELECTOR,
+                "maxElements": _MAX_STRUCTURE_ELEMENTS,
+            },
+        )
+        counts.visible_anchors += unscoped["visibleAnchors"]
+        counts.visible_times += unscoped["visibleTimes"]
+        counts.paragraph_candidates += unscoped["paragraphCandidates"]
+        counts.body_candidates += unscoped["bodyCandidates"]
+        for item in unscoped["postLinks"]:
+            href = item["href"]
+            counts.visible_post_links += 1
+            counts.url_parsed += int(_post_url(href) is not None)
+            self._record_url_structure(href, bool(item["timestamp"]))
+        for href in unscoped["profileHrefs"]:
+            counts.profile_anchor_candidates += int(
+                self._profile_anchor_candidate(href)
+            )
         counts.visible_links = counts.visible_post_links
         return structures
 
@@ -3442,6 +3623,7 @@ class ThreadsHomeReader:
                     root,
                     currently_visible=currently_visible,
                     viewport_y=box["y"],
+                    cached_body_fingerprints=prefer_new_fingerprints,
                 )
             except _CardNotReady as pending:
                 self.last_scan_counts.card_not_ready += 1
@@ -3463,8 +3645,17 @@ class ThreadsHomeReader:
                 continue
             self.last_scan_counts.verified += 1
             if target.body and target.body.strip():
-                self.last_scan_counts.body_read += 1
+                body_was_cached = bool(
+                    prefer_new_fingerprints is not None
+                    and target.fingerprint in prefer_new_fingerprints
+                    and target.fingerprint in self._cached_home_bodies
+                )
+                self.last_scan_counts.body_read += int(not body_was_cached)
                 self.last_scan_counts.body_extracted += 1
+                self._cached_home_bodies.setdefault(
+                    target.fingerprint,
+                    (target.body, target.body_truncated),
+                )
             else:
                 self.last_scan_counts.body_unknown += 1
                 self._record_structure_reason("POST_BODY_STRUCTURE_UNSUPPORTED")
@@ -3600,6 +3791,10 @@ class ThreadsHomeReader:
             raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED")
         deadline = self._readiness_deadline(_DETAIL_TIMEOUT_MS)
         try:
+            def is_target_url(value: str) -> bool:
+                parsed = _post_url(value)
+                return parsed is not None and parsed == (target.url, target.author)
+
             await self._wait_for_verified_feed(
                 deadline,
                 timeout_code="DETAIL_NAVIGATION_UNVERIFIED",
@@ -3618,7 +3813,7 @@ class ThreadsHomeReader:
                 raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED") from None
             self._mark_ui_transition()
             await self._page.wait_for_url(
-                target.url,
+                is_target_url,
                 timeout=self._remaining_readiness_ms(
                     deadline,
                     "DETAIL_NAVIGATION_UNVERIFIED",
@@ -3640,7 +3835,7 @@ class ThreadsHomeReader:
                 )
                 if not _same_home_origin(self._page.url):
                     raise UiReadError("OFF_ORIGIN_REDIRECT")
-                if self._page.url != target.url:
+                if not is_target_url(self._page.url):
                     await self._check_blocker()
                     raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED")
                 await self._check_blocker()
@@ -4078,13 +4273,15 @@ class ThreadsHomeReader:
         currently_visible: bool = False,
         viewport_y: float = 0.0,
         require_body: bool = False,
+        cached_body_fingerprints: set[str] | None = None,
     ) -> PostTarget:
         if not await root.is_visible():
             raise _CardNotReady(root)
         root_handle = await root.element_handle()
         if root_handle is None:
             raise _CardNotReady(root)
-        post_links: list[tuple[str, str, Locator]] = []
+        post_links: list[tuple[str, str, Locator, bool]] = []
+        rejected_post_links: list[tuple[str, bool, str]] = []
         authors: set[str] = set()
         links = root.locator("a")
         link_count = await links.count()
@@ -4104,20 +4301,40 @@ class ThreadsHomeReader:
             href = await link.get_attribute("href")
             if href is None:
                 continue
+            timestamp_link = await link.locator("time").count() > 0
             parsed_post = _post_url(href)
             if parsed_post is not None:
-                post_links.append((parsed_post[0], parsed_post[1], link))
+                post_links.append(
+                    (parsed_post[0], parsed_post[1], link, timestamp_link)
+                )
                 continue
             if "/post/" in href:
-                raise _UnverifiedFeedCandidate(
-                    "POST_PROVENANCE_UNVERIFIED",
-                    "CANDIDATE_NONCANONICAL",
-                    (href,),
-                    diagnostic_reason=_post_url_rejection_reason(href),
+                rejected_post_links.append(
+                    (href, timestamp_link, _post_url_rejection_reason(href))
                 )
+                continue
             author = _profile_author(href)
             if author is not None:
                 authors.add(author)
+        blocking_invalid = next(
+            (item for item in rejected_post_links if item[1]),
+            next(
+                (
+                    item
+                    for item in rejected_post_links
+                    if item[2] == "POST_ORIGIN_INVALID"
+                ),
+                None,
+            ),
+        )
+        if blocking_invalid is not None:
+            href, _, reason = blocking_invalid
+            raise _UnverifiedFeedCandidate(
+                "POST_PROVENANCE_UNVERIFIED",
+                "CANDIDATE_NONCANONICAL",
+                (href,),
+                diagnostic_reason=reason,
+            )
         unique_urls = {item[0] for item in post_links}
         unique_permalink_links = {
             (item[0], item[1]) for item in post_links
@@ -4128,6 +4345,14 @@ class ThreadsHomeReader:
                 "CANDIDATE_AMBIGUOUS",
                 tuple(unique_urls or authors),
                 diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
+            )
+        if not post_links and rejected_post_links:
+            href, _, reason = rejected_post_links[0]
+            raise _UnverifiedFeedCandidate(
+                "POST_PROVENANCE_UNVERIFIED",
+                "CANDIDATE_NONCANONICAL",
+                (href,),
+                diagnostic_reason=reason,
             )
         if not post_links:
             raise _CardNotReady(
@@ -4146,7 +4371,10 @@ class ThreadsHomeReader:
                 tuple(unique_urls),
                 diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
             )
-        url, permalink_author, link = post_links[0]
+        timestamp_links = [item for item in post_links if item[3]]
+        url, permalink_author, link, _ = (
+            timestamp_links[0] if timestamp_links else post_links[0]
+        )
         author = next(iter(authors))
         if author != permalink_author:
             raise _UnverifiedFeedCandidate(
@@ -4157,19 +4385,48 @@ class ThreadsHomeReader:
             )
 
         fingerprint = sha256(f"{url}\n{author}".encode()).hexdigest()
-        if currently_visible and not await self._is_in_visible_scrollports(link):
-            raise _CardDeferredOffscreen(
+        cached_body = (
+            self._cached_home_bodies.get(fingerprint)
+            if not require_body
+            and cached_body_fingerprints is not None
+            and fingerprint in cached_body_fingerprints
+            else None
+        )
+        if cached_body is not None:
+            permalink_visible = (
+                await self._is_in_visible_scrollports(link)
+                if currently_visible
+                else False
+            )
+            return PostTarget(
+                url,
+                author,
+                cached_body[0],
                 fingerprint,
-                "POST_PERMALINK_OUTSIDE_VISIBLE_SCROLLPORT",
+                link,
+                body_available=bool(cached_body[0].strip()),
+                body_truncated=cached_body[1],
+                currently_visible=currently_visible and permalink_visible,
+                viewport_y=viewport_y,
             )
+        permalink_visible = True
         if currently_visible:
-            has_body_candidate, visible_body_candidate = (
-                await self._visible_body_candidate_state(root)
+            has_body_candidate, body_fully_visited = (
+                await self._visible_body_candidate_state(
+                    root,
+                    fingerprint=fingerprint,
+                )
             )
-            if has_body_candidate and not visible_body_candidate:
+            if has_body_candidate and not body_fully_visited:
                 raise _CardDeferredOffscreen(
                     fingerprint,
-                    "POST_BODY_OUTSIDE_VISIBLE_SCROLLPORT",
+                    "POST_BODY_PARTIALLY_VISIBLE",
+                )
+            permalink_visible = await self._is_in_visible_scrollports(link)
+            if not permalink_visible and not has_body_candidate:
+                raise _CardDeferredOffscreen(
+                    fingerprint,
+                    "POST_PERMALINK_OUTSIDE_VISIBLE_SCROLLPORT",
                 )
 
         body, body_available, body_truncated, body_signals = await self._extract_card_body(
@@ -4190,15 +4447,17 @@ class ThreadsHomeReader:
             link,
             body_available=body_available,
             body_truncated=body_truncated,
-            currently_visible=currently_visible,
+            currently_visible=currently_visible and permalink_visible,
             viewport_y=viewport_y,
         )
 
     async def _visible_body_candidate_state(
         self,
         root: Locator,
+        *,
+        fingerprint: str | None = None,
     ) -> tuple[bool, bool]:
-        state = await root.evaluate(
+        candidates = await root.evaluate(
             """(root, args) => {
                 const bodySafe = element => {
                     let current = element;
@@ -4215,13 +4474,13 @@ class ThreadsHomeReader:
                     }
                     return !element.querySelector(`${args.excluded}, ${args.roots}`);
                 };
-                const visible = element => {
+                const cssVisible = element => {
                     const style = getComputedStyle(element);
                     const rect = element.getBoundingClientRect();
                     return style.display !== "none" && style.visibility !== "hidden" &&
                         rect.width > 0 && rect.height > 0;
                 };
-                const inView = element => {
+                const geometry = element => {
                     const rect = element.getBoundingClientRect();
                     let left = Math.max(0, rect.left);
                     let top = Math.max(0, rect.top);
@@ -4247,13 +4506,47 @@ class ThreadsHomeReader:
                             bottom = Math.min(bottom, clipBottom);
                         }
                     }
-                    return right > left && bottom > top;
+                    let scroller = element.parentElement;
+                    while (scroller && scroller !== document.body &&
+                           scroller !== document.documentElement) {
+                        const style = getComputedStyle(scroller);
+                        if (["auto", "scroll", "overlay"].includes(style.overflowY) &&
+                            scroller.scrollHeight > scroller.clientHeight + 1) break;
+                        scroller = scroller.parentElement;
+                    }
+                    const documentScroll = !scroller ||
+                        scroller === document.body ||
+                        scroller === document.documentElement;
+                    const basis = documentScroll ? document.scrollingElement : scroller;
+                    const basisRect = documentScroll ? null : basis.getBoundingClientRect();
+                    const basisTop = documentScroll
+                        ? window.scrollY
+                        : basis.scrollTop - basis.clientTop - basisRect.top;
+                    const contentTop = rect.top + basisTop;
+                    const contentBottom = rect.bottom + basisTop;
+                    const visibleTop = top + basisTop;
+                    const visibleBottom = bottom + basisTop;
+                    return {
+                        top: contentTop,
+                        bottom: contentBottom,
+                        width: rect.width,
+                        visibleTop: Math.max(contentTop, visibleTop),
+                        visibleBottom: Math.min(contentBottom, visibleBottom),
+                        intersects: right > left && bottom > top,
+                    };
                 };
-                const candidates = Array.from(root.querySelectorAll(args.body))
-                    .filter(bodySafe).slice(0, args.maxStructure);
-                const visibleCandidates = candidates.filter(visible);
-                return [visibleCandidates.length > 0,
-                    visibleCandidates.some(inView)];
+                const all = Array.from(root.querySelectorAll(args.body))
+                    .filter(element => bodySafe(element) && cssVisible(element))
+                    .slice(0, args.maxStructure);
+                const bodySet = new Set(all);
+                const outermost = all.filter(element => {
+                    for (let parent = element.parentElement;
+                         parent && parent !== root; parent = parent.parentElement) {
+                        if (bodySet.has(parent)) return false;
+                    }
+                    return true;
+                });
+                return outermost.map(geometry);
             }""",
             {
                 "excluded": _BODY_EXCLUSION_SELECTOR,
@@ -4262,4 +4555,47 @@ class ThreadsHomeReader:
                 "maxStructure": _MAX_STRUCTURE_ELEMENTS,
             },
         )
-        return bool(state[0]), bool(state[1])
+        if not candidates:
+            return False, False
+        fully_visited = True
+        any_visible = False
+        for index, candidate in enumerate(candidates):
+            top = float(candidate["top"])
+            bottom = float(candidate["bottom"])
+            width = float(candidate["width"])
+            visible_top = float(candidate["visibleTop"])
+            visible_bottom = float(candidate["visibleBottom"])
+            intersects = bool(candidate["intersects"])
+            any_visible = any_visible or intersects
+            if fingerprint is None:
+                fully_visited = fully_visited and intersects
+                continue
+            key = (fingerprint, index)
+            previous = self._body_visibility_ranges.get(key)
+            if (
+                previous is None
+                or abs(previous[0] - top) > 2
+                or abs(previous[1] - bottom) > 2
+                or abs(previous[2] - width) > 2
+            ):
+                intervals: list[tuple[float, float]] = []
+            else:
+                intervals = list(previous[3])
+            if visible_bottom > visible_top:
+                intervals.append((visible_top, visible_bottom))
+            merged: list[list[float]] = []
+            for start, end in sorted(intervals):
+                if merged and start <= merged[-1][1] + 1:
+                    merged[-1][1] = max(merged[-1][1], end)
+                else:
+                    merged.append([start, end])
+            self._body_visibility_ranges[key] = (
+                top,
+                bottom,
+                width,
+                [(start, end) for start, end in merged],
+            )
+            fully_visited = fully_visited and bool(
+                merged and merged[0][0] <= top + 2 and merged[0][1] >= bottom - 2
+            )
+        return True, fully_visited if fingerprint is not None else any_visible

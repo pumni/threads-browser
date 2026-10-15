@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sys
 import unicodedata
 from collections.abc import Awaitable, Callable
@@ -155,6 +156,21 @@ def _format_structure_diagnostics(counts: _FeedScanCounts) -> str:
     )
 
 
+def _print_url_structure_diagnostics(counts: _FeedScanCounts) -> None:
+    shapes = ";".join(
+        f"{shape}:count={count}"
+        for shape, count in sorted(counts.url_structure_counts.items())
+    ) or "none"
+    print(
+        "[URL_STRUCTURE] "
+        f"timestamp_primary={counts.url_timestamp_links} "
+        f"secondary_post_links={counts.url_secondary_links} "
+        f"valid_canonical_count={counts.url_canonical_links} "
+        f"rejected_count={counts.url_rejected_links} shapes={shapes}",
+        flush=True,
+    )
+
+
 def _print_candidate_diagnostics(reader: ThreadsHomeReader) -> None:
     for row in reader.last_candidate_diagnostics:
         print(
@@ -254,6 +270,7 @@ async def run_page_workflow(
     observed_rows = 0
     body_extracted = 0
     provenance_verified = 0
+    provenance_verified_fingerprints: set[str] = set()
     classified = 0
     observation_unknown = 0
     unverified_relevant = 0
@@ -261,6 +278,7 @@ async def run_page_workflow(
     viewport_coverage_complete = True
     decisions_by_fingerprint: dict[str, str] = {}
     previous_unverified_rows: list[tuple[str, float]] = []
+    display_dedupe_salt = secrets.token_bytes(16)
     viewport_number = 0
     post_numbers: dict[str, int] = {}
     next_post_number = 0
@@ -336,6 +354,7 @@ async def run_page_workflow(
             nonlocal body_extracted, classified, duplicates, found_relevant
             nonlocal irrelevant, next_post_number, observation_unknown, previewed_bodies
             nonlocal relevant, unknown
+            nonlocal provenance_verified
             nonlocal unverified_relevant, viewport_classified, viewport_irrelevant
             nonlocal viewport_observation_unknown, viewport_relevant
             nonlocal viewport_unverified_relevant, viewport_unknown
@@ -363,6 +382,12 @@ async def run_page_workflow(
                 )
             target = row.target
             if target is not None:
+                if (
+                    diagnostic.state == "VERIFIED"
+                    and target.fingerprint not in provenance_verified_fingerprints
+                ):
+                    provenance_verified_fingerprints.add(target.fingerprint)
+                    provenance_verified += 1
                 if diagnostic.state != "VERIFIED" or not target.body:
                     return
                 unresolved_deferred_fingerprints.discard(target.fingerprint)
@@ -377,11 +402,13 @@ async def run_page_workflow(
                     if (
                         decisions_by_fingerprint.get(target.fingerprint) == "RELEVANT"
                         and target.fingerprint in pending_set
+                        and target.currently_visible
                     ):
                         viewport_relevant_targets.append(target)
                     elif (
                         target.body.strip()
                         and decisions_by_fingerprint.get(target.fingerprint) != "RELEVANT"
+                        and target.currently_visible
                     ):
                         viewport_fallback_targets.append(target)
                     return
@@ -421,16 +448,18 @@ async def run_page_workflow(
                     if is_new and target.fingerprint not in pending_set:
                         pending.append(target.fingerprint)
                         pending_set.add(target.fingerprint)
-                    if target.fingerprint in pending_set:
+                    if target.fingerprint in pending_set and target.currently_visible:
                         viewport_relevant_targets.append(target)
                 elif decision == "IRRELEVANT":
                     irrelevant += 1
                     viewport_irrelevant += 1
-                    viewport_fallback_targets.append(target)
+                    if target.currently_visible:
+                        viewport_fallback_targets.append(target)
                 else:
                     unknown += 1
                     viewport_unknown += 1
-                    viewport_fallback_targets.append(target)
+                    if target.currently_visible:
+                        viewport_fallback_targets.append(target)
                 return
 
             observation = row.display
@@ -448,20 +477,27 @@ async def run_page_workflow(
                 elif show_observed_text:
                     _print_observed_text(viewport_number, "UNKNOWN_UNVERIFIED", observation)
                 return
-            current_unverified_rows.append((observation.body, observation.viewport_y))
+            body_digest = sha256(
+                display_dedupe_salt + observation.body.encode("utf-8")
+            ).hexdigest()
             overlap_duplicate = False
-            if reader.last_scroll_delta > 0:
-                for previous_index, (previous_body, previous_y) in enumerate(
-                    previous_unverified_rows
-                ):
-                    if matched_overlap_rows and previous_index in matched_overlap_rows:
-                        continue
-                    if previous_body != observation.body:
-                        continue
-                    if abs((previous_y - reader.last_scroll_delta) - observation.viewport_y) <= 48:
-                        matched_overlap_rows.add(previous_index)
-                        overlap_duplicate = True
-                        break
+            for previous_index, (previous_digest, previous_y) in enumerate(
+                previous_unverified_rows
+            ):
+                if matched_overlap_rows and previous_index in matched_overlap_rows:
+                    continue
+                if previous_digest != body_digest:
+                    continue
+                if abs((previous_y - reader.last_scroll_delta) - observation.viewport_y) <= 48:
+                    matched_overlap_rows.add(previous_index)
+                    overlap_duplicate = True
+                    break
+            if not overlap_duplicate:
+                overlap_duplicate = any(
+                    current_digest == body_digest
+                    and abs(current_y - observation.viewport_y) <= 2
+                    for current_digest, current_y in current_unverified_rows
+                )
             if overlap_duplicate:
                 if detail:
                     print(
@@ -471,6 +507,7 @@ async def run_page_workflow(
                         flush=True,
                     )
                 return
+            current_unverified_rows.append((body_digest, observation.viewport_y))
             body_extracted += 1
             decision = classify_body(observation.body, normalized_terms)
             classified += 1
@@ -501,6 +538,7 @@ async def run_page_workflow(
         try:
             await reader.scan_viewport(
                 min(max_posts, remaining),
+                scanned_fingerprints=seen_this_run,
                 on_row=observe_row,
             )
         except UiReadError as error:
@@ -531,6 +569,7 @@ async def run_page_workflow(
                     f"wait_reason={reader.last_scan_timings.wait_reason}",
                     flush=True,
                 )
+                _print_url_structure_diagnostics(counts)
                 print(
                     f"[VIEWPORT {viewport_number}] status=PARTIAL code={error.code}",
                     flush=True,
@@ -540,7 +579,6 @@ async def run_page_workflow(
             ):
                 counts.coverage_complete = False
                 observed_rows += counts.observed_rows
-                provenance_verified += counts.verified
                 skipped_rows += counts.skipped_rows
                 if detail:
                     _detail_stop("VIEWPORT_OBSERVATION_INCOMPLETE")
@@ -589,11 +627,11 @@ async def run_page_workflow(
                 f"wait_reason={reader.last_scan_timings.wait_reason}",
                 flush=True,
             )
+            _print_url_structure_diagnostics(scan_counts)
         # Only use this immediate-viewport geometry/body comparison to suppress
         # duplicate overlap work; unverified rows receive no stable identity.
         previous_unverified_rows = current_unverified_rows
         observed_rows += scan_counts.observed_rows
-        provenance_verified += scan_counts.verified
         skipped_rows += scan_counts.skipped_rows
         if not scan_counts.coverage_complete and not reader.last_viewport_deferred_only:
             viewport_coverage_complete = False
@@ -647,34 +685,37 @@ async def run_page_workflow(
                 print(
                     f"[VIEWPORT] verified_body_extracted={scan_counts.body_read} "
                     f"observed_body_extracted={scan_counts.body_extracted - scan_counts.body_read} "
-                    "scan=NOT_COMMITTED"
+                    f"scan={'PARTIAL' if reader.last_viewport_can_wheel else 'NOT_COMMITTED'} "
+                    f"wheel={'ALLOWED' if reader.last_viewport_can_wheel else 'BLOCKED'}"
                 )
-                _detail_stop("VIEWPORT_COVERAGE_INCOMPLETE")
-            return NurtureResult(
-                status="VIEWPORT_COVERAGE_INCOMPLETE",
-                home_sampled=len(seen_this_run),
-                home_new=len(new_fingerprints),
-                home_relevant=relevant,
-                home_irrelevant=irrelevant,
-                home_unknown=unknown,
-                duplicates=duplicates,
-                detail_reads=0,
-                scroll_attempts=reader.scroll_attempts,
-                scrolls=reader.scrolls,
-                checkpoint_runs=checkpoint.completed_runs,
-                home_relevant_ratio=(
-                    None if not seen_this_run else relevant / len(seen_this_run)
-                ),
-                skipped_unverified=reader.skipped_unverified,
-                observed_rows=observed_rows,
-                body_extracted=body_extracted,
-                provenance_verified=provenance_verified,
-                classified=classified,
-                observation_unknown=observation_unknown,
-                unverified_relevant=unverified_relevant,
-                skipped_rows=skipped_rows,
-                viewport_coverage_complete=False,
-            )
+            if not reader.last_viewport_can_wheel:
+                if detail:
+                    _detail_stop("VIEWPORT_COVERAGE_INCOMPLETE")
+                return NurtureResult(
+                    status="VIEWPORT_COVERAGE_INCOMPLETE",
+                    home_sampled=len(seen_this_run),
+                    home_new=len(new_fingerprints),
+                    home_relevant=relevant,
+                    home_irrelevant=irrelevant,
+                    home_unknown=unknown,
+                    duplicates=duplicates,
+                    detail_reads=0,
+                    scroll_attempts=reader.scroll_attempts,
+                    scrolls=reader.scrolls,
+                    checkpoint_runs=checkpoint.completed_runs,
+                    home_relevant_ratio=(
+                        None if not seen_this_run else relevant / len(seen_this_run)
+                    ),
+                    skipped_unverified=reader.skipped_unverified,
+                    observed_rows=observed_rows,
+                    body_extracted=body_extracted,
+                    provenance_verified=provenance_verified,
+                    classified=classified,
+                    observation_unknown=observation_unknown,
+                    unverified_relevant=unverified_relevant,
+                    skipped_rows=skipped_rows,
+                    viewport_coverage_complete=False,
+                )
         if unresolved_deferred_fingerprints or unresolved_deferred_without_identity:
             if reader.scroll_attempts < max_scrolls and await advance_feed():
                 continue
@@ -705,12 +746,30 @@ async def run_page_workflow(
                 skipped_rows=skipped_rows,
                 viewport_coverage_complete=False,
             )
+        if not viewport_coverage_complete:
+            can_continue_observing = bool(
+                scan_counts.coverage_complete
+                or reader.last_viewport_can_wheel
+                or reader.last_viewport_deferred_only
+            )
+            if (
+                can_continue_observing
+                and reader.scroll_attempts < max_scrolls
+                and await advance_feed()
+            ):
+                continue
+            exhaustion_reason = (
+                reader.last_scroll_stop_reason or "VIEWPORT_COVERAGE_INCOMPLETE"
+            )
+            break
         if viewport_relevant_targets:
             viewport_relevant_targets.sort(
                 key=lambda target: target.fingerprint in previously_seen
             )
             if max_scrolls > 0 and reader.scroll_attempts == 0:
-                if await advance_feed(scan_after_scroll=True):
+                if await advance_feed(
+                    scan_after_scroll=len(seen_this_run) >= max_total_posts
+                ):
                     if len(seen_this_run) >= max_total_posts:
                         if (
                             reader.last_viewport_coverage_complete
@@ -758,6 +817,36 @@ async def run_page_workflow(
             break
 
     detail_reads = 0
+    if not viewport_coverage_complete and not (
+        selected is None and unverified_relevant and not found_relevant
+    ):
+        if detail:
+            _detail_stop("VIEWPORT_COVERAGE_INCOMPLETE")
+        else:
+            print("CHECKPOINT status=NOT_SAVED reason=VIEWPORT_COVERAGE_INCOMPLETE")
+        return NurtureResult(
+            status="VIEWPORT_COVERAGE_INCOMPLETE",
+            home_sampled=len(seen_this_run),
+            home_new=len(new_fingerprints),
+            home_relevant=relevant,
+            home_irrelevant=irrelevant,
+            home_unknown=unknown,
+            duplicates=duplicates,
+            detail_reads=0,
+            scroll_attempts=reader.scroll_attempts,
+            scrolls=reader.scrolls,
+            checkpoint_runs=checkpoint.completed_runs,
+            home_relevant_ratio=None if not seen_this_run else relevant / len(seen_this_run),
+            skipped_unverified=reader.skipped_unverified,
+            observed_rows=observed_rows,
+            body_extracted=body_extracted,
+            provenance_verified=provenance_verified,
+            classified=classified,
+            observation_unknown=observation_unknown,
+            unverified_relevant=unverified_relevant,
+            skipped_rows=skipped_rows,
+            viewport_coverage_complete=False,
+        )
     if selected is None and not found_relevant:
         if exhaustion_reason in {"FEED_END_REACHED", "FEED_NOT_SCROLLABLE"}:
             print(
