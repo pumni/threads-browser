@@ -38,6 +38,7 @@ from .browser_ui.feed_rows import (
     _BODY_EXCLUSION_SELECTOR,
     _BODY_TEXT_SELECTOR,
     _FEED_ROOT_SELECTOR,
+    _MAX_CARD_ANCESTORS,
     _MAX_CARD_LINKS,
     _MAX_STRUCTURE_ELEMENTS,
     _QUOTE_SELECTOR,
@@ -46,6 +47,9 @@ from .browser_ui.feed_rows import (
     _CandidateStructure,
     _FeedScanCounts,
     _FeedScanTimings,
+)
+from .browser_ui.feed_rows import (
+    UnverifiedFeedCandidate as _UnverifiedFeedCandidate,
 )
 from .browser_ui.geometry import with_scrollport_geometry as _with_scrollport_geometry
 from .browser_ui.loading import (
@@ -78,7 +82,6 @@ from .feed.urls import (
     _USERNAME,
     HOME_URL,
     THREADS_ORIGIN,
-    _CandidateDiagnosticReason,
     _post_url,
     _post_url_hint,
     _post_url_rejection_reason,
@@ -114,7 +117,6 @@ _RENDER_STABLE_OBSERVATIONS = 2
 _SCROLL_ADVANCE_RATIO = 0.4
 _SCROLL_ADVANCE_MIN_PX = 64
 _SCROLL_ADVANCE_MAX_PX = 360
-_MAX_CARD_ANCESTORS = 8
 _MAX_PERMALINK_CANDIDATES = 40
 _MAX_FEED_ROOTS_PER_TYPE = 40
 _MAX_VISIBLE_ROW_CANDIDATES = 40
@@ -122,27 +124,6 @@ _UNSUPPORTED_CONFIRMATION_SCANS = 3
 _PROFILE_NAME = re.compile(r"^(?:profile|your profile|account)$", re.IGNORECASE)
 _MORE_NAME = re.compile(r"^(?:more|see more|read more)$", re.IGNORECASE)
 _ReadinessResult = TypeVar("_ReadinessResult")
-
-
-class _UnverifiedFeedCandidate(UiReadError):
-    def __init__(
-        self,
-        code: str,
-        reason: Literal[
-            "CANDIDATE_AMBIGUOUS",
-            "CANDIDATE_NONCANONICAL",
-            "CANDIDATE_AUTHOR_CONFLICT",
-        ],
-        identities: tuple[str, ...],
-        *,
-        diagnostic_reason: _CandidateDiagnosticReason | None = None,
-    ) -> None:
-        self.reason = reason
-        self.diagnostic_reason = diagnostic_reason
-        self.identities = frozenset(
-            sha256(identity.encode("utf-8")).hexdigest() for identity in identities if identity
-        )
-        super().__init__(code)
 
 
 @dataclass(frozen=True, slots=True)
@@ -3567,164 +3548,15 @@ class ThreadsHomeReader:
         expected_url: str,
         expected_author: str,
     ) -> tuple[Locator, dict[str, float]]:
-        if await self._is_nested_feed_content(permalink):
-            raise _UnverifiedFeedCandidate(
-                "POST_PROVENANCE_UNVERIFIED",
-                "CANDIDATE_AMBIGUOUS",
-                (expected_url,),
-                diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
-            )
-        if await self._is_inside_quote(permalink):
-            raise _UnverifiedFeedCandidate(
-                "POST_PROVENANCE_UNVERIFIED",
-                "CANDIDATE_AMBIGUOUS",
-                (expected_url,),
-                diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
-            )
-        candidate_root = permalink.locator(
-            "xpath=ancestor::*[self::article or @role='article' "
-            "or @data-pressable-container='true'][1]"
-        )
-        if await candidate_root.count() and not await self._is_nested_feed_root(candidate_root):
-            box = await candidate_root.bounding_box()
-            if box is not None:
-                return candidate_root, box
-        ancestor = permalink
-        smallest_without_body: tuple[Locator, dict[str, float]] | None = None
-        pending_author: Locator | None = None
-        for _ in range(_MAX_CARD_ANCESTORS):
-            ancestor = ancestor.locator("xpath=..")
-            if await ancestor.count() == 0:
-                break
-            if (
-                await ancestor.get_attribute("role") in {"feed", "main"}
-                or await ancestor.locator("xpath=self::main").count() > 0
-            ):
-                break
-            if not await ancestor.is_visible():
-                continue
-
-            links = ancestor.locator("a")
-            link_count = await links.count()
-            if link_count > _MAX_CARD_LINKS:
-                raise _UnverifiedFeedCandidate(
-                    "POST_PROVENANCE_UNVERIFIED",
-                    "CANDIDATE_AMBIGUOUS",
-                    (expected_url,),
-                    diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
-                )
-            post_authors: dict[str, str] = {}
-            authors: set[str] = set()
-            rejected_post_links: list[tuple[str, bool, str]] = []
-            for index in range(link_count):
-                link = links.nth(index)
-                if (
-                    await self._is_outside_content_landmark(link)
-                    or await self._is_nested_feed_content(link)
-                    or not await link.is_visible()
-                ):
-                    continue
-                href = await link.get_attribute("href")
-                if href is None:
-                    continue
-                parsed_post = _post_url(href)
-                if parsed_post is not None:
-                    post_authors[parsed_post[0]] = parsed_post[1]
-                    continue
-                if _post_url_hint(href):
-                    rejected_post_links.append(
-                        (
-                            href,
-                            await link.locator("time").count() > 0,
-                            _post_url_rejection_reason(href),
-                        )
-                    )
-                author = _profile_author(href)
-                if author is not None:
-                    authors.add(author)
-            if len(post_authors) > 1:
-                raise _UnverifiedFeedCandidate(
-                    "POST_PROVENANCE_UNVERIFIED",
-                    "CANDIDATE_AMBIGUOUS",
-                    tuple(post_authors),
-                    diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
-                )
-            if expected_url not in post_authors:
-                continue
-            blocking_invalid = next(
-                (
-                    item
-                    for item in rejected_post_links
-                    if _rejected_post_link_blocks_candidate(
-                        timestamp_link=item[1], reason=item[2]
-                    )
-                ),
-                None,
-            )
-            if blocking_invalid is not None:
-                href, _, reason = blocking_invalid
-                raise _UnverifiedFeedCandidate(
-                    "POST_PROVENANCE_UNVERIFIED",
-                    "CANDIDATE_NONCANONICAL",
-                    (expected_url, href),
-                    diagnostic_reason=reason,
-                )
-            if post_authors[expected_url] != expected_author:
-                raise _UnverifiedFeedCandidate(
-                    "POST_AUTHOR_UNVERIFIED",
-                    "CANDIDATE_AUTHOR_CONFLICT",
-                    (expected_url,),
-                    diagnostic_reason="CANDIDATE_AUTHOR_MISMATCH",
-                )
-            if len(authors) > 1:
-                raise _UnverifiedFeedCandidate(
-                    "POST_PROVENANCE_UNVERIFIED",
-                    "CANDIDATE_AMBIGUOUS",
-                    (expected_url,),
-                    diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
-                )
-            if authors and expected_author not in authors:
-                raise _UnverifiedFeedCandidate(
-                    "POST_AUTHOR_UNVERIFIED",
-                    "CANDIDATE_AUTHOR_CONFLICT",
-                    (expected_url,),
-                    diagnostic_reason="CANDIDATE_AUTHOR_MISMATCH",
-                )
-
-            box = await ancestor.bounding_box()
-            if box is None:
-                continue
-            if not authors:
-                if pending_author is None:
-                    pending_author = self._expected_profile_link_signal(
-                        ancestor,
-                        expected_author,
-                    )
-                continue
-            candidate = (ancestor, box)
-            if smallest_without_body is None:
-                smallest_without_body = candidate
-            paragraphs = ancestor.get_by_role("paragraph")
-            paragraph_count = await paragraphs.count()
-            if paragraph_count > 1:
-                return candidate
-            if paragraph_count == 1 and await paragraphs.first.is_visible():
-                return candidate
-
-        if pending_author is not None:
-            raise _CardNotReady(pending_author)
-        if smallest_without_body is not None:
-            return smallest_without_body
-        raise _UnverifiedFeedCandidate(
-            "POST_PROVENANCE_UNVERIFIED",
-            "CANDIDATE_AMBIGUOUS",
-            (expected_url,),
-            diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
+        return await self._feed_rows._resolve_permalink_card(
+            permalink,
+            expected_url,
+            expected_author,
         )
 
     @staticmethod
     def _expected_profile_link_signal(root: Locator, author: str) -> Locator:
-        return root.locator(f'a[href$="/@{author}" i], a[href$="/@{author}/" i]').first
+        return FeedRowScanner._expected_profile_link_signal(root, author)
 
     async def _recover_ambiguous_visible_card(
         self,
