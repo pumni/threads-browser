@@ -11,7 +11,9 @@ from playwright.async_api import BrowserContext, Page, async_playwright
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from .reader import HOME_URL, ThreadsHomeReader, UiReadError
+from .errors import UiReadError
+from .feed.urls import HOME_URL
+from .reader import ThreadsHomeReader
 from .storage import (
     AccountStore,
     BrowserAccount,
