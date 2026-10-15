@@ -26,7 +26,7 @@ src/threads_browser/
 - `storage` owns persisted account references, terms, locks and versioned fingerprints; never store raw post bodies, cookies or raw URLs.
 - `login` and `account_service` own interactive session establishment; `cli` is only an adapter around these application entry points.
 
-Existing `threads_browser.reader` imports are kept as aliases for callers/tests while new feature code can import pure helpers from `threads_browser.feed`. The reader stays one class for now: splitting its tightly coupled DOM state across mixins before private Threads UAT would increase risk and obscure failures.
+Existing `threads_browser.reader` imports remain compatibility aliases; new pure helpers belong in `feed`. The reader currently holds tightly coupled DOM state in one class. Refactor it when justified by a task, with regression coverage for behavior.
 
 ## Evolution
 
