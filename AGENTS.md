@@ -1,5 +1,9 @@
 # Repository guidance
 
-This repository is the independent Browser lane. Keep the official API out of its runtime and dependencies. Browser runs are foreground, headed, bounded, and read-only. Never add automatic engagement, stealth, CAPTCHA bypass, private GraphQL/XHR access, credential extraction, or profile copying.
+Threads Browser is an independent local Playwright CLI. Browser runs are foreground, headed, bounded, and read-only; there is no official API client or LLM runtime.
 
-Use fresh temporary synthetic roots and local-only Chromium fixtures. Do not inspect operator profiles. Keep profile paths, actor handles, post bodies, cookies, and post URLs out of logs and test output. Report UI assumptions as UNVERIFIED_LIVE_UI until the owner completes private live UAT.
+**Hard boundaries:** No automatic engagement, stealth, CAPTCHA bypass, private GraphQL/XHR, credential extraction, profile copying, or official API dependencies. Preserve actor/post provenance, profile isolation, scan limits, and checkpoint privacy. Never inspect operator profiles or expose profile paths, actor handles, post bodies, cookies, or raw post URLs in logs, tests, or PRs.
+
+**Find context on demand:** `docs/ARCHITECTURE.md` maps module ownership; `README.md` documents CLI behavior. Read task-relevant code and tests rather than loading the entire repository.
+
+**Verify proportionally:** Use fresh synthetic data roots and local-only Chromium fixtures. Run focused tests first; for substantive code changes, run `uv run ruff check .` and `uv run pytest -q --maxfail=1` when feasible, and report any checks not run. Offline tests do not verify live Threads UI; report assumptions as `UNVERIFIED_LIVE_UI` until owner-authorized private UAT.
