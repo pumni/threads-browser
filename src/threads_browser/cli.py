@@ -134,6 +134,7 @@ def _format_result(result: object) -> str:
     ratio = "n/a" if ratio_value is None else f"{ratio_value:.2f}"
     return (
         f"NURTURE status={result.status} "
+        f"stop_reason={getattr(result, 'stop_reason', 'UNKNOWN')} "
         "source=HOME_FOR_YOU "
         f"ui={result.ui_status} "
         f"home_sampled={result.home_sampled} "

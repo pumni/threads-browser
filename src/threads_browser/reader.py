@@ -66,6 +66,7 @@ _READINESS_TIMEOUT_MS = 8_000
 _AUTOMATIC_READINESS_WINDOWS = 2
 _READINESS_RECHECK_INTERVAL_MS = 200
 _CARD_HYDRATION_WAIT_MS = 800
+_BODY_STABILITY_INTERVAL_MS = 180
 _RENDER_MIN_DWELL_MS = 600
 _RENDER_SETTLE_INTERVAL_MS = 300
 _RENDER_STABLE_OBSERVATIONS = 2
@@ -92,10 +93,99 @@ _BODY_EXCLUSION_SELECTOR = (
     '[role="complementary"], [role="dialog"], [role="search"], '
     '[role="textbox"], [contenteditable="true"], blockquote, [role="quote"]'
 )
+_SCROLLPORT_GEOMETRY_JS = """const clipFor = element => {
+    const clip = {
+        left: 0, top: 0,
+        right: window.innerWidth, bottom: window.innerHeight,
+    };
+    for (let parent = element.parentElement; parent;
+         parent = parent.parentElement) {
+        const style = getComputedStyle(parent);
+        const clipX = style.overflowX !== "visible";
+        const clipY = style.overflowY !== "visible";
+        if (!clipX && !clipY) continue;
+        const bounds = parent.getBoundingClientRect();
+        const left = bounds.left + parent.clientLeft;
+        const top = bounds.top + parent.clientTop;
+        if (clipX) {
+            clip.left = Math.max(clip.left, left);
+            clip.right = Math.min(clip.right, left + parent.clientWidth);
+        }
+        if (clipY) {
+            clip.top = Math.max(clip.top, top);
+            clip.bottom = Math.min(clip.bottom, top + parent.clientHeight);
+        }
+    }
+    return clip;
+};
+const geometryFor = element => {
+    const rect = element.getBoundingClientRect();
+    const clip = clipFor(element);
+    const visible = {
+        left: Math.max(rect.left, clip.left),
+        top: Math.max(rect.top, clip.top),
+        right: Math.min(rect.right, clip.right),
+        bottom: Math.min(rect.bottom, clip.bottom),
+    };
+    return {
+        rect, clip, visible,
+        intersects: visible.right > visible.left && visible.bottom > visible.top,
+    };
+};
+const isScrollable = element => {
+    if (!element || element === document.body ||
+        element === document.documentElement) return false;
+    const style = getComputedStyle(element);
+    return element.scrollHeight > element.clientHeight + 1 &&
+        ["auto", "scroll", "overlay"].includes(style.overflowY);
+};
+const keyFor = element => {
+    if (!element || element === document.scrollingElement) return "DOCUMENT";
+    const path = [];
+    for (let current = element; current && current !== document.body;
+         current = current.parentElement) {
+        let siblingIndex = 0;
+        for (const sibling of current.parentElement?.children || []) {
+            if (sibling.tagName !== current.tagName) continue;
+            if (sibling === current) break;
+            siblingIndex++;
+        }
+        path.push(`${current.tagName.toLowerCase()}:${siblingIndex}`);
+    }
+    return path.reverse().join("/");
+};
+const scrollMetrics = element => {
+    let scroller = element;
+    while (scroller && !isScrollable(scroller)) scroller = scroller.parentElement;
+    if (!scroller || scroller === document.body ||
+        scroller === document.documentElement) {
+        return {
+            element: document.scrollingElement,
+            offset: window.scrollY,
+            top: window.scrollY,
+            bottom: window.scrollY + window.innerHeight,
+            scrollHeight: document.scrollingElement?.scrollHeight ?? 0,
+            key: "DOCUMENT",
+        };
+    }
+    const bounds = scroller.getBoundingClientRect();
+    return {
+        element: scroller,
+        offset: scroller.scrollTop - bounds.top - scroller.clientTop,
+        top: scroller.scrollTop,
+        bottom: scroller.scrollTop + scroller.clientHeight,
+        scrollHeight: scroller.scrollHeight,
+        key: keyFor(scroller),
+    };
+};"""
 _FOR_YOU_NAME = re.compile(r"^for you$", re.IGNORECASE)
 _PROFILE_NAME = re.compile(r"^(?:profile|your profile|account)$", re.IGNORECASE)
 _MORE_NAME = re.compile(r"^(?:more|see more|read more)$", re.IGNORECASE)
 _ReadinessResult = TypeVar("_ReadinessResult")
+
+
+def _with_scrollport_geometry(source: str) -> str:
+    return source.replace("/*SCROLLPORT_GEOMETRY*/", _SCROLLPORT_GEOMETRY_JS)
 
 
 def _canonicalize_body(value: str) -> str:
@@ -339,6 +429,16 @@ class _CandidateDiagnostic:
     observation_id: str | None = field(default=None, repr=False)
     read_evidence: BodyReadEvidence | None = field(default=None, repr=False)
     same_scroller_scroll_top_delta: float | None = field(default=None, repr=False)
+    row_movement_px: float | None = field(default=None, repr=False)
+    text_distance_delta_px: float | None = field(default=None, repr=False)
+    row_top_before_px: float | None = field(default=None, repr=False)
+    row_bottom_before_px: float | None = field(default=None, repr=False)
+    clip_top_before_px: float | None = field(default=None, repr=False)
+    clip_bottom_before_px: float | None = field(default=None, repr=False)
+    text_top_before_px: float | None = field(default=None, repr=False)
+    text_bottom_before_px: float | None = field(default=None, repr=False)
+    wheel_surface_matches: bool | None = field(default=None, repr=False)
+    scroll_reason_flags: tuple[str, ...] = field(default=(), repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -414,6 +514,8 @@ class ThreadsHomeReader:
         self.last_scroll_end_distance: float | None = None
         self.last_scroll_near_end = False
         self.last_scroll_stop_reason: str | None = None
+        self.last_scroll_surface_key: str | None = None
+        self.last_scroll_geometry: dict[str, object] | None = None
         self._last_viewport_signature: tuple[object, ...] | None = None
         self._last_viewport_candidate_roots: tuple[Locator, ...] = ()
         self._last_viewport_candidate_observation_ids: tuple[str, ...] = ()
@@ -1046,13 +1148,10 @@ class ThreadsHomeReader:
         witness: JSHandle | None = None
         try:
             try:
-                point, wheel_delta, viewport_height = (
+                point, wheel_delta, viewport_height, hit_test_tag = (
                     await self._safe_feed_scroll_point(surface)
                 )
-                scroll_state = await surface.evaluate(
-                    "element => ({top: element.scrollTop, max: "
-                    "Math.max(0, element.scrollHeight - element.clientHeight)})"
-                )
+                scroll_state = await self._scroll_surface_snapshot(surface)
                 initial_position = float(scroll_state["top"])
                 if float(scroll_state["max"]) - initial_position <= 1:
                     self.last_scroll_stop_reason = "FEED_END_REACHED"
@@ -1145,6 +1244,29 @@ class ThreadsHomeReader:
                 raise
             self.scrolls += 1
             self.last_scroll_delta = observed_delta
+            final_surface = await self._scroll_surface_snapshot(surface)
+            self.last_scroll_surface_key = str(final_surface["key"])
+            self.last_scroll_geometry = {
+                "surface_key": self.last_scroll_surface_key,
+                "surface_tag": str(final_surface["tag"]),
+                "overflow_y": str(final_surface["overflowY"]),
+                "hit_test_tag": hit_test_tag,
+                "scroll_top_before": float(scroll_state["top"]),
+                "scroll_top_after": float(final_surface["top"]),
+                "scroll_height_before": float(scroll_state["scrollHeight"]),
+                "scroll_height_after": float(final_surface["scrollHeight"]),
+                "clip_top_before": float(scroll_state["clipTop"]),
+                "clip_top_after": float(final_surface["clipTop"]),
+                "clip_bottom_before": float(scroll_state["clipBottom"]),
+                "clip_bottom_after": float(final_surface["clipBottom"]),
+                "scroll_top_delta": (
+                    float(final_surface["top"]) - float(scroll_state["top"])
+                ),
+                "scroll_height_delta": (
+                    float(final_surface["scrollHeight"])
+                    - float(scroll_state["scrollHeight"])
+                ),
+            }
             final_scroll_state = await surface.evaluate(
                 "element => Math.max(0, element.scrollHeight - element.clientHeight - element.scrollTop)"
             )
@@ -1176,6 +1298,37 @@ class ThreadsHomeReader:
                     pass
                 await witness.dispose()
             await surface.dispose()
+
+    async def _scroll_surface_snapshot(
+        self,
+        surface: JSHandle,
+    ) -> dict[str, object]:
+        return await surface.evaluate(
+            _with_scrollport_geometry("""element => {
+                /*SCROLLPORT_GEOMETRY*/
+                const root = document.scrollingElement;
+                const rect = element.getBoundingClientRect();
+                const clip = clipFor(element);
+                const documentSurface = element === root;
+                const contentTop = documentSurface
+                    ? 0 : rect.top + element.clientTop;
+                const contentBottom = documentSurface
+                    ? window.innerHeight : contentTop + element.clientHeight;
+                return {
+                    key: keyFor(element),
+                    tag: documentSurface ? "DOCUMENT" : element.tagName,
+                    overflowY: documentSurface
+                        ? "document" : getComputedStyle(element).overflowY,
+                    top: documentSurface ? window.scrollY : element.scrollTop,
+                    max: documentSurface
+                        ? Math.max(0, element.scrollHeight - window.innerHeight)
+                        : Math.max(0, element.scrollHeight - element.clientHeight),
+                    scrollHeight: element.scrollHeight,
+                    clipTop: Math.max(clip.top, contentTop),
+                    clipBottom: Math.min(clip.bottom, contentBottom),
+                };
+            }""")
+        )
 
     async def sample_and_scroll(self, max_posts: int) -> HomeSample:
         """Compatibility helper for callers that need a before/after sample."""
@@ -1917,15 +2070,27 @@ class ThreadsHomeReader:
     async def _safe_feed_scroll_point(
         self,
         surface: JSHandle,
-    ) -> tuple[tuple[float, float], int, float]:
+    ) -> tuple[tuple[float, float], int, float, str]:
         viewport = self._page.viewport_size
         if viewport is None:
             raise UiReadError("FEED_VIEWPORT_UNVERIFIED")
         box = await surface.evaluate(
-            """element => {
+            _with_scrollport_geometry("""element => {
+                /*SCROLLPORT_GEOMETRY*/
                 const rect = element.getBoundingClientRect();
-                return {x: rect.x, y: rect.y, width: rect.width, height: rect.height};
-            }"""
+                const clip = clipFor(element);
+                const left = Math.max(clip.left, rect.left + element.clientLeft);
+                const top = Math.max(clip.top, rect.top + element.clientTop);
+                const right = Math.min(
+                    clip.right, rect.left + element.clientLeft + element.clientWidth
+                );
+                const bottom = Math.min(
+                    clip.bottom, rect.top + element.clientTop + element.clientHeight
+                );
+                return {
+                    x: left, y: top, width: right - left, height: bottom - top,
+                };
+            }""")
         )
         if not box or box["width"] <= 0 or box["height"] <= 0:
             raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
@@ -1964,12 +2129,30 @@ class ThreadsHomeReader:
                             "a, button, input, select, textarea, [role='button'], " +
                             "[role='link'], [role='tab'], [role='menuitem']"
                         );
-                        return !excluded && !control;
+                        const nestedScroller = (() => {
+                            for (let current = target; current && current !== surface;
+                                 current = current.parentElement) {
+                                const style = getComputedStyle(current);
+                                if (current.scrollHeight > current.clientHeight + 1 &&
+                                    ["auto", "scroll", "overlay"].includes(
+                                        style.overflowY
+                                    )) return true;
+                            }
+                            return false;
+                        })();
+                        return !excluded && !control && !nestedScroller;
                     }""",
                     {"x": x, "y": y},
                 )
                 if safe:
-                    return (x, y), advance, visible_height
+                    hit_type = await surface.evaluate(
+                        """(surface, point) => {
+                            const target = document.elementFromPoint(point.x, point.y);
+                            return target?.tagName ?? "UNKNOWN";
+                        }""",
+                        {"x": x, "y": y},
+                    )
+                    return (x, y), advance, visible_height, str(hit_type)
         raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
 
     async def _scroll_surface(self) -> JSHandle | None:
@@ -1994,7 +2177,8 @@ class ThreadsHomeReader:
                     raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
                 row_handles.append(handle)
             surface_state = await self._page.evaluate_handle(
-                """([region, rows, maxCandidates]) => {
+                _with_scrollport_geometry("""([region, rows, maxCandidates]) => {
+                /*SCROLLPORT_GEOMETRY*/
                 const root = document.scrollingElement;
                 const visibleItem = item => {
                     if (!item.isConnected || (item !== region && !region.contains(item)) ||
@@ -2007,23 +2191,23 @@ class ThreadsHomeReader:
                     const style = window.getComputedStyle(item);
                     const rect = item.getBoundingClientRect();
                     return style.display !== "none" && style.visibility !== "hidden" &&
-                        rect.width > 0 && rect.height > 0 && rect.bottom > 0 &&
-                        rect.right > 0 && rect.top < window.innerHeight &&
-                        rect.left < window.innerWidth;
+                        rect.width > 0 && rect.height > 0 &&
+                        geometryFor(item).intersects;
                 };
-                const isScrollable = element => {
-                    if (element.scrollHeight <= element.clientHeight + 1) return false;
-                    if (element === root) return true;
-                    const overflow = window.getComputedStyle(element).overflowY;
-                    return overflow === "auto" || overflow === "scroll" ||
-                        overflow === "overlay";
+                const postPathHint = item => {
+                    const href = item.getAttribute("href");
+                    if (!href) return false;
+                    try {
+                        return new URL(href, location.href).pathname
+                            .split("/").includes("post");
+                    } catch { return false; }
                 };
                 let items = rows;
                 if (items.length && !items.every(visibleItem)) return null;
                 if (!items.length) {
-                    items = Array.from(
-                        region.querySelectorAll('a[href*="/post/"]')
-                    ).slice(0, maxCandidates).filter(visibleItem);
+                    items = Array.from(region.querySelectorAll("a"))
+                        .filter(postPathHint).slice(0, maxCandidates)
+                        .filter(visibleItem);
                 }
                 if (!items.length) return {state: "NOT_SCROLLABLE", surface: null};
 
@@ -2031,7 +2215,11 @@ class ThreadsHomeReader:
                 for (const item of items) {
                     for (let element = item; element;
                          element = element.parentElement) {
-                        if (isScrollable(element)) candidates.add(element);
+                        if ((element === root &&
+                             root.scrollHeight > root.clientHeight + 1) ||
+                            isScrollable(element)) {
+                            candidates.add(element);
+                        }
                     }
                 }
                 const innermost = Array.from(candidates).filter(candidate =>
@@ -2050,8 +2238,13 @@ class ThreadsHomeReader:
                 if (!items.every(item => surface === item || surface.contains(item))) {
                     return {state: "AMBIGUOUS", surface: null};
                 }
-                return {state: "READY", surface};
-                }""",
+                return {
+                    state: "READY", surface, surfaceKey: keyFor(surface),
+                    surfaceTag: surface === root ? "DOCUMENT" : surface.tagName,
+                    overflowY: surface === root
+                        ? "document" : getComputedStyle(surface).overflowY,
+                };
+                }"""),
                 arg=[region_handle, row_handles, _MAX_PERMALINK_CANDIDATES],
             )
         finally:
@@ -2069,6 +2262,10 @@ class ThreadsHomeReader:
             await surface_state.dispose()
             self.last_scan_counts.scroll_surface_status = "UNVERIFIED"
             raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
+        key_handle = await surface_state.get_property("surfaceKey")
+        key_value = await key_handle.json_value()
+        await key_handle.dispose()
+        self.last_scroll_surface_key = str(key_value)
         surface = await surface_state.get_property("surface")
         await surface_state.dispose()
         self.last_scan_counts.scroll_surface_status = "VALIDATED"
@@ -2374,34 +2571,23 @@ class ThreadsHomeReader:
                 continue
             read_started = time.perf_counter()
             try:
-                target = await self._read_card(
-                    root,
-                    currently_visible=currently_visible,
-                    viewport_y=box["y"],
-                    cached_body_fingerprints=prefer_new_fingerprints,
-                    visible_text_progress=currently_visible,
-                )
                 if currently_visible:
                     stabilize_started = time.perf_counter()
-                    stabilized = await self._read_card(
+                    target, body_stable = await self._read_stable_visible_card(
                         root,
-                        currently_visible=True,
                         viewport_y=box["y"],
                         cached_body_fingerprints=prefer_new_fingerprints,
-                        visible_text_progress=True,
                     )
                     self.last_scan_timings.stabilize_ms += round(
                         (time.perf_counter() - stabilize_started) * 1000
                     )
-                    if (
-                        stabilized.url != target.url
-                        or stabilized.author != target.author
-                        or not stabilized.body_consistent
-                    ):
+                    if not body_stable:
                         diagnostic.state = "OBSERVED_UNVERIFIED"
                         diagnostic.reason = "ROW_CONTENT_CHANGED_DURING_READ"
+                        diagnostic.identity_fingerprint = target.fingerprint
+                        diagnostic.read_evidence = target.read_evidence
                         diagnostic.has_readable_body = bool(
-                            stabilized.body and stabilized.body.strip()
+                            target.body and target.body.strip()
                         )
                         counts.uncertain_rows += 1
                         counts.skipped_rows += 1
@@ -2409,8 +2595,9 @@ class ThreadsHomeReader:
                             counts.body_extracted += 1
                             display_observations.append(
                                 DisplayObservation(
-                                    stabilized.body,
+                                    target.body,
                                     viewport_y=box["y"],
+                                    read_evidence=target.read_evidence,
                                 )
                             )
                         else:
@@ -2420,23 +2607,21 @@ class ThreadsHomeReader:
                                     None,
                                     "OBSERVATION_UNCERTAIN",
                                     box["y"],
+                                    read_evidence=target.read_evidence,
                                 )
                             )
                         await emit_row(
                             diagnostic,
                             display=display_observations[-1],
+                            fingerprint=target.fingerprint,
                         )
                         continue
-                    initial_segments = target.visible_segments
-                    target = stabilized
-                    target = replace(
-                        target,
-                        visible_segments=tuple(
-                            {
-                                segment.segment_id: segment
-                                for segment in initial_segments + stabilized.visible_segments
-                            }.values()
-                        ),
+                else:
+                    target = await self._read_card(
+                        root,
+                        currently_visible=False,
+                        viewport_y=box["y"],
+                        cached_body_fingerprints=prefer_new_fingerprints,
                     )
             except _CardDeferredOffscreen as deferred:
                 self.last_scan_timings.read_row_ms += round(
@@ -2569,14 +2754,52 @@ class ThreadsHomeReader:
                         self.last_scan_timings.wait_reason = "CARD_HYDRATION_TIMEOUT"
                     if changed:
                         self.last_scan_timings.wait_reason = "CARD_HYDRATION"
-                        try:
-                            target = await self._read_card(
-                                root,
-                                currently_visible=currently_visible,
-                                viewport_y=box["y"],
-                                cached_body_fingerprints=prefer_new_fingerprints,
-                                visible_text_progress=currently_visible,
+                        if currently_visible:
+                            quiet_started = time.perf_counter()
+                            body_quiet = await self._wait_for_stable_card_dom(root)
+                            self.last_scan_timings.stabilize_ms += round(
+                                (time.perf_counter() - quiet_started) * 1000
                             )
+                            if not body_quiet:
+                                self.last_scan_timings.wait_reason = (
+                                    "CARD_BODY_NOT_STABLE"
+                                )
+                                await emit_row(
+                                    diagnostic,
+                                    display=display_observations[-1]
+                                    if display_observations
+                                    else None,
+                                )
+                                continue
+                        try:
+                            if currently_visible:
+                                target, body_stable = (
+                                    await self._read_stable_visible_card(
+                                        root,
+                                        viewport_y=box["y"],
+                                        cached_body_fingerprints=(
+                                            prefer_new_fingerprints
+                                        ),
+                                    )
+                                )
+                                if not body_stable:
+                                    self.last_scan_timings.wait_reason = (
+                                        "CARD_BODY_NOT_STABLE"
+                                    )
+                                    await emit_row(
+                                        diagnostic,
+                                        display=display_observations[-1]
+                                        if display_observations
+                                        else None,
+                                    )
+                                    continue
+                            else:
+                                target = await self._read_card(
+                                    root,
+                                    currently_visible=False,
+                                    viewport_y=box["y"],
+                                    cached_body_fingerprints=prefer_new_fingerprints,
+                                )
                         except (_CardNotReady, _UnverifiedFeedCandidate, _CardDeferredOffscreen):
                             pass
                         else:
@@ -2935,39 +3158,18 @@ class ThreadsHomeReader:
                 return False
             return bool(
                 await element.evaluate(
-                    """node => {
+                    _with_scrollport_geometry("""node => {
+                        /*SCROLLPORT_GEOMETRY*/
                         if (!node.isConnected) return false;
-                        const style = getComputedStyle(node);
-                        if (style.display === "none" || style.visibility === "hidden") {
-                            return false;
+                        for (let current = node; current;
+                             current = current.parentElement) {
+                            const style = getComputedStyle(current);
+                            if (style.display === "none" ||
+                                style.visibility === "hidden" ||
+                                Number(style.opacity) === 0) return false;
                         }
-                        const rect = node.getBoundingClientRect();
-                        let left = Math.max(0, rect.left);
-                        let top = Math.max(0, rect.top);
-                        let right = Math.min(window.innerWidth, rect.right);
-                        let bottom = Math.min(window.innerHeight, rect.bottom);
-                        for (let parent = node.parentElement; parent;
-                             parent = parent.parentElement) {
-                            const overflow = getComputedStyle(parent);
-                            const clipX = overflow.overflowX !== "visible";
-                            const clipY = overflow.overflowY !== "visible";
-                            if (!clipX && !clipY) continue;
-                            const bounds = parent.getBoundingClientRect();
-                            const clipLeft = bounds.left + parent.clientLeft;
-                            const clipTop = bounds.top + parent.clientTop;
-                            const clipRight = clipLeft + parent.clientWidth;
-                            const clipBottom = clipTop + parent.clientHeight;
-                            if (clipX) {
-                                left = Math.max(left, clipLeft);
-                                right = Math.min(right, clipRight);
-                            }
-                            if (clipY) {
-                                top = Math.max(top, clipTop);
-                                bottom = Math.min(bottom, clipBottom);
-                            }
-                        }
-                        return right > left && bottom > top;
-                    }"""
+                        return geometryFor(node).intersects;
+                    }""")
                 )
             )
         except PlaywrightError:
@@ -3124,7 +3326,11 @@ class ThreadsHomeReader:
             ):
                 return None
             box = await root.bounding_box()
-            if box is None or not self._intersects_viewport(box, viewport):
+            if (
+                box is None
+                or not self._intersects_viewport(box, viewport)
+                or not await self._is_in_visible_scrollports(root)
+            ):
                 return None
             if await self._is_nested_feed_root(root):
                 return None
@@ -3176,6 +3382,8 @@ class ThreadsHomeReader:
                 async def inspect_carried_root(
                     root: Locator,
                 ) -> dict[str, object] | None:
+                    if not await self._is_in_visible_scrollports(root):
+                        return None
                     return await root.evaluate(
                         """(node, args) => {
                             const style = getComputedStyle(node);
@@ -3183,9 +3391,6 @@ class ThreadsHomeReader:
                             if (style.display === "none" ||
                                 style.visibility === "hidden" ||
                                 rect.width <= 0 || rect.height <= 0 ||
-                                rect.right <= 0 || rect.bottom <= 0 ||
-                                rect.left >= args.viewport.width ||
-                                rect.top >= args.viewport.height ||
                                 node.closest(args.outside) ||
                                 node.closest(args.quote) ||
                                 !args.region.contains(node)) return null;
@@ -3271,40 +3476,14 @@ class ThreadsHomeReader:
         if time_count > _MAX_STRUCTURE_ELEMENTS:
             truncated = True
         fallbacks = await times.evaluate_all(
-            """(timeNodes, args) => {
+            _with_scrollport_geometry("""(timeNodes, args) => {
+                /*SCROLLPORT_GEOMETRY*/
                 const visible = element => {
                     const style = getComputedStyle(element);
                     const rect = element.getBoundingClientRect();
                     if (style.display === "none" || style.visibility === "hidden" ||
-                        rect.width <= 0 || rect.height <= 0 ||
-                        rect.right <= 0 || rect.bottom <= 0 ||
-                        rect.left >= args.viewport.width ||
-                        rect.top >= args.viewport.height) return false;
-                    let left = Math.max(0, rect.left);
-                    let top = Math.max(0, rect.top);
-                    let right = Math.min(args.viewport.width, rect.right);
-                    let bottom = Math.min(args.viewport.height, rect.bottom);
-                    for (let parent = element.parentElement; parent;
-                         parent = parent.parentElement) {
-                        const parentStyle = getComputedStyle(parent);
-                        const clipX = parentStyle.overflowX !== "visible";
-                        const clipY = parentStyle.overflowY !== "visible";
-                        if (!clipX && !clipY) continue;
-                        const bounds = parent.getBoundingClientRect();
-                        const clipLeft = bounds.left + parent.clientLeft;
-                        const clipTop = bounds.top + parent.clientTop;
-                        const clipRight = clipLeft + parent.clientWidth;
-                        const clipBottom = clipTop + parent.clientHeight;
-                        if (clipX) {
-                            left = Math.max(left, clipLeft);
-                            right = Math.min(right, clipRight);
-                        }
-                        if (clipY) {
-                            top = Math.max(top, clipTop);
-                            bottom = Math.min(bottom, clipBottom);
-                        }
-                    }
-                    return right > left && bottom > top;
+                        rect.width <= 0 || rect.height <= 0) return false;
+                    return geometryFor(element).intersects;
                 };
                 const outside = element => element.closest(args.outside) !== null;
                 const insideQuote = element => element.closest(args.quote) !== null;
@@ -3402,7 +3581,7 @@ class ThreadsHomeReader:
                     results.push({index, ...fallback});
                 }
                 return results;
-            }""",
+            }"""),
             {
                 "viewport": viewport,
                 "roots": _FEED_ROOT_SELECTOR,
@@ -4038,7 +4217,10 @@ class ThreadsHomeReader:
                     parsed_post[0],
                     parsed_post[1],
                 )
-                if not self._intersects_viewport(box, viewport):
+                if (
+                    not self._intersects_viewport(box, viewport)
+                    or not await self._is_in_visible_scrollports(root)
+                ):
                     continue
                 target = await self._read_card(
                     root,
@@ -4225,14 +4407,15 @@ class ThreadsHomeReader:
                 target.url,
                 target.author,
             )
-            current = await self._read_card(
+            current, body_stable = await self._read_stable_visible_card(
                 root,
-                currently_visible=True,
                 viewport_y=box["y"],
                 cached_body_fingerprints={target.fingerprint},
             )
             if (
-                current.fingerprint != target.fingerprint
+                not body_stable
+                or not current.currently_visible
+                or current.fingerprint != target.fingerprint
                 or normalize_text(current.body or "")
                 != normalize_text(target.body or "")
             ):
@@ -4806,41 +4989,12 @@ class ThreadsHomeReader:
         fingerprint: str | None = None,
     ) -> _VisibleBodyRead:
         observation = await root.evaluate(
-            """(root, args) => {
-                const clipFor = element => {
-                    const clip = {
-                        left: 0, top: 0,
-                        right: window.innerWidth, bottom: window.innerHeight,
-                    };
-                    for (let parent = element.parentElement; parent;
-                         parent = parent.parentElement) {
-                        const style = getComputedStyle(parent);
-                        const clipX = style.overflowX !== "visible";
-                        const clipY = style.overflowY !== "visible";
-                        if (!clipX && !clipY) continue;
-                        const bounds = parent.getBoundingClientRect();
-                        const left = bounds.left + parent.clientLeft;
-                        const top = bounds.top + parent.clientTop;
-                        if (clipX) {
-                            clip.left = Math.max(clip.left, left);
-                            clip.right = Math.min(
-                                clip.right, left + parent.clientWidth
-                            );
-                        }
-                        if (clipY) {
-                            clip.top = Math.max(clip.top, top);
-                            clip.bottom = Math.min(
-                                clip.bottom, top + parent.clientHeight
-                            );
-                        }
-                    }
-                    return clip;
-                };
+            _with_scrollport_geometry("""(root, args) => {
+                /*SCROLLPORT_GEOMETRY*/
                 const rootRect = root.getBoundingClientRect();
-                const rootClip = clipFor(root);
-                const rootIntersects = rootRect.right > rootClip.left &&
-                    rootRect.left < rootClip.right && rootRect.bottom > rootClip.top &&
-                    rootRect.top < rootClip.bottom;
+                const rootGeometry = geometryFor(root);
+                const rootClip = rootGeometry.clip;
+                const rootIntersects = rootGeometry.intersects;
                 const rootPositionBand = rootRect.bottom <= rootClip.top ? "ABOVE" :
                     rootRect.top >= rootClip.bottom ? "BELOW" : "INTERSECTS";
                 const cssVisible = element => {
@@ -4895,42 +5049,6 @@ class ThreadsHomeReader:
                     }
                     return `${parts.reverse().join("/")}/text:${textIndex}`;
                 };
-                const scrollMetrics = element => {
-                    let scroller = element.parentElement;
-                    while (scroller && scroller !== document.body &&
-                           scroller !== document.documentElement) {
-                        const style = getComputedStyle(scroller);
-                        if (["auto", "scroll", "overlay"].includes(style.overflowY) &&
-                            scroller.scrollHeight > scroller.clientHeight + 1) break;
-                        scroller = scroller.parentElement;
-                    }
-                    const documentScroll = !scroller || scroller === document.body ||
-                        scroller === document.documentElement;
-                    if (documentScroll) {
-                        return {offset: window.scrollY, top: window.scrollY,
-                            bottom: window.scrollY + window.innerHeight,
-                            key: "DOCUMENT"};
-                    }
-                    const bounds = scroller.getBoundingClientRect();
-                    const offset = scroller.scrollTop - bounds.top - scroller.clientTop;
-                    const path = [];
-                    for (let current = scroller; current && current !== document.body;
-                         current = current.parentElement) {
-                        let siblingIndex = 0;
-                        for (const sibling of current.parentElement?.children || []) {
-                            if (sibling.tagName !== current.tagName) continue;
-                            if (sibling === current) break;
-                            siblingIndex++;
-                        }
-                        path.push(`${current.tagName.toLowerCase()}:${siblingIndex}`);
-                    }
-                    return {
-                        offset,
-                        top: scroller.scrollTop,
-                        bottom: scroller.scrollTop + scroller.clientHeight,
-                        key: path.reverse().join("/"),
-                    };
-                };
                 const bodyContainers = Array.from(root.querySelectorAll(args.body))
                     .filter(element => belongs(element) && !excluded(element) &&
                         cssVisible(element)).length;
@@ -4948,6 +5066,8 @@ class ThreadsHomeReader:
                 let unsupportedTextNodesPresent = 0;
                 let closestTextBelow = null;
                 let closestTextAbove = null;
+                let closestTextTop = null;
+                let closestTextBottom = null;
                 let truncated = false;
                 let node;
                 while ((node = walker.nextNode())) {
@@ -4967,7 +5087,7 @@ class ThreadsHomeReader:
                     const block = nearestBlock(node);
                     if (!blockIds.has(block)) blockIds.set(block, nextBlockId++);
                     const clip = clipFor(parent);
-                    const metrics = scrollMetrics(parent);
+                    const metrics = scrollMetrics(root);
                     const expected = [];
                     const visible = [];
                     let deferredAbove = 0;
@@ -5010,14 +5130,21 @@ class ThreadsHomeReader:
                         for (const rect of rects) {
                             if (rect.top >= clip.bottom) {
                                 const distance = Math.max(0, rect.top - clip.bottom);
-                                closestTextBelow = Math.min(
-                                    closestTextBelow ?? Infinity, distance
-                                );
+                                if (distance < (closestTextBelow ?? Infinity)) {
+                                    closestTextBelow = distance;
+                                    closestTextTop = rect.top;
+                                    closestTextBottom = rect.bottom;
+                                }
                             } else if (rect.bottom <= clip.top) {
                                 const distance = Math.max(0, clip.top - rect.bottom);
-                                closestTextAbove = Math.min(
-                                    closestTextAbove ?? Infinity, distance
-                                );
+                                if (distance < (closestTextAbove ?? Infinity)) {
+                                    closestTextAbove = distance;
+                                    closestTextTop = rect.top;
+                                    closestTextBottom = rect.bottom;
+                                }
+                            } else if (closestTextTop === null) {
+                                closestTextTop = rect.top;
+                                closestTextBottom = rect.bottom;
                             }
                         }
                         if (states.every(state => state.fully)) {
@@ -5130,10 +5257,17 @@ class ThreadsHomeReader:
                     rootIntersects,
                     rootPositionBand,
                     scrollTop: scrollMetrics(root).top,
+                    scrollHeight: scrollMetrics(root).scrollHeight,
                     scrollSurfaceKey: scrollMetrics(root).key,
+                    rowTop: rootRect.top,
+                    rowBottom: rootRect.bottom,
+                    clipTop: rootClip.top,
+                    clipBottom: rootClip.bottom,
+                    closestTextTop,
+                    closestTextBottom,
                     textEvidence,
                 };
-            }""",
+            }"""),
             {
                 "roots": _FEED_ROOT_SELECTOR,
                 "body": _BODY_TEXT_SELECTOR,
@@ -5157,6 +5291,20 @@ class ThreadsHomeReader:
                 else float(observation["closestTextDistance"])
             ),
             closest_text_side=str(observation["closestTextSide"]),
+            row_top_px=float(observation["rowTop"]),
+            row_bottom_px=float(observation["rowBottom"]),
+            clip_top_px=float(observation["clipTop"]),
+            clip_bottom_px=float(observation["clipBottom"]),
+            text_rect_top_px=(
+                None
+                if observation["closestTextTop"] is None
+                else float(observation["closestTextTop"])
+            ),
+            text_rect_bottom_px=(
+                None
+                if observation["closestTextBottom"] is None
+                else float(observation["closestTextBottom"])
+            ),
             root_intersects=bool(observation["rootIntersects"]),
             root_position_band=str(observation["rootPositionBand"]),
             scroller_scroll_top=float(observation["scrollTop"]),
@@ -5306,7 +5454,11 @@ class ThreadsHomeReader:
                     )
                     segment_key = sha256(
                         self._body_progress_salt
-                        + f"{fingerprint or 'display'}:{identity}:{new_start}:{new_end}".encode()
+                        + (
+                            f"{fingerprint or 'display'}:{identity}:"
+                            f"{new_start}:{new_end}:"
+                        ).encode()
+                        + fragment_text.encode("utf-8", errors="replace")
                     ).hexdigest()
                     new_segments.append(
                         VisibleBodySegment(
@@ -5504,12 +5656,7 @@ class ThreadsHomeReader:
             and fingerprint in cached_body_fingerprints
             else None
         )
-        if cached_body is not None:
-            permalink_visible = (
-                await self._is_in_visible_scrollports(link)
-                if currently_visible
-                else False
-            )
+        if cached_body is not None and not currently_visible:
             return PostTarget(
                 url,
                 author,
@@ -5518,7 +5665,17 @@ class ThreadsHomeReader:
                 link,
                 body_available=bool(cached_body[0].strip()),
                 body_truncated=cached_body[1],
-                currently_visible=currently_visible and permalink_visible,
+                read_evidence=BodyReadEvidence(
+                    state="NOT_SAMPLED_CACHE",
+                    body_text_nodes_present=None,
+                    render_rect_count=None,
+                    visible_text_rect_count=None,
+                    deferred_above_rect_count=None,
+                    deferred_below_rect_count=None,
+                    root_intersects=None,
+                    root_position_band="NOT_SAMPLED",
+                    scroll_surface_key="NOT_SAMPLED",
+                ),
                 viewport_y=viewport_y,
             )
         permalink_visible = True
@@ -5592,9 +5749,105 @@ class ThreadsHomeReader:
             read_evidence=(
                 None if visible_body is None else visible_body.read_evidence
             ),
-            currently_visible=currently_visible and permalink_visible,
+            currently_visible=(
+                currently_visible
+                and permalink_visible
+                and (
+                    visible_body is None
+                    or visible_body.read_evidence.root_intersects
+                )
+            ),
             viewport_y=viewport_y,
         )
+
+    async def _wait_for_stable_card_dom(self, root: Locator) -> bool:
+        """Wait for a bounded quiet interval after a hydration signal."""
+        return bool(
+            await root.evaluate(
+                """async (node, args) => {
+                    const snapshot = () => JSON.stringify([
+                        node.innerText,
+                        Array.from(node.querySelectorAll("a"), link =>
+                            link.getAttribute("href")),
+                    ]);
+                    let value = snapshot();
+                    let changedAt = performance.now();
+                    const observer = new MutationObserver(() => {
+                        const current = snapshot();
+                        if (current !== value) {
+                            value = current;
+                            changedAt = performance.now();
+                        }
+                    });
+                    observer.observe(node, {
+                        subtree: true,
+                        childList: true,
+                        characterData: true,
+                        attributes: true,
+                        attributeFilter: ["href"],
+                    });
+                    const deadline = performance.now() + args.timeoutMs;
+                    while (
+                        performance.now() - changedAt < args.dwellMs &&
+                        performance.now() < deadline
+                    ) {
+                        await new Promise(resolve => setTimeout(resolve, 16));
+                    }
+                    observer.disconnect();
+                    return performance.now() - changedAt >= args.dwellMs;
+                }""",
+                {
+                    "dwellMs": min(
+                        max(1, _BODY_STABILITY_INTERVAL_MS),
+                        max(1, _CARD_HYDRATION_WAIT_MS),
+                    ),
+                    "timeoutMs": max(1, _CARD_HYDRATION_WAIT_MS),
+                },
+            )
+        )
+
+    async def _read_stable_visible_card(
+        self,
+        root: Locator,
+        *,
+        viewport_y: float,
+        cached_body_fingerprints: set[str] | None,
+    ) -> tuple[PostTarget, bool]:
+        """Require the same row identity and body across a bounded dwell."""
+        target = await self._read_card(
+            root,
+            currently_visible=True,
+            viewport_y=viewport_y,
+            cached_body_fingerprints=cached_body_fingerprints,
+            visible_text_progress=True,
+        )
+        # Measure stability between completed samples. DOM extraction can take
+        # longer than the existing hydration wait on a busy feed; that work
+        # already provides elapsed time and must not make a stable row fail.
+        await asyncio.sleep(max(1, _BODY_STABILITY_INTERVAL_MS) / 1000)
+        settled = await self._read_card(
+            root,
+            currently_visible=True,
+            viewport_y=viewport_y,
+            cached_body_fingerprints=cached_body_fingerprints,
+            visible_text_progress=True,
+        )
+        body_same = (
+            _canonicalize_body(target.body or "")
+            == _canonicalize_body(settled.body or "")
+            and target.body_complete == settled.body_complete
+            and target.body_truncated == settled.body_truncated
+        )
+        identity_same = target.url == settled.url and target.author == settled.author
+        if not body_same or not identity_same or not settled.body_consistent:
+            return settled, False
+        segments = tuple(
+            {
+                segment.segment_id: segment
+                for segment in target.visible_segments + settled.visible_segments
+            }.values()
+        )
+        return replace(settled, visible_segments=segments), True
 
     async def _visible_body_candidate_state(
         self,
@@ -5603,7 +5856,8 @@ class ThreadsHomeReader:
         fingerprint: str | None = None,
     ) -> tuple[bool, bool]:
         candidates = await root.evaluate(
-            """(root, args) => {
+            _with_scrollport_geometry("""(root, args) => {
+                /*SCROLLPORT_GEOMETRY*/
                 const bodySafe = element => {
                     let current = element;
                     while (current && current !== root) {
@@ -5627,57 +5881,19 @@ class ThreadsHomeReader:
                 };
                 const geometry = element => {
                     const rect = element.getBoundingClientRect();
-                    let left = Math.max(0, rect.left);
-                    let top = Math.max(0, rect.top);
-                    let right = Math.min(window.innerWidth, rect.right);
-                    let bottom = Math.min(window.innerHeight, rect.bottom);
-                    for (let parent = element.parentElement; parent;
-                         parent = parent.parentElement) {
-                        const style = getComputedStyle(parent);
-                        const clipX = style.overflowX !== "visible";
-                        const clipY = style.overflowY !== "visible";
-                        if (!clipX && !clipY) continue;
-                        const bounds = parent.getBoundingClientRect();
-                        const clipLeft = bounds.left + parent.clientLeft;
-                        const clipTop = bounds.top + parent.clientTop;
-                        const clipRight = clipLeft + parent.clientWidth;
-                        const clipBottom = clipTop + parent.clientHeight;
-                        if (clipX) {
-                            left = Math.max(left, clipLeft);
-                            right = Math.min(right, clipRight);
-                        }
-                        if (clipY) {
-                            top = Math.max(top, clipTop);
-                            bottom = Math.min(bottom, clipBottom);
-                        }
-                    }
-                    let scroller = element.parentElement;
-                    while (scroller && scroller !== document.body &&
-                           scroller !== document.documentElement) {
-                        const style = getComputedStyle(scroller);
-                        if (["auto", "scroll", "overlay"].includes(style.overflowY) &&
-                            scroller.scrollHeight > scroller.clientHeight + 1) break;
-                        scroller = scroller.parentElement;
-                    }
-                    const documentScroll = !scroller ||
-                        scroller === document.body ||
-                        scroller === document.documentElement;
-                    const basis = documentScroll ? document.scrollingElement : scroller;
-                    const basisRect = documentScroll ? null : basis.getBoundingClientRect();
-                    const basisTop = documentScroll
-                        ? window.scrollY
-                        : basis.scrollTop - basis.clientTop - basisRect.top;
-                    const contentTop = rect.top + basisTop;
-                    const contentBottom = rect.bottom + basisTop;
-                    const visibleTop = top + basisTop;
-                    const visibleBottom = bottom + basisTop;
+                    const geometry = geometryFor(element);
+                    const metrics = scrollMetrics(element);
+                    const contentTop = rect.top + metrics.offset;
+                    const contentBottom = rect.bottom + metrics.offset;
+                    const visibleTop = geometry.visible.top + metrics.offset;
+                    const visibleBottom = geometry.visible.bottom + metrics.offset;
                     return {
                         top: contentTop,
                         bottom: contentBottom,
                         width: rect.width,
                         visibleTop: Math.max(contentTop, visibleTop),
                         visibleBottom: Math.min(contentBottom, visibleBottom),
-                        intersects: right > left && bottom > top,
+                        intersects: geometry.intersects,
                     };
                 };
                 const all = Array.from(root.querySelectorAll(args.body))
@@ -5692,7 +5908,7 @@ class ThreadsHomeReader:
                     return true;
                 });
                 return outermost.map(geometry);
-            }""",
+            }"""),
             {
                 "excluded": _BODY_EXCLUSION_SELECTOR,
                 "roots": _FEED_ROOT_SELECTOR,

@@ -4291,50 +4291,40 @@ def test_unmarked_rows_keep_display_and_provenance_evidence_separate(
             show_post_text=True,
             show_observed_text=True,
         )
-        assert result.status == "COMPLETE"
+        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
         assert result.observed_rows == 3
         assert result.body_extracted == 3
         assert result.provenance_verified == 2
         assert result.unverified_relevant == 1
-        assert result.detail_reads == 1
-        assert result.viewport_coverage_complete
+        assert result.detail_reads == result.checkpoint_runs == 0
+        assert not result.viewport_coverage_complete
 
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
-    assert detail_requests == 1
-    assert "OBSERVED stage=FEED_INITIAL" not in output
-    assert "READY stage=FEED_INITIAL state=BODY_EXTRACTED verified=2" in output
-    assert "DETAIL_VERIFIED status=PROVENANCE_VERIFIED" in output
+    assert detail_requests == 0
+    assert "OBSERVED stage=FEED_INITIAL state=OBSERVATION_UNCERTAIN verified=2" in output
+    assert "VIEWPORT_COVERAGE_INCOMPLETE" in output
+    assert "[DETAIL]" not in output
+    assert "[BACK]" not in output
     assert output.count(f"| {unverified_body}") == 1
     assert output.count(f"| {verified_body}") == 1
-    assert output.count(f"| {selected_body}") == 2
+    assert output.count(f"| {selected_body}") == 1
     assert quoted_body not in output
     assert "status=OBSERVED_UNVERIFIED decision=RELEVANT_UNVERIFIED" in output
-    assert "[DETAIL] post=2 status=VERIFIED provenance=VERIFIED extent=FULL" in output
     checkpoint = store.load(
         account.account_id,
         policy_fingerprint(canonical_terms(("đang tìm việc", "hiring"))),
     )
-    assert checkpoint.completed_runs == 1
-    assert checkpoint.home_sampled == 2
-    assert checkpoint.detail_reads == 1
+    assert checkpoint.completed_runs == 0
+    assert checkpoint.home_sampled == 0
+    assert checkpoint.detail_reads == 0
     checkpoint_path = (
         data_root
         / "nurture"
         / "checkpoints"
         / f"{account.account_id}-{checkpoint.policy_fingerprint}.json"
     )
-    persisted = checkpoint_path.read_text(encoding="utf-8")
-    assert all(
-        value not in persisted
-        for value in (
-            unverified_body,
-            verified_body,
-            selected_body,
-            quoted_body,
-            "/@verified/post/selected",
-        )
-    )
+    assert not checkpoint_path.exists()
 
 
 def test_two_row_cap_reports_incomplete_viewport_without_wheel_or_checkpoint(
@@ -4689,3 +4679,258 @@ def test_unverified_relevance_prevents_completed_checkpoint_with_verified_rows(
         policy_fingerprint(canonical_terms(("looking for work",))),
     )
     assert checkpoint.completed_runs == 0
+
+
+def test_nested_scrollport_excludes_future_rows_and_uses_its_own_coordinates() -> None:
+    actor = "offline.operator"
+    feed_html = f"""<!doctype html><html><head><style>
+html, body {{ height: 100%; margin: 0; overflow: hidden; }}
+nav {{ height: 36px; }}
+#outer {{ height: 420px; overflow-y: auto; }}
+#feed {{ height: 120px; overflow-y: auto; }}
+.card {{ box-sizing: border-box; height: 120px; padding: 8px; }}
+#outer-filler {{ height: 600px; }}
+</style></head><body><nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<section id="outer"><main id="feed">
+<article id="first" class="card">
+  <a href="/@candidate/post/nested-first"><time>now</time></a>
+  <a href="/@candidate">candidate</a><p>A synthetic first row.</p>
+</article>
+<article id="below" class="card">
+  <a href="/@candidate/post/nested-below"><time>1h</time></a>
+  <a href="/@candidate">candidate</a><p>A synthetic second row.</p>
+</article>
+<article id="far-below" class="card">
+  <a href="/@candidate/post/nested-far"><time>2h</time></a>
+  <a href="/@candidate">candidate</a><p>A synthetic third row.</p>
+</article>
+</main><div id="outer-filler" aria-hidden="true"></div></section></body></html>"""
+
+    async def exercise(page) -> None:
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        initial = await reader.scan_viewport(5)
+        assert len(initial) == 1
+        assert initial[0].url.endswith("/post/nested-first")
+        assert reader.last_scan_counts.observed_rows == 1
+        assert reader.last_scan_counts.coverage_complete
+        evidence = initial[0].read_evidence
+        assert evidence is not None
+        assert evidence.clip_top_px is not None
+        assert evidence.clip_bottom_px is not None
+        below_box = await page.locator("#below").bounding_box()
+        assert below_box is not None
+        assert below_box["y"] >= evidence.clip_bottom_px
+        assert below_box["y"] < page.viewport_size["height"]
+
+        assert await reader.advance_feed(scan_after_scroll=False)
+        assert await reader.advance_feed(scan_after_scroll=False)
+        first_box = await page.locator("#first").bounding_box()
+        assert first_box is not None
+        assert first_box["y"] + first_box["height"] <= evidence.clip_top_px
+        cached = await reader._read_card(
+            page.locator("#first"),
+            currently_visible=False,
+            cached_body_fingerprints={initial[0].fingerprint},
+        )
+        assert cached.read_evidence is not None
+        assert cached.read_evidence.state == "NOT_SAMPLED_CACHE"
+        assert cached.read_evidence.root_intersects is None
+        assert cached.read_evidence.body_text_nodes_present is None
+        assert not cached.currently_visible
+        geometry = reader.last_scroll_geometry
+        assert geometry is not None
+        assert geometry["surface_tag"] == "MAIN"
+        assert geometry["overflow_y"] == "auto"
+        assert float(geometry["scroll_top_after"]) > float(
+            geometry["scroll_top_before"]
+        )
+        after = await reader.scan_viewport(5)
+        loaded = next(
+            target for target in after if target.url.endswith("/post/nested-below")
+        )
+        assert loaded.body == "A synthetic second row."
+        assert loaded.currently_visible
+        assert reader.last_scan_counts.coverage_complete
+        assert all(
+            not diagnostic.observation_id
+            or diagnostic.state in {"VERIFIED", "NON_POST"}
+            for diagnostic in reader.last_candidate_diagnostics
+        )
+
+    _run_offline_page(feed_html, exercise)
+
+
+def test_sticky_row_with_scrolltop_change_is_not_reading_progress(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    body = "A synthetic weather note stays fixed while the feed moves."
+    feed_html = f"""<!doctype html><html><head><style>
+html, body {{ height: 100%; margin: 0; overflow: hidden; }}
+nav {{ height: 36px; }}
+#feed {{ height: 220px; overflow-y: auto; }}
+#sticky {{ position: sticky; top: 0; height: 150px; padding: 8px; }}
+#space {{ height: 1200px; }}
+</style></head><body><nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main id="feed"><article id="sticky">
+<a href="/@candidate/post/sticky"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>{body}</p></article>
+<div id="space" aria-hidden="true"></div></main></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+
+    async def exercise(page) -> None:
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=2,
+            max_scrolls=3,
+            max_total_posts=10,
+            terms=("hiring",),
+            detail=True,
+        )
+        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
+        assert result.stop_reason == "READ_PROGRESS_STALLED"
+        assert result.scroll_attempts == result.scrolls == 3
+        assert not result.viewport_coverage_complete
+        assert result.unresolved_gaps > 0
+
+    _run_offline_page(feed_html, exercise)
+    output = capsys.readouterr().out
+    assert "SCROLLTOP_MOVED_ROW_STATIC" in output
+    assert "ROW_MOVED_TOWARD_VIEW" not in output
+    assert "reason=READ_PROGRESS_STALLED coverage=INCOMPLETE" in output
+    assert "scroll_height_delta=0.0" in output
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert checkpoint.completed_runs == 0
+    assert checkpoint.detail_reads == 0
+
+
+def test_native_wheel_loads_new_visible_post_then_detail_back_and_checkpoint(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    detail_url = "https://www.threads.com/@candidate/post/loaded"
+    seed_body = "A synthetic weather seed post."
+    loaded_body = "Hiring a synthetic backend engineer after the wheel."
+    feed_html = f"""<!doctype html><html><head><style>
+html, body {{ height: 100%; margin: 0; overflow: hidden; }}
+nav {{ height: 36px; }}
+#feed {{ height: 220px; overflow-y: auto; }}
+.card {{ box-sizing: border-box; height: 132px; padding: 12px; }}
+#space {{ height: 600px; }}
+</style></head><body><nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main id="feed"><article class="card" id="seed">
+<a href="/@candidate/post/seed"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>{seed_body}</p></article>
+<div id="space" aria-hidden="true"></div></main><script>
+const feed = document.querySelector('#feed');
+window.nativeWheelCount = Number(sessionStorage.getItem('synthetic-wheels') || 0);
+window.loadedMore = sessionStorage.getItem('synthetic-loaded') === 'true';
+window.feedHeightBefore = feed.scrollHeight;
+const loadMore = () => {{
+  if (window.loadedMore) return;
+  const card = document.createElement('article');
+  card.className = 'card';
+  card.id = 'loaded';
+  card.innerHTML = `<a href="/@candidate/post/loaded"><time>now</time></a>
+    <a href="/@candidate">candidate</a><p>{loaded_body}</p>`;
+  document.querySelector('#space').before(card);
+  window.loadedMore = true;
+  sessionStorage.setItem('synthetic-loaded', 'true');
+  window.feedHeightAfter = feed.scrollHeight;
+}};
+if (window.loadedMore) {{
+  window.loadedMore = false;
+  loadMore();
+  feed.scrollTop = Number(sessionStorage.getItem('synthetic-scrolltop') || 0);
+}}
+feed.addEventListener('wheel', () => {{
+  window.nativeWheelCount += 1;
+  sessionStorage.setItem('synthetic-wheels', String(window.nativeWheelCount));
+  loadMore();
+}});
+feed.addEventListener('scroll', () => sessionStorage.setItem(
+  'synthetic-scrolltop', String(feed.scrollTop)
+), {{ passive: true }});
+</script></body></html>"""
+    detail_html = f"""<!doctype html><html><body><article>
+<a href="/@candidate/post/loaded"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>{loaded_body}</p>
+</article></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+    detail_requests = 0
+
+    async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            nonlocal detail_requests
+            detail_requests += 1
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=detail_html,
+            )
+
+        await page.route(detail_url, serve_detail)
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=3,
+            max_scrolls=1,
+            max_total_posts=10,
+            terms=("hiring", "engineer"),
+            detail=True,
+        )
+        assert result.status == "COMPLETE"
+        assert result.home_relevant == 1
+        assert result.home_sampled == result.unique_verified_posts == 2
+        assert result.scroll_attempts == result.scrolls == 1
+        assert result.detail_reads == 1
+        assert await page.evaluate("window.nativeWheelCount") == 1
+        assert await page.evaluate("window.loadedMore")
+        assert await page.evaluate("window.feedHeightAfter - window.feedHeightBefore") >= 120
+
+    _run_offline_page(feed_html, exercise)
+    output = capsys.readouterr().out
+    assert detail_requests == 1
+    assert output.count(seed_body) == 1
+    assert output.count(loaded_body) == 2
+    assert "scroll_height_delta=132.0" in output
+    assert "[DETAIL] post=2 status=VERIFIED" in output
+    assert "[BACK] post=2 status=RESTORED anchor=MATCHED" in output
+    assert "[CHECKPOINT] status=SAVED completed_runs=1" in output
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring", "engineer"))),
+    )
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.home_sampled == 2
+    assert checkpoint.detail_reads == 1
+    persisted = (
+        data_root
+        / "nurture"
+        / "checkpoints"
+        / f"{account.account_id}-{checkpoint.policy_fingerprint}.json"
+    ).read_text(encoding="utf-8")
+    assert all(value not in persisted for value in (seed_body, loaded_body, detail_url, actor))

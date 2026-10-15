@@ -25,15 +25,21 @@ class BodyReadEvidence:
     """Structural evidence about where rendered body text is located."""
 
     state: str = "UNKNOWN"
-    body_text_nodes_present: int = 0
-    render_rect_count: int = 0
-    visible_text_rect_count: int = 0
-    deferred_above_rect_count: int = 0
-    deferred_below_rect_count: int = 0
+    body_text_nodes_present: int | None = 0
+    render_rect_count: int | None = 0
+    visible_text_rect_count: int | None = 0
+    deferred_above_rect_count: int | None = 0
+    deferred_below_rect_count: int | None = 0
     closest_text_distance_px: float | None = None
     closest_text_side: str = "NONE"
+    row_top_px: float | None = field(default=None, repr=False)
+    row_bottom_px: float | None = field(default=None, repr=False)
+    clip_top_px: float | None = field(default=None, repr=False)
+    clip_bottom_px: float | None = field(default=None, repr=False)
+    text_rect_top_px: float | None = field(default=None, repr=False)
+    text_rect_bottom_px: float | None = field(default=None, repr=False)
     frontier_content_px: float | None = field(default=None, repr=False)
-    root_intersects: bool = False
+    root_intersects: bool | None = False
     root_position_band: str = "UNKNOWN"
     scroller_scroll_top: float | None = field(default=None, repr=False)
     scroll_surface_key: str = field(default="", repr=False)
