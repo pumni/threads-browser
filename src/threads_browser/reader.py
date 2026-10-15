@@ -1513,7 +1513,31 @@ class ThreadsHomeReader:
                     and not self.last_scan_counts.card_not_ready
                 )
             ):
-                if await self._visible_feed_evidence():
+                pending_readiness = await self._feed_readiness_signals()
+                readiness_timing = self.last_scan_timings
+                should_rescan = False
+                if pending_readiness is not None:
+                    wait_started = time.perf_counter()
+                    changed = await self._wait_for_pending_card(
+                        pending_readiness,
+                        deadline,
+                    )
+                    readiness_timing.stabilize_ms += round(
+                        (time.perf_counter() - wait_started) * 1000
+                    )
+                    readiness_timing.wait_reason = (
+                        "FEED_READINESS_SIGNAL"
+                        if changed
+                        else "FEED_READINESS_TIMEOUT"
+                    )
+                    should_rescan = changed
+                if not should_rescan:
+                    should_rescan = await self._visible_feed_evidence()
+                if should_rescan:
+                    previous_discover_ms = readiness_timing.discover_ms
+                    previous_read_row_ms = readiness_timing.read_row_ms
+                    previous_stabilize_ms = readiness_timing.stabilize_ms
+                    previous_wait_reason = readiness_timing.wait_reason
                     self.last_scan_counts = _FeedScanCounts()
                     scan = await self._visible_targets(
                         max_posts,
@@ -1522,6 +1546,11 @@ class ThreadsHomeReader:
                         stage=stage_name,
                         on_row=on_row,
                     )
+                    self.last_scan_timings.discover_ms += previous_discover_ms
+                    self.last_scan_timings.read_row_ms += previous_read_row_ms
+                    self.last_scan_timings.stabilize_ms += previous_stabilize_ms
+                    if self.last_scan_timings.wait_reason == "NONE":
+                        self.last_scan_timings.wait_reason = previous_wait_reason
                 if not (
                     scan.targets
                     or self.last_scan_counts.body_extracted
@@ -1531,9 +1560,10 @@ class ThreadsHomeReader:
                         and not self.last_scan_counts.card_not_ready
                     )
                 ):
-                    self.last_scan_timings.wait_reason = (
-                        "NO_VERIFIABLE_ROW_EVIDENCE"
-                    )
+                    if self.last_scan_timings.wait_reason == "NONE":
+                        self.last_scan_timings.wait_reason = (
+                            "NO_VERIFIABLE_ROW_EVIDENCE"
+                        )
                     raise UiReadError(timeout_code)
             return scan
 
