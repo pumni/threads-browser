@@ -39,6 +39,17 @@ _MAX_BODY_CODEPOINTS = 10_000
 _MAX_CARD_ANCESTORS = 8
 _MAX_CARD_LINKS = 40
 _MAX_PERMALINK_CANDIDATES = 40
+_MAX_FEED_ROOTS_PER_TYPE = 40
+_MAX_STRUCTURE_ELEMENTS = 200
+_UNSUPPORTED_CONFIRMATION_SCANS = 3
+_FEED_ROOT_SELECTOR = 'article, [role="article"], [data-pressable-container="true"]'
+_BODY_TEXT_SELECTOR = 'p, span[dir="auto"], div[dir="auto"]'
+_BODY_EXCLUSION_SELECTOR = (
+    'a, button, time, [role="button"], [role="link"], [aria-hidden="true"], '
+    'nav, aside, footer, form, [role="navigation"], [role="menu"], '
+    '[role="complementary"], [role="dialog"], [role="search"], '
+    '[role="textbox"], [contenteditable="true"], blockquote, [role="quote"]'
+)
 _USERNAME = re.compile(r"[A-Za-z0-9._]{1,30}")
 _POST_PATH = re.compile(r"/@(?P<author>[A-Za-z0-9._]{1,30})/post/(?P<post>[A-Za-z0-9_-]{1,120})")
 _PROFILE_PATH = re.compile(r"/@(?P<author>[A-Za-z0-9._]{1,30})/?")
@@ -150,6 +161,14 @@ class HomeSample:
 class _FeedScanCounts:
     visible_links: int = 0
     inspected: int = 0
+    article_roots: int = 0
+    pressable_roots: int = 0
+    visible_times: int = 0
+    profile_anchor_candidates: int = 0
+    visible_anchors: int = 0
+    visible_post_links: int = 0
+    body_candidates: int = 0
+    paragraph_candidates: int = 0
     url_parsed: int = 0
     author_unverified: int = 0
     wrapper_ambiguous: int = 0
@@ -159,6 +178,21 @@ class _FeedScanCounts:
     body_unknown: int = 0
     skipped: int = 0
     rejection_reasons: dict[str, int] = field(default_factory=dict)
+    structural_reasons: dict[str, int] = field(default_factory=dict)
+    unsupported_roots: int = 0
+    region_status: str = "UNSET"
+    scroll_surface_status: str = "NOT_CHECKED"
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateStructure:
+    visible_anchors: int = 0
+    visible_post_links: int = 0
+    canonical_post_links: int = 0
+    profile_anchor_candidates: int = 0
+    visible_times: int = 0
+    body_candidates: int = 0
+    paragraph_candidates: int = 0
 
 
 def normalize_text(value: str) -> str:
@@ -832,6 +866,7 @@ class ThreadsHomeReader:
 
         async def attempt(window_deadline: float) -> tuple[tuple[PostTarget, ...], dict[str, float]]:
             self.last_scan_counts = _FeedScanCounts()
+            unsupported_scans = 0
             while True:
                 self._remaining_readiness_ms(window_deadline, timeout_code)
                 await self._wait_for_verified_feed(
@@ -865,6 +900,22 @@ class ThreadsHomeReader:
                         timeout_code=timeout_code,
                     )
                     return (), {}
+                if self.last_scan_counts.unsupported_roots:
+                    unsupported_scans += 1
+                    if unsupported_scans >= _UNSUPPORTED_CONFIRMATION_SCANS:
+                        raise UiReadError("FEED_VISIBLE_UNSUPPORTED")
+                    await self._wait_for_pending_card(
+                        _CardNotReady(
+                            self._page.locator("body"),
+                            condition="mutation",
+                        ),
+                        min(
+                            window_deadline,
+                            time.monotonic()
+                            + _READINESS_RECHECK_INTERVAL_MS / 1000,
+                        ),
+                    )
+                    continue
                 pending = await self._feed_readiness_signals()
                 if not pending:
                     pending = _CardNotReady(
@@ -883,38 +934,41 @@ class ThreadsHomeReader:
                 attempt,
             )
         except UiReadError as error:
-            if error.code == timeout_code:
+            if error.code in {timeout_code, "FEED_VISIBLE_UNSUPPORTED"}:
                 print(f"STOP stage={stage_name} code={error.code}")
             raise
 
     async def _feed_readiness_signals(self) -> _CardNotReady | None:
         signals: list[_CardWaitSignal] = []
         viewport = self._page.viewport_size
-        articles = self._page.get_by_role("article")
-        article_count = await articles.count()
-        for index in range(min(article_count, _MAX_PERMALINK_CANDIDATES)):
-            article = articles.nth(index)
-            if await self._is_outside_content_landmark(article):
-                continue
-            box = await article.bounding_box()
-            if viewport is None or box is None or not self._intersects_viewport(box, viewport):
-                signals.append(_CardWaitSignal(article, "in_viewport"))
-
-        if article_count == 0:
-            region = await self._content_region()
-            permalinks = region.locator('a[href*="/post/"]')
-            count = await permalinks.count()
-            for index in range(min(count, _MAX_PERMALINK_CANDIDATES)):
-                permalink = permalinks.nth(index)
-                if await self._is_outside_content_landmark(permalink):
+        region = await self._content_region()
+        for selector in (
+            'article, [role="article"]:not(article)',
+            '[data-pressable-container="true"]:not(article):not([role="article"])',
+        ):
+            roots = region.locator(selector)
+            for index in range(min(await roots.count(), _MAX_FEED_ROOTS_PER_TYPE)):
+                root = roots.nth(index)
+                if not await root.is_visible():
                     continue
-                box = await permalink.bounding_box()
-                if (
-                    viewport is None
-                    or box is None
-                    or not self._intersects_viewport(box, viewport)
-                ):
-                    signals.append(_CardWaitSignal(permalink, "in_viewport"))
+                if await self._is_outside_content_landmark(root):
+                    continue
+                if await self._is_nested_feed_root(root):
+                    continue
+                box = await root.bounding_box()
+                if viewport is None or box is None or not self._intersects_viewport(box, viewport):
+                    signals.append(_CardWaitSignal(root, "in_viewport"))
+
+        permalinks = region.locator('a[href*="/post/"]')
+        for index in range(min(await permalinks.count(), _MAX_PERMALINK_CANDIDATES)):
+            permalink = permalinks.nth(index)
+            if await self._is_outside_content_landmark(permalink):
+                continue
+            if await self._is_nested_feed_content(permalink):
+                continue
+            box = await permalink.bounding_box()
+            if viewport is None or box is None or not self._intersects_viewport(box, viewport):
+                signals.append(_CardWaitSignal(permalink, "in_viewport"))
 
         if not signals:
             return None
@@ -986,51 +1040,35 @@ class ThreadsHomeReader:
         viewport = self._page.viewport_size
         if viewport is None:
             return False
-        articles = self._page.get_by_role("article")
-        for index in range(min(await articles.count(), _MAX_PERMALINK_CANDIDATES)):
-            article = articles.nth(index)
-            if not await article.is_visible():
-                continue
-            if await self._is_outside_content_landmark(article):
-                continue
-            links = article.locator('a[href*="/post/"]')
-            for link_index in range(await links.count()):
-                permalink = links.nth(link_index)
-                if not await permalink.is_visible():
-                    continue
-                box = await permalink.bounding_box()
-                if box is not None and self._intersects_viewport(box, viewport):
-                    return True
         region = await self._content_region()
         permalinks = region.locator('a[href*="/post/"]')
         for index in range(min(await permalinks.count(), _MAX_PERMALINK_CANDIDATES)):
             permalink = permalinks.nth(index)
-            if not await permalink.is_visible():
-                continue
             if await self._is_outside_content_landmark(permalink):
                 continue
-            box = await permalink.bounding_box()
-            if box is not None and self._intersects_viewport(box, viewport):
+            if await self._is_nested_feed_content(permalink):
+                continue
+            if not await self._is_in_viewport(permalink, viewport):
+                continue
+            href = await permalink.get_attribute("href")
+            if href is None:
+                continue
+            if _post_url(href) is not None:
+                return True
+            root = permalink.locator(
+                "xpath=ancestor::*[self::article or @role='article' "
+                "or @data-pressable-container='true'][1]"
+            )
+            if await root.count() == 0 or await self._is_nested_feed_root(root):
+                continue
+            structure = await self._inspect_candidate_root(root, viewport)
+            if (
+                structure.visible_times
+                and structure.profile_anchor_candidates
+                and structure.body_candidates
+            ):
                 return True
         return False
-
-    async def _count_visible_permalink_links(self) -> int:
-        viewport = self._page.viewport_size
-        if viewport is None:
-            return 0
-        region = await self._content_region()
-        permalinks = region.locator('a[href*="/post/"]')
-        count = 0
-        for index in range(min(await permalinks.count(), _MAX_PERMALINK_CANDIDATES)):
-            permalink = permalinks.nth(index)
-            if not await permalink.is_visible():
-                continue
-            if await self._is_outside_content_landmark(permalink):
-                continue
-            box = await permalink.bounding_box()
-            if box is not None and self._intersects_viewport(box, viewport):
-                count += 1
-        return count
 
     async def _safe_feed_scroll_point(
         self,
@@ -1092,10 +1130,12 @@ class ThreadsHomeReader:
 
     async def _scroll_surface(self) -> JSHandle:
         if not await self._visible_feed_evidence():
+            self.last_scan_counts.scroll_surface_status = "UNVERIFIED"
             raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
         region = await self._content_region()
         region_handle = await region.element_handle()
         if region_handle is None:
+            self.last_scan_counts.scroll_surface_status = "UNVERIFIED"
             raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
         try:
             surface = await self._page.evaluate_handle(
@@ -1105,7 +1145,8 @@ class ThreadsHomeReader:
                     if (!link.isConnected || link.closest(
                         "nav, aside, footer, [role='navigation'], [role='menu'], " +
                         "[role='complementary'], [role='dialog'], [role='search'], " +
-                        "[role='banner'], [role='contentinfo']"
+                        "[role='banner'], [role='contentinfo'], form, " +
+                        "[contenteditable='true'], [role='textbox']"
                     )) return false;
                     const style = window.getComputedStyle(link);
                     const rect = link.getBoundingClientRect();
@@ -1149,7 +1190,9 @@ class ThreadsHomeReader:
             await region_handle.dispose()
         if await surface.evaluate("element => element === null"):
             await surface.dispose()
+            self.last_scan_counts.scroll_surface_status = "UNVERIFIED"
             raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
+        self.last_scan_counts.scroll_surface_status = "VALIDATED"
         return surface
 
     async def _watch_scroll_completion(
@@ -1235,63 +1278,66 @@ class ThreadsHomeReader:
         prefer_new_fingerprints: set[str] | None = None,
         stage: str = "FEED",
     ) -> tuple[tuple[PostTarget, ...], dict[str, float] | None]:
-        articles = self._page.get_by_role("article")
         viewport = self._page.viewport_size
         if viewport is None:
             raise UiReadError("FEED_VIEWPORT_UNVERIFIED")
+        counts = self.last_scan_counts
+        counts.visible_links = 0
+        counts.inspected = 0
+        counts.article_roots = 0
+        counts.pressable_roots = 0
+        counts.visible_times = 0
+        counts.profile_anchor_candidates = 0
+        counts.visible_anchors = 0
+        counts.visible_post_links = 0
+        counts.body_candidates = 0
+        counts.paragraph_candidates = 0
+        counts.url_parsed = 0
+        counts.card_not_ready = 0
+        counts.verified = 0
+        counts.body_read = 0
+        counts.body_unknown = 0
+        counts.skipped = 0
+        counts.rejection_reasons.clear()
+        counts.unsupported_roots = 0
+        counts.region_status = "UNSET"
+        counts.scroll_surface_status = "NOT_CHECKED"
+        counts.structural_reasons.clear()
+        region = await self._content_region()
+        roots = await self._top_level_candidate_roots(region, viewport)
+        structures = await self._collect_structure_diagnostics(
+            region,
+            roots,
+            viewport,
+        )
         targets: list[PostTarget] = []
         scroll_anchor: dict[str, float] | None = None
-        article_count = await articles.count()
-        self.last_scan_counts.visible_links = await self._count_visible_permalink_links()
-        if article_count == 0:
-            return await self._visible_permalink_targets(
-                max_posts,
-                currently_visible=currently_visible,
-                prefer_new_fingerprints=prefer_new_fingerprints,
-                stage=stage,
-            )
-        scan_limit = min(article_count, min(max_posts + 20, _MAX_PERMALINK_CANDIDATES))
         pending_cards: list[_CardNotReady] = []
         scanned_fingerprints: set[str] = set()
-        for index in range(scan_limit):
-            article = articles.nth(index)
-            if not await article.is_visible():
+        root_limit = min(len(roots), _MAX_FEED_ROOTS_PER_TYPE * 2)
+        for index in range(root_limit):
+            root = roots[index]
+            structure = structures[index]
+            box = await root.bounding_box()
+            if box is None:
                 continue
-            box = await article.bounding_box()
             if (
-                box is None
-                or box["x"] >= viewport["width"]
-                or box["y"] >= viewport["height"]
-                or box["x"] + box["width"] <= 0
-                or box["y"] + box["height"] <= 0
+                structure.visible_times
+                and structure.profile_anchor_candidates
+                and structure.body_candidates
+                and not structure.visible_post_links
             ):
+                counts.inspected += 1
                 continue
-            if currently_visible:
-                permalinks = article.locator('a[href*="/post/"]')
-                permalink_count = await permalinks.count()
-                visible_permalink = False
-                for link_index in range(permalink_count):
-                    permalink = permalinks.nth(link_index)
-                    if not await permalink.is_visible():
-                        continue
-                    permalink_box = await permalink.bounding_box()
-                    if (
-                        permalink_box is not None
-                        and self._intersects_viewport(permalink_box, viewport)
-                    ):
-                        visible_permalink = True
-                        break
-                if permalink_count and not visible_permalink:
-                    continue
-            self.last_scan_counts.inspected += 1
+            counts.inspected += 1
             try:
                 target = await self._read_card(
-                    article,
+                    root,
                     currently_visible=currently_visible,
                     viewport_y=box["y"],
                 )
             except _CardNotReady as pending:
-                self.last_scan_counts.card_not_ready += 1
+                counts.card_not_ready += 1
                 pending_cards.append(pending)
                 continue
             except _UnverifiedFeedCandidate as error:
@@ -1304,11 +1350,12 @@ class ThreadsHomeReader:
                     or not self._intersects_viewport(permalink_box, viewport)
                 ):
                     continue
-            self.last_scan_counts.verified += 1
+            counts.verified += 1
             if target.body and target.body.strip():
-                self.last_scan_counts.body_read += 1
+                counts.body_read += 1
             else:
-                self.last_scan_counts.body_unknown += 1
+                counts.body_unknown += 1
+                self._record_structure_reason("POST_BODY_STRUCTURE_UNSUPPORTED")
             if (
                 target.fingerprint in scanned_fingerprints
                 or (
@@ -1324,10 +1371,32 @@ class ThreadsHomeReader:
                 scroll_anchor = box
             if len(targets) >= max_posts:
                 break
+
+        remaining = max_posts - len(targets)
+        if remaining > 0:
+            prefer_new = set(prefer_new_fingerprints or ()) | {
+                target.fingerprint for target in targets
+            }
+            permalink_targets, permalink_anchor = await self._visible_permalink_targets(
+                remaining,
+                currently_visible=currently_visible,
+                prefer_new_fingerprints=prefer_new,
+                stage=stage,
+            )
+            for target in permalink_targets:
+                if target.fingerprint in scanned_fingerprints:
+                    continue
+                scanned_fingerprints.add(target.fingerprint)
+                targets.append(target)
+                if scroll_anchor is None:
+                    scroll_anchor = permalink_anchor
+                if len(targets) >= max_posts:
+                    break
         if (
             not targets
             and pending_cards
-            and self.last_scan_counts.skipped == 0
+            and counts.skipped == 0
+            and counts.unsupported_roots == 0
         ):
             raise _CardNotReady.combine(pending_cards)
         return tuple(targets), scroll_anchor
@@ -1344,6 +1413,338 @@ class ThreadsHomeReader:
             and box["y"] + box["height"] > 0
         )
 
+    async def _is_in_viewport(
+        self,
+        element: Locator,
+        viewport: dict[str, int],
+    ) -> bool:
+        if not await element.is_visible():
+            return False
+        box = await element.bounding_box()
+        return box is not None and self._intersects_viewport(box, viewport)
+
+    async def _is_nested_feed_root(self, root: Locator) -> bool:
+        return bool(
+            await root.evaluate(
+                "(node, selector) => Boolean(node.parentElement?.closest(selector))",
+                _FEED_ROOT_SELECTOR,
+            )
+        )
+
+    async def _is_nested_feed_content(self, element: Locator) -> bool:
+        return bool(
+            await element.evaluate(
+                """(node, selector) => {
+                    const nearest = node.parentElement?.closest(selector);
+                    return Boolean(nearest?.parentElement?.closest(selector));
+                }""",
+                _FEED_ROOT_SELECTOR,
+            )
+        )
+
+    async def _belongs_to_card(
+        self,
+        element: Locator,
+        root: Locator,
+        root_handle: JSHandle,
+    ) -> bool:
+        return bool(
+            await element.evaluate(
+                """(node, args) => {
+                    const nearest = node.parentElement?.closest(args.selector);
+                    if (args.root.matches(args.selector)) {
+                        return nearest === args.root;
+                    }
+                    return args.root.contains(node) && nearest === null;
+                }""",
+                {"selector": _FEED_ROOT_SELECTOR, "root": root_handle},
+            )
+        )
+
+    async def _safe_body_candidate(
+        self,
+        element: Locator,
+        root: Locator,
+        root_handle: JSHandle,
+    ) -> bool:
+        return bool(
+            await element.evaluate(
+                """(node, args) => {
+                    const excluded = args.excluded;
+                    let current = node;
+                    while (current && current !== args.root) {
+                        if (current.matches(excluded)) return false;
+                        current = current.parentElement;
+                    }
+                    if (current !== args.root) return false;
+                    const nearestRoot = node.parentElement?.closest(args.roots);
+                    if (args.root.matches(args.roots)) {
+                        if (nearestRoot !== args.root) return false;
+                    } else if (!args.root.contains(node) || nearestRoot) {
+                        return false;
+                    }
+                    return !node.querySelector(
+                        `${excluded}, ${args.roots}`
+                    );
+                }""",
+                {
+                    "root": root_handle,
+                    "roots": _FEED_ROOT_SELECTOR,
+                    "excluded": _BODY_EXCLUSION_SELECTOR,
+                },
+            )
+        )
+
+    async def _safe_unscoped_text_candidate(self, element: Locator) -> bool:
+        if await self._is_outside_content_landmark(element):
+            return False
+        if await self._is_nested_feed_content(element):
+            return False
+        return bool(
+            await element.evaluate(
+                """(node, excluded) => {
+                    let current = node;
+                    while (current) {
+                        if (current.matches(excluded)) return false;
+                        current = current.parentElement;
+                    }
+                    return !node.querySelector(excluded);
+                }""",
+                _BODY_EXCLUSION_SELECTOR,
+            )
+        )
+
+    @staticmethod
+    def _profile_anchor_candidate(value: str) -> bool:
+        return _profile_author(value) is not None
+
+    async def _top_level_candidate_roots(
+        self,
+        region: Locator,
+        viewport: dict[str, int],
+    ) -> list[Locator]:
+        candidates: list[tuple[float, Locator]] = []
+        selectors = (
+            'article, [role="article"]:not(article)',
+            '[data-pressable-container="true"]:not(article):not([role="article"])',
+        )
+        for selector in selectors:
+            roots = region.locator(selector)
+            count = min(await roots.count(), _MAX_FEED_ROOTS_PER_TYPE)
+            for index in range(count):
+                root = roots.nth(index)
+                if not await root.is_visible():
+                    continue
+                if await self._is_outside_content_landmark(root):
+                    continue
+                box = await root.bounding_box()
+                if box is None or not self._intersects_viewport(box, viewport):
+                    continue
+                if await self._is_nested_feed_root(root):
+                    continue
+                candidates.append((box["y"], root))
+        candidates.sort(key=lambda item: item[0])
+        return [root for _, root in candidates]
+
+    async def _inspect_candidate_root(
+        self,
+        root: Locator,
+        viewport: dict[str, int],
+    ) -> _CandidateStructure:
+        root_handle = await root.element_handle()
+        if root_handle is None:
+            return _CandidateStructure()
+        visible_anchors = 0
+        visible_post_links = 0
+        canonical_post_links = 0
+        profile_anchor_candidates = 0
+        anchors = root.locator("a")
+        anchor_count = min(await anchors.count(), _MAX_CARD_LINKS)
+        for index in range(anchor_count):
+            anchor = anchors.nth(index)
+            if not await self._belongs_to_card(anchor, root, root_handle):
+                continue
+            if await self._is_outside_content_landmark(anchor):
+                continue
+            if not await self._is_in_viewport(anchor, viewport):
+                continue
+            visible_anchors += 1
+            href = await anchor.get_attribute("href")
+            if href is None:
+                continue
+            if "/post/" in href:
+                visible_post_links += 1
+                if _post_url(href) is not None:
+                    canonical_post_links += 1
+            if self._profile_anchor_candidate(href):
+                profile_anchor_candidates += 1
+
+        times = root.locator("time")
+        visible_times = 0
+        for index in range(min(await times.count(), _MAX_CARD_LINKS)):
+            node = times.nth(index)
+            if (
+                await self._belongs_to_card(node, root, root_handle)
+                and not await self._is_outside_content_landmark(node)
+                and await self._is_in_viewport(node, viewport)
+            ):
+                visible_times += 1
+
+        body_nodes = root.locator(_BODY_TEXT_SELECTOR)
+        body_candidates = 0
+        paragraph_candidates = 0
+        for index in range(min(await body_nodes.count(), _MAX_STRUCTURE_ELEMENTS)):
+            node = body_nodes.nth(index)
+            if not await self._safe_body_candidate(node, root, root_handle):
+                continue
+            if not await self._is_in_viewport(node, viewport):
+                continue
+            body_candidates += 1
+            if await node.evaluate("element => element.tagName === 'P'"):
+                paragraph_candidates += 1
+        return _CandidateStructure(
+            visible_anchors=visible_anchors,
+            visible_post_links=visible_post_links,
+            canonical_post_links=canonical_post_links,
+            profile_anchor_candidates=profile_anchor_candidates,
+            visible_times=visible_times,
+            body_candidates=body_candidates,
+            paragraph_candidates=paragraph_candidates,
+        )
+
+    def _record_structure_reason(self, reason: str) -> None:
+        counts = self.last_scan_counts
+        counts.structural_reasons[reason] = counts.structural_reasons.get(reason, 0) + 1
+
+    async def _collect_structure_diagnostics(
+        self,
+        region: Locator,
+        roots: list[Locator],
+        viewport: dict[str, int],
+    ) -> dict[int, _CandidateStructure]:
+        counts = self.last_scan_counts
+        structures: dict[int, _CandidateStructure] = {}
+        for index, root in enumerate(roots):
+            is_semantic = bool(
+                await root.evaluate(
+                    "node => node.matches('article, [role=\"article\"]')"
+                )
+            )
+            is_pressable = await root.get_attribute("data-pressable-container") == "true"
+            counts.article_roots += int(is_semantic)
+            counts.pressable_roots += int(is_pressable)
+            structure = await self._inspect_candidate_root(root, viewport)
+            structures[index] = structure
+            counts.visible_anchors += structure.visible_anchors
+            counts.visible_post_links += structure.visible_post_links
+            counts.url_parsed += structure.canonical_post_links
+            counts.profile_anchor_candidates += structure.profile_anchor_candidates
+            counts.visible_times += structure.visible_times
+            counts.body_candidates += structure.body_candidates
+            counts.paragraph_candidates += structure.paragraph_candidates
+            feed_row_evidence = (
+                structure.visible_times
+                and structure.body_candidates
+                and (
+                    structure.profile_anchor_candidates
+                    or structure.visible_post_links
+                )
+            )
+            safe_malformed_feed_evidence = (
+                structure.visible_times
+                and structure.profile_anchor_candidates
+                and structure.body_candidates
+                and structure.visible_post_links
+                and not structure.canonical_post_links
+            )
+            if feed_row_evidence and not structure.canonical_post_links:
+                if safe_malformed_feed_evidence:
+                    self._record_structure_reason("POST_ROOT_UNRESOLVED")
+                else:
+                    counts.unsupported_roots += 1
+                    self._record_structure_reason("FEED_VISIBLE_NO_PERMALINK")
+            elif (
+                structure.visible_post_links and not structure.canonical_post_links
+            ) or (
+                structure.canonical_post_links
+                and not structure.profile_anchor_candidates
+            ):
+                self._record_structure_reason("POST_ROOT_UNRESOLVED")
+
+        anchors = region.locator("a")
+        for index in range(min(await anchors.count(), _MAX_STRUCTURE_ELEMENTS)):
+            anchor = anchors.nth(index)
+            if await self._is_outside_content_landmark(anchor):
+                continue
+            if await self._is_nested_feed_content(anchor):
+                continue
+            if await anchor.evaluate(
+                "(node, selector) => Boolean(node.parentElement?.closest(selector))",
+                _FEED_ROOT_SELECTOR,
+            ):
+                continue
+            if not await self._is_in_viewport(anchor, viewport):
+                continue
+            counts.visible_anchors += 1
+            href = await anchor.get_attribute("href")
+            if href is None:
+                continue
+            if "/post/" in href:
+                counts.visible_post_links += 1
+                if _post_url(href) is not None:
+                    counts.url_parsed += 1
+            if self._profile_anchor_candidate(href):
+                counts.profile_anchor_candidates += 1
+
+        times = region.locator("time")
+        for index in range(min(await times.count(), _MAX_STRUCTURE_ELEMENTS)):
+            node = times.nth(index)
+            if await self._is_nested_feed_content(node):
+                continue
+            if await node.evaluate(
+                "(element, selector) => Boolean(element.parentElement?.closest(selector))",
+                _FEED_ROOT_SELECTOR,
+            ):
+                continue
+            if not await self._is_outside_content_landmark(node) and await self._is_in_viewport(
+                node,
+                viewport,
+            ):
+                counts.visible_times += 1
+
+        body_nodes = region.locator(_BODY_TEXT_SELECTOR)
+        paragraphs = region.locator("p")
+        for index in range(min(await paragraphs.count(), _MAX_STRUCTURE_ELEMENTS)):
+            node = paragraphs.nth(index)
+            if await self._is_nested_feed_content(node):
+                continue
+            if await node.evaluate(
+                "(element, selector) => Boolean(element.parentElement?.closest(selector))",
+                _FEED_ROOT_SELECTOR,
+            ):
+                continue
+            if (
+                await self._safe_unscoped_text_candidate(node)
+                and await self._is_in_viewport(node, viewport)
+            ):
+                counts.paragraph_candidates += 1
+        for index in range(min(await body_nodes.count(), _MAX_STRUCTURE_ELEMENTS)):
+            node = body_nodes.nth(index)
+            if await self._is_nested_feed_content(node):
+                continue
+            if await node.evaluate(
+                "(element, selector) => Boolean(element.parentElement?.closest(selector))",
+                _FEED_ROOT_SELECTOR,
+            ):
+                continue
+            if (
+                await self._safe_unscoped_text_candidate(node)
+                and await self._is_in_viewport(node, viewport)
+            ):
+                counts.body_candidates += 1
+        counts.visible_links = counts.visible_post_links
+        return structures
+
     async def _content_region(
         self,
         *,
@@ -1359,18 +1760,22 @@ class ThreadsHomeReader:
                 if await landmark.is_visible():
                     visible.append(landmark)
             if len(visible) > 1:
+                self.last_scan_counts.region_status = "AMBIGUOUS"
                 raise UiReadError(error_code)
             if visible:
+                self.last_scan_counts.region_status = "LANDMARK"
                 return visible[0]
+        self.last_scan_counts.region_status = "BODY_FALLBACK"
         return self._page.locator("body")
 
     @staticmethod
     async def _is_outside_content_landmark(link: Locator) -> bool:
         excluded = link.locator(
             "xpath=ancestor-or-self::*[self::nav or self::aside or self::footer "
+            "or self::form or @contenteditable='true' "
             "or @role='navigation' or @role='menu' or @role='complementary' "
             "or @role='dialog' or @role='search' or @role='banner' "
-            "or @role='contentinfo']"
+            "or @role='contentinfo' or @role='textbox']"
         )
         return await excluded.count() > 0
 
@@ -1380,6 +1785,23 @@ class ThreadsHomeReader:
         expected_url: str,
         expected_author: str,
     ) -> tuple[Locator, dict[str, float]]:
+        if await self._is_nested_feed_content(permalink):
+            raise _UnverifiedFeedCandidate(
+                "POST_PROVENANCE_UNVERIFIED",
+                "CANDIDATE_AMBIGUOUS",
+                (expected_url,),
+                diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
+            )
+        candidate_root = permalink.locator(
+            "xpath=ancestor::*[self::article or @role='article' "
+            "or @data-pressable-container='true'][1]"
+        )
+        if await candidate_root.count() and not await self._is_nested_feed_root(
+            candidate_root
+        ):
+            box = await candidate_root.bounding_box()
+            if box is not None:
+                return candidate_root, box
         ancestor = permalink
         smallest_without_body: tuple[Locator, dict[str, float]] | None = None
         pending_author: Locator | None = None
@@ -1395,7 +1817,7 @@ class ThreadsHomeReader:
             if not await ancestor.is_visible():
                 continue
 
-            links = ancestor.get_by_role("link")
+            links = ancestor.locator("a")
             link_count = await links.count()
             if link_count > _MAX_CARD_LINKS:
                 raise _UnverifiedFeedCandidate(
@@ -1408,7 +1830,11 @@ class ThreadsHomeReader:
             authors: set[str] = set()
             for index in range(link_count):
                 link = links.nth(index)
-                if await self._is_outside_content_landmark(link):
+                if (
+                    await self._is_outside_content_landmark(link)
+                    or await self._is_nested_feed_content(link)
+                    or not await link.is_visible()
+                ):
                     continue
                 href = await link.get_attribute("href")
                 if href is None:
@@ -1522,6 +1948,13 @@ class ThreadsHomeReader:
                 continue
             if await self._is_outside_content_landmark(permalink):
                 continue
+            if await self._is_nested_feed_content(permalink):
+                continue
+            if await permalink.evaluate(
+                "(node, selector) => Boolean(node.parentElement?.closest(selector))",
+                _FEED_ROOT_SELECTOR,
+            ):
+                continue
             permalink_box = await permalink.bounding_box()
             if permalink_box is None or not self._intersects_viewport(permalink_box, viewport):
                 continue
@@ -1540,7 +1973,6 @@ class ThreadsHomeReader:
                         ),
                     )
                 continue
-            self.last_scan_counts.url_parsed += 1
             if parsed_post[0] in targets_by_url:
                 self.feed_duplicates += 1
                 continue
@@ -1557,7 +1989,6 @@ class ThreadsHomeReader:
                     root,
                     currently_visible=currently_visible,
                     viewport_y=box["y"],
-                    count_url_parses=False,
                 )
             except _CardNotReady as pending:
                 self.last_scan_counts.card_not_ready += 1
@@ -1582,6 +2013,7 @@ class ThreadsHomeReader:
                 self.last_scan_counts.body_read += 1
             else:
                 self.last_scan_counts.body_unknown += 1
+                self._record_structure_reason("POST_BODY_STRUCTURE_UNSUPPORTED")
             if (
                 target.fingerprint in scanned_fingerprints
                 or (
@@ -1603,6 +2035,7 @@ class ThreadsHomeReader:
             not targets_by_url
             and pending_cards
             and self.last_scan_counts.skipped == 0
+            and self.last_scan_counts.unsupported_roots == 0
         ):
             raise _CardNotReady.combine(pending_cards)
         targets = [
@@ -1924,27 +2357,110 @@ class ThreadsHomeReader:
             for marker in ("rate limit", "too many requests", "try again later", "temporarily blocked")
         ):
             raise UiReadError("RATE_LIMITED")
+    async def _extract_card_body(
+        self,
+        root: Locator,
+        root_handle: JSHandle,
+        *,
+        require_body: bool,
+    ) -> str | None:
+        buttons = root.get_by_role("button", name=_MORE_NAME)
+        for index in range(min(await buttons.count(), _MAX_CARD_LINKS)):
+            button = buttons.nth(index)
+            if await self._belongs_to_card(button, root, root_handle) and await button.is_visible():
+                return None
+
+        candidates = root.locator(_BODY_TEXT_SELECTOR)
+        bodies: list[str] = []
+        body_is_auto: list[bool] = []
+        count = min(await candidates.count(), _MAX_STRUCTURE_ELEMENTS)
+        for index in range(count):
+            candidate = candidates.nth(index)
+            if not await self._safe_body_candidate(candidate, root, root_handle):
+                continue
+            if not await candidate.is_visible():
+                continue
+            has_body_candidate_ancestor = await candidate.evaluate(
+                """(node, args) => {
+                    let current = node.parentElement;
+                    while (current && current !== args.root) {
+                        if (current.matches(args.body)) return true;
+                        current = current.parentElement;
+                    }
+                    return current !== args.root;
+                }""",
+                {"root": root_handle, "body": _BODY_TEXT_SELECTOR},
+            )
+            if has_body_candidate_ancestor:
+                continue
+            text = (await candidate.inner_text()).strip()
+            if not text:
+                continue
+            bodies.append(text)
+            body_is_auto.append(
+                bool(
+                    await candidate.evaluate(
+                        "element => element.matches('span[dir=\"auto\"], div[dir=\"auto\"]')"
+                    )
+                )
+            )
+
+        if not bodies:
+            if require_body:
+                raise _CardNotReady(
+                    candidates.first,
+                    nonempty_text=True,
+                    timeout_code="DETAIL_BODY_UNVERIFIED",
+                )
+            return None
+        if len(bodies) > 1 and not all(body_is_auto):
+            return None
+        body = "\n".join(bodies)
+        if len(body) > _MAX_BODY_CODEPOINTS:
+            if require_body:
+                raise _CardNotReady(
+                    candidates.first,
+                    nonempty_text=True,
+                    timeout_code="DETAIL_BODY_UNVERIFIED",
+                )
+            return None
+        return body
+
     async def _read_card(
         self,
-        article: Locator,
+        root: Locator,
         *,
         currently_visible: bool = False,
         viewport_y: float = 0.0,
         require_body: bool = False,
-        count_url_parses: bool = True,
     ) -> PostTarget:
-        if not await article.is_visible():
-            raise _CardNotReady(article)
+        if not await root.is_visible():
+            raise _CardNotReady(root)
+        root_handle = await root.element_handle()
+        if root_handle is None:
+            raise _CardNotReady(root)
         post_links: list[tuple[str, str, Locator]] = []
         authors: set[str] = set()
-        for link in await article.get_by_role("link").all():
+        links = root.locator("a")
+        link_count = await links.count()
+        if link_count > _MAX_CARD_LINKS:
+            raise _UnverifiedFeedCandidate(
+                "POST_PROVENANCE_UNVERIFIED",
+                "CANDIDATE_AMBIGUOUS",
+                (),
+                diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
+            )
+        for index in range(link_count):
+            link = links.nth(index)
+            if not await self._belongs_to_card(link, root, root_handle):
+                continue
+            if await self._is_outside_content_landmark(link) or not await link.is_visible():
+                continue
             href = await link.get_attribute("href")
             if href is None:
                 continue
             parsed_post = _post_url(href)
             if parsed_post is not None:
-                if count_url_parses:
-                    self.last_scan_counts.url_parsed += 1
                 post_links.append((parsed_post[0], parsed_post[1], link))
                 continue
             if "/post/" in href:
@@ -1969,10 +2485,10 @@ class ThreadsHomeReader:
                 diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
             )
         if not post_links:
-            raise _CardNotReady(article, condition="mutation")
+            raise _CardNotReady(root, condition="mutation")
         if not authors:
             raise _CardNotReady(
-                self._expected_profile_link_signal(article, post_links[0][1])
+                self._expected_profile_link_signal(root, post_links[0][1])
             )
         if len(unique_urls) != 1 or len(unique_permalink_links) != 1:
             raise _UnverifiedFeedCandidate(
@@ -1991,38 +2507,11 @@ class ThreadsHomeReader:
                 diagnostic_reason="CANDIDATE_AUTHOR_MISMATCH",
             )
 
-        body: str | None = None
-        paragraphs = article.get_by_role("paragraph")
-        if await paragraphs.count() == 1:
-            paragraph = paragraphs.nth(0)
-            if await paragraph.is_visible():
-                candidate = (await paragraph.inner_text()).strip()
-                more_buttons = article.get_by_role("button", name=_MORE_NAME)
-                if (
-                    candidate
-                    and len(candidate) <= _MAX_BODY_CODEPOINTS
-                    and await more_buttons.count() == 0
-                ):
-                    body = candidate
-                elif require_body and not candidate:
-                    raise _CardNotReady(
-                        paragraph,
-                        nonempty_text=True,
-                        timeout_code="DETAIL_BODY_UNVERIFIED",
-                    )
-            elif require_body:
-                raise _CardNotReady(
-                    paragraph,
-                    nonempty_text=True,
-                    timeout_code="DETAIL_BODY_UNVERIFIED",
-                )
-        elif require_body and await paragraphs.count() == 0:
-            raise _CardNotReady(
-                paragraphs.first,
-                nonempty_text=True,
-                timeout_code="DETAIL_BODY_UNVERIFIED",
-            )
-        # Multiple paragraphs may include quoted or reposted text; keep them UNKNOWN.
+        body = await self._extract_card_body(
+            root,
+            root_handle,
+            require_body=require_body,
+        )
         fingerprint = sha256(f"{url}\n{author}".encode()).hexdigest()
         return PostTarget(
             url,

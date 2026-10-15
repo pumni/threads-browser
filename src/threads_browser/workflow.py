@@ -14,6 +14,7 @@ from playwright.async_api import Page, async_playwright
 from .reader import (
     ThreadsHomeReader,
     UiReadError,
+    _FeedScanCounts,
     canonical_terms,
     classify_body,
 )
@@ -65,6 +66,25 @@ def _print_post_text(viewport: int, decision: str, body: str | None) -> bool:
         print(f"| {line}")
     print("<<< POST TEXT END >>>")
     return True
+
+
+def _format_structure_diagnostics(counts: _FeedScanCounts) -> str:
+    structural_reasons = ",".join(
+        f"{reason}:{count}"
+        for reason, count in sorted(counts.structural_reasons.items())
+    ) or "none"
+    return (
+        f"article_roots={counts.article_roots} "
+        f"pressable_roots={counts.pressable_roots} "
+        f"time_nodes={counts.visible_times} "
+        f"profile_anchor_candidates={counts.profile_anchor_candidates} "
+        f"anchors={counts.visible_anchors} post_links={counts.visible_post_links} "
+        f"body_candidates={counts.body_candidates} "
+        f"paragraph_candidates={counts.paragraph_candidates} "
+        f"region={counts.region_status} "
+        f"scroll_surface={counts.scroll_surface_status} "
+        f"structural_reasons={structural_reasons}"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,7 +177,8 @@ async def run_page_workflow(
                 f"card_not_ready={counts.card_not_ready} "
                 f"verified={counts.verified} body_read={counts.body_read} "
                 f"body_unknown={counts.body_unknown} classified=0 relevant=0 "
-                f"skipped={counts.skipped} rejection_reasons={rejection_reasons}"
+                f"skipped={counts.skipped} rejection_reasons={rejection_reasons} "
+                f"{_format_structure_diagnostics(counts)}"
             )
             raise
         duplicates += reader.feed_duplicates - duplicate_count_before_scan
@@ -223,6 +244,8 @@ async def run_page_workflow(
                 )
                 or "none"
             )
+            + " "
+            + _format_structure_diagnostics(scan_counts)
         )
         if viewport_selected is not None:
             selected = viewport_selected

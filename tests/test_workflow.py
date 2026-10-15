@@ -106,6 +106,15 @@ def test_relevance_classifier_is_conservative() -> None:
     assert classify_body("   ", terms) == "UNKNOWN"
 
 
+def test_job_seeking_and_hiring_terms_are_literal_and_independent() -> None:
+    job_seeking = canonical_terms(("đang tìm việc",))
+    hiring = canonical_terms(("đang tuyển",))
+    assert classify_body("Tôi đang tìm việc kỹ sư", job_seeking) == "RELEVANT"
+    assert classify_body("Công ty đang tuyển kỹ sư", job_seeking) == "IRRELEVANT"
+    assert classify_body("Công ty đang tuyển kỹ sư", hiring) == "RELEVANT"
+    assert classify_body("Tôi đang tìm việc kỹ sư", hiring) == "IRRELEVANT"
+
+
 def test_offline_chromium_cli_reads_once_and_resumes_without_double_counting(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1838,9 +1847,13 @@ def test_noncanonical_first_viewport_can_advance_to_verified_relevant_post(
   <a aria-current="page" aria-label="For you" href="/">For you</a>
   <a aria-label="Profile" href="/@{actor}">Profile</a>
 </nav><main>
-<div class="post-card"><a href="{invalid_urls[0]}">Permalink A</a>
-  <a href="{invalid_urls[1]}">Permalink B</a><p>Hiring content must be skipped</p></div>
-<div class="post-card"><a href="/@candidate/post/later-valid"><time>1h</time></a>
+<div class="post-card" data-pressable-container="true">
+  <a href="{invalid_urls[0]}"><time>2h</time></a>
+  <a href="{invalid_urls[1]}">Permalink B</a>
+  <a href="/@candidate">@candidate</a><p>Hiring content must be skipped</p>
+</div>
+<div class="post-card" data-pressable-container="true">
+  <a href="/@candidate/post/later-valid"><time>1h</time></a>
   <a href="/@candidate">@candidate</a><p>{detail_body}</p></div>
 </main><script>
 window.addEventListener("wheel", event => {{
@@ -1882,7 +1895,7 @@ window.addEventListener("wheel", event => {{
         assert result.status == "COMPLETE"
         assert result.home_sampled == result.home_new == 1
         assert result.home_relevant == 1
-        assert result.skipped_unverified == 2
+        assert result.skipped_unverified == 1
         assert result.scroll_attempts == result.scrolls == 1
         assert result.detail_reads == 1
         assert await page.evaluate("sessionStorage.getItem('wheel-count')") == "1"
@@ -1891,12 +1904,12 @@ window.addEventListener("wheel", event => {{
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
     assert (
-        "SKIPPED stage=FEED_INITIAL reason=CANDIDATE_NONCANONICAL count=2 "
+        "SKIPPED stage=FEED_INITIAL reason=CANDIDATE_NONCANONICAL count=1 "
         "cause=POST_PATH_SHAPE_INVALID"
     ) in output
     assert (
-        "SCANNING viewport=1 verified=0 relevant=0 skipped=2 visible_links=2 "
-        "inspected=2 body_read=0 body_unknown=0 classified=0"
+        "SCANNING viewport=1 verified=0 relevant=0 skipped=1 visible_links=2 "
+        "inspected=1 body_read=0 body_unknown=0 classified=0"
     ) in output
     assert "STOP stage=FEED_SCROLL" not in output
     assert all(value not in output for value in (*invalid_urls, "Hiring content must be skipped"))
@@ -1938,19 +1951,19 @@ def test_noncanonical_link_reasons_are_aggregate_and_privacy_safe(
   <a aria-current="page" aria-label="For you" href="/">For you</a>
   <a aria-label="Profile" href="/@{actor}">Profile</a>
 </nav><main>
-<div class="post-card"><a href="/@candidate/post/query-id?token={private_values[0]}">Query</a>
+<div class="post-card" data-pressable-container="true"><a href="/@candidate/post/query-id?token={private_values[0]}">Query</a>
   <p>Hiring query body</p></div>
-<div class="post-card"><a href="/@candidate/post/fragment-id#{private_values[1]}">Fragment</a>
+<div class="post-card" data-pressable-container="true"><a href="/@candidate/post/fragment-id#{private_values[1]}">Fragment</a>
   <p>Hiring fragment body</p></div>
-<div class="post-card"><a href="https://{private_values[2]}/@candidate/post/{private_values[3]}">Origin</a>
+<div class="post-card" data-pressable-container="true"><a href="https://{private_values[2]}/@candidate/post/{private_values[3]}">Origin</a>
   <p>Hiring origin body</p></div>
-<div class="post-card"><a href="/@candidate/post/{private_values[4]}/extra">Path</a>
+<div class="post-card" data-pressable-container="true"><a href="/@candidate/post/{private_values[4]}/extra">Path</a>
   <p>Hiring path body</p></div>
-<div class="post-card"><a href="/@bad!author/post/{private_values[5]}">Author</a>
+<div class="post-card" data-pressable-container="true"><a href="/@bad!author/post/{private_values[5]}">Author</a>
   <p>Hiring author body</p></div>
-<div class="post-card"><a href="/@candidate/post/author-mismatch">Post</a>
+<div class="post-card" data-pressable-container="true"><a href="/@candidate/post/author-mismatch">Post</a>
   <a href="/@different.author">Author</a><p>{private_values[6]}</p></div>
-<div class="post-card"><a href="/@candidate/post/wrapper-one">Post one</a>
+<div class="post-card" data-pressable-container="true"><a href="/@candidate/post/wrapper-one">Post one</a>
   <a href="/@candidate/post/wrapper-two">Post two</a>
   <a href="/@candidate">Author</a><p>{private_values[7]}</p></div>
 </main></body></html>"""
@@ -1984,10 +1997,10 @@ def test_noncanonical_link_reasons_are_aggregate_and_privacy_safe(
     assert "cause=POST_AUTHOR_OR_ID_INVALID" in output
     assert "cause=CANDIDATE_AUTHOR_MISMATCH" in output
     assert "cause=CANDIDATE_WRAPPER_AMBIGUOUS" in output
-    assert "url_parsed=3 author_unverified=1 wrapper_ambiguous=2 card_not_ready=0" in output
+    assert "url_parsed=3 author_unverified=1 wrapper_ambiguous=1 card_not_ready=0" in output
     assert (
         "rejection_reasons=CANDIDATE_AUTHOR_MISMATCH:1,"
-        "CANDIDATE_WRAPPER_AMBIGUOUS:2,POST_AUTHOR_OR_ID_INVALID:1,"
+        "CANDIDATE_WRAPPER_AMBIGUOUS:1,POST_AUTHOR_OR_ID_INVALID:1,"
         "POST_LINK_HAS_QUERY_OR_FRAGMENT:2,POST_ORIGIN_INVALID:1,"
         "POST_PATH_SHAPE_INVALID:1"
     ) in output
@@ -2010,7 +2023,7 @@ def test_verified_multiline_body_stays_unknown_without_private_text_logging(
 </nav><main><article>
   <a href="/@candidate/post/multiline"><time>1h</time></a>
   <a href="/@candidate">@candidate</a>
-  <p>{first_paragraph}</p><blockquote><p>{quoted_paragraph}</p></blockquote>
+  <p>{first_paragraph}</p><p>{quoted_paragraph}</p>
 </article></main></body></html>"""
     data_root = tmp_path / "data"
     profile = tmp_path / "profile"
@@ -2241,3 +2254,225 @@ window.addEventListener("wheel", event => {{
     assert "SEARCH_BUDGET_EXHAUSTED reason=MAX_TOTAL_POSTS viewports=2" in output
     assert "SEARCH_BUDGET_EXHAUSTED reason=MAX_SCROLLS viewports=3" in output
     assert "POST_TEXT status=NONE verified_posts=0 extracted=0" in output
+
+
+def test_modern_landmark_free_div_feed_verifies_cards_and_detail(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    detail_url = "https://www.threads.com/@candidate/post/job-seeking"
+    first_body = "A short weather update."
+    verified_body_first = "Tôi đang tìm việc"
+    verified_body_second = "trong lĩnh vực kỹ thuật"
+    excluded_text = (
+        "đang tìm việc in a quoted post",
+        "đang tìm việc in the sidebar",
+        "đang tìm việc in the composer",
+        "đang tìm việc in an unrelated article",
+    )
+    feed_html = f"""<!doctype html><html><head><meta charset="utf-8"><style>
+body {{ font-family: sans-serif; }}
+[data-pressable-container="true"] {{ display: block; margin: 16px; }}
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav>
+<aside><article><a href="/@sidebar/post/decoy"><time>1h</time></a>
+  <a href="/@sidebar">@sidebar</a><span dir="auto">{excluded_text[1]}</span>
+</article></aside>
+<form><div contenteditable="true" role="textbox">{excluded_text[2]}</div>
+  <a href="/@composer/post/decoy">Compose</a></form>
+<aside><article><p>{excluded_text[3]}</p></article></aside>
+<div id="first-card" data-pressable-container="true">
+  <a href="/@candidate/post/weather"><time>3h</time></a>
+  <a href="/@candidate">@candidate</a>
+  <div><span dir="auto">{first_body}</span></div>
+  <div data-pressable-container="true"><blockquote>
+    <a href="/@quoted/post/quote"><time>4h</time></a>
+    <a href="/@quoted">@quoted</a>
+    <span dir="auto">{excluded_text[0]}</span>
+  </blockquote></div>
+  <button type="button">Like</button>
+</div>
+<div id="second-card" data-pressable-container="true">
+  <a href="/@candidate/post/job-seeking"><time>1h</time></a>
+  <a href="/@candidate">@candidate</a>
+  <span dir="auto">{verified_body_first}</span>
+  <div dir="auto">{verified_body_second}</div>
+  <button type="button">Reply</button>
+</div>
+</body></html>"""
+    detail_html = f"""<!doctype html><html><head><meta charset="utf-8"></head><body>
+<div data-pressable-container="true">
+  <a href="/@candidate/post/job-seeking"><time>1h</time></a>
+  <a href="/@candidate">@candidate</a>
+  <span dir="auto">{verified_body_first}</span>
+  <div dir="auto">{verified_body_second}</div>
+</div>
+</body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+
+    async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=detail_html,
+            )
+
+        await page.route(detail_url, serve_detail)
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=2,
+            max_scrolls=0,
+            max_total_posts=10,
+            terms=("đang tìm việc",),
+            show_post_text=True,
+        )
+        assert result.status == "COMPLETE"
+        assert result.home_sampled == 2
+        assert result.home_irrelevant == result.home_relevant == 1
+        assert result.detail_reads == 1
+
+    _run_offline_page(feed_html, exercise)
+    output = capsys.readouterr().out
+    assert "article_roots=0 pressable_roots=2" in output
+    assert f"| {first_body}" in output
+    assert f"| {verified_body_first}" in output
+    assert f"| {verified_body_second}" in output
+    assert all(text not in output for text in excluded_text)
+    preview_blocks = re.findall(
+        r"<<< POST TEXT BEGIN >>>\n(.*?)\n<<< POST TEXT END >>>",
+        output,
+        re.DOTALL,
+    )
+    assert preview_blocks == [
+        f"| {first_body}",
+        f"| {verified_body_first}\n| {verified_body_second}",
+    ]
+    assert all(label not in "\n".join(preview_blocks) for label in ("Like", "Reply"))
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("đang tìm việc",))),
+    )
+    assert checkpoint.home_sampled == 2
+    assert checkpoint.detail_reads == 1
+    persisted = (
+        data_root
+        / "nurture"
+        / "checkpoints"
+        / f"{account.account_id}-{checkpoint.policy_fingerprint}.json"
+    ).read_text(encoding="utf-8")
+    assert all(body not in persisted for body in (first_body, *excluded_text))
+    assert verified_body_first not in persisted
+    assert verified_body_second not in persisted
+
+
+def test_visible_card_without_permalink_stops_as_unsupported_without_checkpoint(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actor = "offline.operator"
+    private_text = "Hiring text must stay unread without a post permalink"
+    feed_html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav>
+<aside><div data-pressable-container="true">
+  <a href="/@sidebar/post/decoy"><time>2h</time></a>
+  <a href="/@sidebar">@sidebar</a><span dir="auto">Hiring sidebar decoy</span>
+</div></aside>
+<form><div contenteditable="true" role="textbox">Hiring composer decoy</div>
+  <a href="/@composer/post/decoy">Compose</a></form>
+<article><p>Hiring unrelated article without feed evidence</p></article>
+<div data-pressable-container="true">
+  <time>now</time><a href="/@candidate">@candidate</a>
+  <span dir="auto">{private_text}</span>
+</div>
+<script>window.addEventListener("wheel", () => {{
+  sessionStorage.setItem("wheel-count", "1");
+}});</script>
+</body></html>"""
+    monkeypatch.setattr(reader_module, "_READINESS_RECHECK_INTERVAL_MS", 20)
+    data_root = tmp_path / "data"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+
+    async def exercise(page) -> None:
+        with pytest.raises(UiReadError) as unsupported:
+            await workflow.run_page_workflow(
+                page,
+                account,
+                store,
+                max_posts=2,
+                max_scrolls=2,
+                max_total_posts=10,
+                terms=("hiring",),
+                show_post_text=True,
+            )
+        assert unsupported.value.code == "FEED_VISIBLE_UNSUPPORTED"
+        assert await page.evaluate("sessionStorage.getItem('wheel-count')") is None
+
+    _run_offline_page(feed_html, exercise)
+    output = capsys.readouterr().out
+    assert "STOP stage=FEED_INITIAL code=FEED_VISIBLE_UNSUPPORTED" in output
+    assert "pressable_roots=1" in output
+    assert "FEED_VISIBLE_NO_PERMALINK:1" in output
+    assert private_text not in output
+    assert "Hiring sidebar decoy" not in output
+    assert "Hiring composer decoy" not in output
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert checkpoint.completed_runs == 0
+    assert checkpoint.home_sampled == 0
+
+
+def test_delayed_permalink_hydration_recovers_before_unsupported_stop() -> None:
+    actor = "offline.operator"
+    body = "A safely identified hydrated post"
+    feed_html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav>
+<div data-pressable-container="true">
+  <time>now</time><a href="/@candidate">@candidate</a>
+  <span dir="auto">{body}</span>
+</div></body></html>"""
+
+    async def exercise(page) -> None:
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        await page.evaluate(
+            """() => setTimeout(() => {
+                const card = document.querySelector(
+                    '[data-pressable-container="true"]'
+                );
+                const time = card.querySelector('time');
+                const permalink = document.createElement('a');
+                permalink.href = '/@candidate/post/hydrated';
+                time.replaceWith(permalink);
+                permalink.append(time);
+            }, 80)"""
+        )
+        targets = await reader.scan_viewport(1)
+        assert len(targets) == 1
+        assert targets[0].url == "https://www.threads.com/@candidate/post/hydrated"
+        assert targets[0].author == "candidate"
+        assert targets[0].body == body
+
+    _run_offline_page(feed_html, exercise)
