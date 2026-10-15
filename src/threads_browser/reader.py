@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import re
+import secrets
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from typing import Literal, TypeVar
 from urllib.parse import urljoin, urlsplit
@@ -25,7 +26,7 @@ from playwright.async_api import (
 )
 
 from .errors import UiReadError
-from .feed.models import DisplayObservation, HomeSample, PostTarget
+from .feed.models import DisplayObservation, HomeSample, PostTarget, VisibleBodySegment
 from .feed.relevance import canonical_terms, classify_body, normalize_text
 from .feed.urls import (
     _USERNAME,
@@ -65,6 +66,9 @@ _SCROLL_ADVANCE_RATIO = 0.4
 _SCROLL_ADVANCE_MIN_PX = 64
 _SCROLL_ADVANCE_MAX_PX = 360
 _MAX_BODY_CODEPOINTS = 10_000
+_MAX_BODY_TEXT_NODES = 256
+_MAX_BODY_RANGE_CHECKS = 40_000
+_MAX_BODY_PROGRESS_POSTS = 200
 _MAX_CARD_ANCESTORS = 8
 _MAX_CARD_LINKS = 40
 _MAX_PERMALINK_CANDIDATES = 40
@@ -178,6 +182,15 @@ class _FeedScanCounts:
     wrapper_ambiguous: int = 0
     card_not_ready: int = 0
     deferred_offscreen: int = 0
+    identity_verified: int = 0
+    new_verified_rows: int = 0
+    partial_body_rows: int = 0
+    deferred_identity_rows: int = 0
+    new_visible_text_segments: int = 0
+    deferred_above: int = 0
+    deferred_below: int = 0
+    nearest_deferred_below_px: float | None = None
+    frontier_content_px: float | None = None
     verified: int = 0
     body_read: int = 0
     body_unknown: int = 0
@@ -210,6 +223,46 @@ class _CandidateStructure:
     offscreen_times: int = 0
     offscreen_body_candidates: int = 0
     post_url_links: tuple[tuple[str, bool], ...] = ()
+    root_kind: str = "CONTAINER"
+
+
+@dataclass(slots=True, repr=False)
+class _TextFragment:
+    start: int
+    end: int
+    text: str = field(repr=False)
+    viewport_y: float = field(default=0.0, repr=False)
+    content_y: float = field(default=0.0, repr=False)
+
+    def __repr__(self) -> str:
+        return "_TextFragment(<private>)"
+
+
+@dataclass(slots=True, repr=False)
+class _BodyTextProgress:
+    length: int
+    block: int
+    order: int
+    expected_ranges: list[tuple[int, int]] = field(default_factory=list, repr=False)
+    visited_ranges: list[tuple[int, int]] = field(default_factory=list, repr=False)
+    fragments: list[_TextFragment] = field(default_factory=list, repr=False)
+
+    def __repr__(self) -> str:
+        return "_BodyTextProgress(<private>)"
+
+
+@dataclass(frozen=True, slots=True)
+class _VisibleBodyRead:
+    body: str | None = field(repr=False)
+    complete: bool
+    has_rendered_text: bool
+    consistent: bool = True
+    segments: tuple[VisibleBodySegment, ...] = field(default=(), repr=False)
+    deferred_above: int = 0
+    deferred_below: int = 0
+    nearest_deferred_below_px: float | None = None
+    frontier_content_px: float | None = None
+    truncated: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,15 +362,19 @@ class ThreadsHomeReader:
         self.last_deferred_fingerprints: frozenset[str] = frozenset()
         self._last_viewport_limit = 20
         self.last_scroll_delta = 0.0
+        self.last_scroll_band = "UNKNOWN"
+        self.last_scroll_end_distance: float | None = None
+        self.last_scroll_near_end = False
         self.last_scroll_stop_reason: str | None = None
         self._last_viewport_signature: tuple[object, ...] | None = None
         self._last_viewport_candidate_roots: tuple[Locator, ...] = ()
         self._carried_viewport_candidate_roots: tuple[Locator, ...] = ()
-        self._body_visibility_ranges: dict[
-            tuple[str, int], tuple[float, float, float, list[tuple[float, float]]]
-        ] = {}
+        self._body_text_progress: dict[str, dict[str, _BodyTextProgress]] = {}
+        self._body_visibility_ranges: dict[str, set[tuple[int, int, int]]] = {}
+        self._body_progress_salt = secrets.token_bytes(16)
         self._cached_home_bodies: dict[str, tuple[str, bool]] = {}
         self._detail_return_anchor: tuple[str, float] | None = None
+        self._detail_return_target: PostTarget | None = None
         self._reported_render_rescans: set[tuple[str, float | None]] = set()
         self._skipped_candidate_identities: set[str] = set()
         self._reported_candidate_skips: dict[tuple[str, str], set[str]] = {}
@@ -1034,6 +1091,14 @@ class ThreadsHomeReader:
                 raise
             self.scrolls += 1
             self.last_scroll_delta = observed_delta
+            final_scroll_state = await surface.evaluate(
+                "element => Math.max(0, element.scrollHeight - element.clientHeight - element.scrollTop)"
+            )
+            self.last_scroll_end_distance = float(final_scroll_state)
+            self.last_scroll_near_end = self.last_scroll_end_distance <= max(
+                wheel_delta * 1.5,
+                viewport_height * 0.75,
+            )
             delta_ratio = observed_delta / viewport_height
             delta_band = (
                 "SMALL"
@@ -1042,6 +1107,7 @@ class ThreadsHomeReader:
                 if delta_ratio <= 0.75
                 else "LARGE"
             )
+            self.last_scroll_band = delta_band
             if not self._detail_mode:
                 print(
                     f"SCROLL attempt={self.scroll_attempts} observed=1 "
@@ -1224,7 +1290,7 @@ class ThreadsHomeReader:
                         style.visibility !== 'hidden' && style.display !== 'none';
                 }).length;
                 return [
-                    body ? (body.innerText || '').trim().length : 0,
+                    body ? body.childNodes.length : 0,
                     body ? body.childElementCount : 0,
                     visibleCount(rootSelector),
                     visibleCount('a[href*="/post/"]'),
@@ -1265,7 +1331,7 @@ class ThreadsHomeReader:
                         style.visibility !== 'hidden' && style.display !== 'none';
                 }).length;
                 return [
-                    body ? (body.innerText || '').trim().length : 0,
+                    body ? body.childNodes.length : 0,
                     body ? body.childElementCount : 0,
                     visibleCount('main, [role="main"], h1, [role="tab"]'),
                 ];
@@ -1611,35 +1677,19 @@ class ThreadsHomeReader:
         self._last_viewport_candidate_roots = scan.candidate_roots
         self.last_viewport_deferred_only = (
             not scan.coverage_complete
-            and self.last_scan_counts.deferred_offscreen > 0
-            and self.last_scan_counts.uncertain_rows == 0
-            and self.last_scan_counts.body_extracted == self.last_scan_counts.body_read
-            and self.last_scan_counts.skipped == 0
+            and any(
+                diagnostic.state in {"DEFERRED_OFFSCREEN", "PARTIAL_BODY"}
+                for diagnostic in self.last_candidate_diagnostics
+            )
             and all(
                 diagnostic.identity_fingerprint is not None
                 for diagnostic in self.last_candidate_diagnostics
-                if diagnostic.state == "DEFERRED_OFFSCREEN"
+                if diagnostic.state in {"DEFERRED_OFFSCREEN", "PARTIAL_BODY"}
             )
-        )
-        unresolved_states = {
-            diagnostic.state
-            for diagnostic in self.last_candidate_diagnostics
-            if diagnostic.state not in {"VERIFIED", "NON_POST"}
-        }
-        only_observation_gaps = unresolved_states.issubset(
-            {"OBSERVED_UNVERIFIED", "DEFERRED_OFFSCREEN"}
-        ) and bool(unresolved_states)
-        deferred_rows_identified = all(
-            diagnostic.identity_fingerprint is not None
-            for diagnostic in self.last_candidate_diagnostics
-            if diagnostic.state == "DEFERRED_OFFSCREEN"
         )
         self.last_viewport_can_wheel = bool(
             not scan.coverage_complete
-            and only_observation_gaps
-            and deferred_rows_identified
             and scan.observed_rows <= self._last_viewport_limit
-            and not self.last_scan_counts.unsupported_roots
         )
         self.last_deferred_fingerprints = frozenset(
             diagnostic.identity_fingerprint
@@ -2046,6 +2096,15 @@ class ThreadsHomeReader:
         counts.url_rejected_links = 0
         counts.card_not_ready = 0
         counts.deferred_offscreen = 0
+        counts.identity_verified = 0
+        counts.new_verified_rows = 0
+        counts.partial_body_rows = 0
+        counts.deferred_identity_rows = 0
+        counts.new_visible_text_segments = 0
+        counts.deferred_above = 0
+        counts.deferred_below = 0
+        counts.nearest_deferred_below_px = None
+        counts.frontier_content_px = None
         counts.verified = 0
         counts.body_read = 0
         counts.body_unknown = 0
@@ -2121,7 +2180,7 @@ class ThreadsHomeReader:
         diagnostics: list[_CandidateDiagnostic] = []
         for index, root in enumerate(roots):
             structure = structures[index]
-            root_kind = await self._candidate_root_kind(root)
+            root_kind = structure.root_kind
             diagnostic = _CandidateDiagnostic(
                 row_index=index + 1,
                 root_kind=root_kind,
@@ -2246,6 +2305,7 @@ class ThreadsHomeReader:
                     currently_visible=currently_visible,
                     viewport_y=box["y"],
                     cached_body_fingerprints=prefer_new_fingerprints,
+                    visible_text_progress=currently_visible,
                 )
                 if currently_visible:
                     stabilize_started = time.perf_counter()
@@ -2254,6 +2314,7 @@ class ThreadsHomeReader:
                         currently_visible=True,
                         viewport_y=box["y"],
                         cached_body_fingerprints=prefer_new_fingerprints,
+                        visible_text_progress=True,
                     )
                     self.last_scan_timings.stabilize_ms += round(
                         (time.perf_counter() - stabilize_started) * 1000
@@ -2261,8 +2322,7 @@ class ThreadsHomeReader:
                     if (
                         stabilized.url != target.url
                         or stabilized.author != target.author
-                        or normalize_text(stabilized.body or "")
-                        != normalize_text(target.body or "")
+                        or not stabilized.body_consistent
                     ):
                         diagnostic.state = "OBSERVED_UNVERIFIED"
                         diagnostic.reason = "ROW_CONTENT_CHANGED_DURING_READ"
@@ -2293,7 +2353,17 @@ class ThreadsHomeReader:
                             display=display_observations[-1],
                         )
                         continue
+                    initial_segments = target.visible_segments
                     target = stabilized
+                    target = replace(
+                        target,
+                        visible_segments=tuple(
+                            {
+                                segment.segment_id: segment
+                                for segment in initial_segments + stabilized.visible_segments
+                            }.values()
+                        ),
+                    )
             except _CardDeferredOffscreen as deferred:
                 self.last_scan_timings.read_row_ms += round(
                     (time.perf_counter() - read_started) * 1000
@@ -2412,6 +2482,7 @@ class ThreadsHomeReader:
                                 currently_visible=currently_visible,
                                 viewport_y=box["y"],
                                 cached_body_fingerprints=prefer_new_fingerprints,
+                                visible_text_progress=currently_visible,
                             )
                         except (_CardNotReady, _UnverifiedFeedCandidate, _CardDeferredOffscreen):
                             pass
@@ -2427,13 +2498,24 @@ class ThreadsHomeReader:
                                 counts.body_unknown = max(0, counts.body_unknown - 1)
                             if display_observations:
                                 display_observations.pop()
-                            diagnostic.state = "VERIFIED"
-                            diagnostic.reason = "PROVENANCE_VERIFIED"
+                            diagnostic.identity_fingerprint = target.fingerprint
+                            diagnostic.state = (
+                                "VERIFIED" if target.body_complete else "PARTIAL_BODY"
+                            )
+                            diagnostic.reason = (
+                                "PROVENANCE_VERIFIED"
+                                if target.body_complete
+                                else "VISIBLE_TEXT_PROGRESS"
+                            )
                             diagnostic.has_readable_body = bool(
                                 target.body and target.body.strip()
                             )
-                            counts.verified += 1
-                            counts.body_read += int(diagnostic.has_readable_body)
+                            counts.identity_verified += 1
+                            counts.verified += int(target.body_complete)
+                            counts.partial_body_rows += int(not target.body_complete)
+                            counts.body_read += int(
+                                diagnostic.has_readable_body and target.body_complete
+                            )
                             counts.body_extracted += int(diagnostic.has_readable_body)
                             if not diagnostic.has_readable_body:
                                 counts.body_unknown += 1
@@ -2441,7 +2523,7 @@ class ThreadsHomeReader:
                                 counts.skipped_rows += 1
                                 diagnostic.state = "PENDING_HYDRATION"
                                 diagnostic.reason = "POST_BODY_UNAVAILABLE"
-                            else:
+                            elif target.body_complete:
                                 targets.append(target)
                             await emit_row(diagnostic, target=target)
                             continue
@@ -2501,9 +2583,16 @@ class ThreadsHomeReader:
             self.last_scan_timings.read_row_ms += round(
                 (time.perf_counter() - read_started) * 1000
             )
-            counts.verified += 1
-            diagnostic.state = "VERIFIED"
-            diagnostic.reason = "PROVENANCE_VERIFIED"
+            diagnostic.identity_fingerprint = target.fingerprint
+            diagnostic.state = "VERIFIED" if target.body_complete else "PARTIAL_BODY"
+            diagnostic.reason = (
+                "PROVENANCE_VERIFIED"
+                if target.body_complete
+                else "VISIBLE_TEXT_PROGRESS"
+            )
+            counts.identity_verified += 1
+            counts.verified += int(target.body_complete)
+            counts.partial_body_rows += int(not target.body_complete)
             diagnostic.has_readable_body = bool(target.body and target.body.strip())
             if target.body and target.body.strip():
                 body_was_cached = bool(
@@ -2511,12 +2600,13 @@ class ThreadsHomeReader:
                     and target.fingerprint in prefer_new_fingerprints
                     and target.fingerprint in self._cached_home_bodies
                 )
-                counts.body_read += int(not body_was_cached)
+                counts.body_read += int(not body_was_cached and target.body_complete)
                 counts.body_extracted += 1
-                self._cached_home_bodies.setdefault(
-                    target.fingerprint,
-                    (target.body, target.body_truncated),
-                )
+                if target.body_complete:
+                    self._cached_home_bodies.setdefault(
+                        target.fingerprint,
+                        (target.body, target.body_truncated),
+                    )
             else:
                 counts.body_unknown += 1
                 self._record_structure_reason("POST_BODY_STRUCTURE_UNSUPPORTED")
@@ -2525,6 +2615,15 @@ class ThreadsHomeReader:
                 counts.skipped_rows += 1
                 counts.uncertain_rows += 1
                 diagnostic.identity_fingerprint = target.fingerprint
+                await emit_row(
+                    diagnostic,
+                    target=target,
+                    fingerprint=target.fingerprint,
+                )
+                continue
+            if not target.body_complete:
+                counts.skipped_rows += 1
+                counts.coverage_complete = False
                 await emit_row(
                     diagnostic,
                     target=target,
@@ -2574,6 +2673,7 @@ class ThreadsHomeReader:
             counts.body_unknown
             or counts.uncertain_rows
             or counts.deferred_offscreen
+            or counts.partial_body_rows
             or any(
                 diagnostic.state != "VERIFIED"
                 for diagnostic in diagnostics
@@ -3125,6 +3225,10 @@ class ThreadsHomeReader:
                 const offscreenBodies = allBodies.filter(offscreen)
                     .slice(0, args.maxStructure);
                 return {
+                    root_kind: root.tagName === "ARTICLE" ? "ARTICLE" :
+                        root.getAttribute("role") === "article" ? "ROLE_ARTICLE" :
+                        root.getAttribute("data-pressable-container") === "true" ? "PRESSABLE" :
+                        "CONTAINER",
                     hrefs: anchors.map(element => element.getAttribute("href")),
                     post_links: anchors
                         .map(element => ({
@@ -3142,8 +3246,12 @@ class ThreadsHomeReader:
                     offscreen_times: offscreenTimes,
                     body_candidates: bodies.length,
                     offscreen_body_candidates: offscreenBodies.length,
-                    readable_body_candidates: bodies.filter(element =>
-                        (element.innerText || "").trim().length > 0).length,
+                    readable_body_candidates: bodies.filter(element => {
+                        const walker = document.createTreeWalker(
+                            element, NodeFilter.SHOW_TEXT
+                        );
+                        return Boolean(walker.nextNode());
+                    }).length,
                     paragraph_candidates: bodies.filter(element =>
                         element.tagName === "P").length,
                 };
@@ -3190,6 +3298,7 @@ class ThreadsHomeReader:
             offscreen_times=structure["offscreen_times"],
             offscreen_body_candidates=structure["offscreen_body_candidates"],
             post_url_links=post_url_links,
+            root_kind=structure["root_kind"],
         )
 
     @staticmethod
@@ -3238,16 +3347,14 @@ class ThreadsHomeReader:
     ) -> dict[int, _CandidateStructure]:
         counts = self.last_scan_counts
         structures: dict[int, _CandidateStructure] = {}
-        for index, root in enumerate(roots):
-            is_semantic = bool(
-                await root.evaluate(
-                    "node => node.matches('article, [role=\"article\"]')"
-                )
-            )
-            is_pressable = await root.get_attribute("data-pressable-container") == "true"
+        inspected = await asyncio.gather(
+            *(self._inspect_candidate_root(root, viewport) for root in roots)
+        )
+        for index, (root, structure) in enumerate(zip(roots, inspected, strict=True)):
+            is_semantic = structure.root_kind in {"ARTICLE", "ROLE_ARTICLE"}
+            is_pressable = structure.root_kind == "PRESSABLE"
             counts.article_roots += int(is_semantic)
             counts.pressable_roots += int(is_pressable)
-            structure = await self._inspect_candidate_root(root, viewport)
             structures[index] = structure
             for href, timestamp_link in structure.post_url_links:
                 self._record_url_structure(href, timestamp_link)
@@ -3624,6 +3731,7 @@ class ThreadsHomeReader:
                     currently_visible=currently_visible,
                     viewport_y=box["y"],
                     cached_body_fingerprints=prefer_new_fingerprints,
+                    visible_text_progress=currently_visible,
                 )
             except _CardNotReady as pending:
                 self.last_scan_counts.card_not_ready += 1
@@ -3643,8 +3751,10 @@ class ThreadsHomeReader:
                     ),
                 )
                 continue
-            self.last_scan_counts.verified += 1
-            if target.body and target.body.strip():
+            self.last_scan_counts.identity_verified += 1
+            self.last_scan_counts.verified += int(target.body_complete)
+            self.last_scan_counts.partial_body_rows += int(not target.body_complete)
+            if target.body and target.body.strip() and target.body_complete:
                 body_was_cached = bool(
                     prefer_new_fingerprints is not None
                     and target.fingerprint in prefer_new_fingerprints
@@ -3656,9 +3766,34 @@ class ThreadsHomeReader:
                     target.fingerprint,
                     (target.body, target.body_truncated),
                 )
+            elif target.body and target.body.strip():
+                self.last_scan_counts.body_extracted += 1
             else:
                 self.last_scan_counts.body_unknown += 1
                 self._record_structure_reason("POST_BODY_STRUCTURE_UNSUPPORTED")
+            if not target.body_complete:
+                self.last_scan_counts.skipped_rows += 1
+                self.last_scan_counts.coverage_complete = False
+                diagnostic = _CandidateDiagnostic(
+                    row_index=len(targets_by_url) + 1,
+                    root_kind="CONTAINER",
+                    has_visible_time=True,
+                    has_post_permalink=True,
+                    has_profile_author=True,
+                    has_readable_body=bool(target.body and target.body.strip()),
+                    state="PARTIAL_BODY",
+                    reason="VISIBLE_TEXT_PROGRESS",
+                    identity_fingerprint=target.fingerprint,
+                )
+                if on_row is not None:
+                    await on_row(
+                        _HomeRowObservation(
+                            diagnostic,
+                            target=target,
+                            fingerprint=target.fingerprint,
+                        )
+                    )
+                continue
             if (
                 target.fingerprint in scanned_fingerprints
                 or (
@@ -3743,6 +3878,7 @@ class ThreadsHomeReader:
                 root,
                 currently_visible=True,
                 viewport_y=box["y"],
+                cached_body_fingerprints={target.fingerprint},
             )
             if (
                 current.fingerprint != target.fingerprint
@@ -3923,6 +4059,7 @@ class ThreadsHomeReader:
         if not body_matches:
             raise UiReadError("DETAIL_BODY_UNVERIFIED")
         self._detail_return_anchor = (target.fingerprint, target.viewport_y)
+        self._detail_return_target = target
         return detail
 
     async def _detail_permalink_card(self, target: PostTarget) -> Locator:
@@ -3958,18 +4095,15 @@ class ThreadsHomeReader:
 
     async def return_to_home(self) -> None:
         await self._go_back_to_home()
-        targets, _ = await self._wait_for_home_targets(
-            self._last_viewport_limit,
-            timeout_code="FEED_RETURN_NOT_READY",
-        )
-        if not self.last_viewport_coverage_complete:
-            raise UiReadError("VIEWPORT_COVERAGE_INCOMPLETE")
         anchor = self._detail_return_anchor
-        if anchor is not None and not any(
-            target.fingerprint == anchor[0]
-            and abs(target.viewport_y - anchor[1]) <= 48
-            for target in targets
-        ):
+        target = self._detail_return_target
+        if anchor is None or target is None:
+            raise UiReadError("RETURN_CONTEXT_CHANGED")
+        try:
+            current = await self._revalidate_action_target(target)
+        except UiReadError:
+            raise UiReadError("RETURN_CONTEXT_CHANGED") from None
+        if current.fingerprint != anchor[0] or abs(current.viewport_y - anchor[1]) > 48:
             raise UiReadError("RETURN_CONTEXT_CHANGED")
     async def _for_you_control(self, *, timeout_ms: int | None = None) -> Locator:
         links = self._page.get_by_role("link", name=_FOR_YOU_NAME)
@@ -4256,14 +4390,512 @@ class ThreadsHomeReader:
         root_handle = await root.element_handle()
         if root_handle is None:
             return None, ()
-        body, available, _, pending_signals = await self._extract_card_body(
-            root,
-            root_handle,
-            require_body=False,
+        observed = await self._read_visible_body_progress(root, root_handle)
+        if observed.has_rendered_text:
+            return observed.body, ()
+        candidates = root.locator(_BODY_TEXT_SELECTOR)
+        signals = tuple(
+            _CardWaitSignal(candidates.nth(index), "nonempty_text")
+            for index in range(min(await candidates.count(), _MAX_STRUCTURE_ELEMENTS))
+            if await self._safe_body_candidate(candidates.nth(index), root, root_handle)
         )
-        return (
-            body if available and body and body.strip() else None,
-            pending_signals,
+        return None, signals
+
+    @staticmethod
+    def _merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        merged: list[list[int]] = []
+        for start, end in sorted(ranges):
+            if end <= start:
+                continue
+            if merged and start <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], end)
+            else:
+                merged.append([start, end])
+        return [(start, end) for start, end in merged]
+
+    @staticmethod
+    def _subtract_ranges(
+        start: int,
+        end: int,
+        covered: list[tuple[int, int]],
+    ) -> list[tuple[int, int]]:
+        remaining: list[tuple[int, int]] = []
+        cursor = start
+        for old_start, old_end in covered:
+            if old_end <= cursor:
+                continue
+            if old_start >= end:
+                break
+            if old_start > cursor:
+                remaining.append((cursor, min(old_start, end)))
+            cursor = max(cursor, old_end)
+            if cursor >= end:
+                break
+        if cursor < end:
+            remaining.append((cursor, end))
+        return remaining
+
+    @staticmethod
+    def _utf16_slice(value: str, start: int, end: int) -> str:
+        encoded = value.encode("utf-16-le", errors="surrogatepass")
+        return encoded[start * 2 : end * 2].decode("utf-16-le", errors="surrogatepass")
+
+    @classmethod
+    def _fragment_text(
+        cls,
+        fragments: list[_TextFragment],
+        start: int,
+        end: int,
+    ) -> str | None:
+        for fragment in fragments:
+            if fragment.start <= start and fragment.end >= end:
+                return cls._utf16_slice(
+                    fragment.text,
+                    start - fragment.start,
+                    end - fragment.start,
+                )
+        return None
+
+    async def _read_visible_body_progress(
+        self,
+        root: Locator,
+        root_handle: JSHandle,
+        *,
+        fingerprint: str | None = None,
+    ) -> _VisibleBodyRead:
+        observation = await root.evaluate(
+            """(root, args) => {
+                const clipFor = element => {
+                    const clip = {
+                        left: 0, top: 0,
+                        right: window.innerWidth, bottom: window.innerHeight,
+                    };
+                    for (let parent = element.parentElement; parent;
+                         parent = parent.parentElement) {
+                        const style = getComputedStyle(parent);
+                        const clipX = style.overflowX !== "visible";
+                        const clipY = style.overflowY !== "visible";
+                        if (!clipX && !clipY) continue;
+                        const bounds = parent.getBoundingClientRect();
+                        const left = bounds.left + parent.clientLeft;
+                        const top = bounds.top + parent.clientTop;
+                        if (clipX) {
+                            clip.left = Math.max(clip.left, left);
+                            clip.right = Math.min(
+                                clip.right, left + parent.clientWidth
+                            );
+                        }
+                        if (clipY) {
+                            clip.top = Math.max(clip.top, top);
+                            clip.bottom = Math.min(
+                                clip.bottom, top + parent.clientHeight
+                            );
+                        }
+                    }
+                    return clip;
+                };
+                const cssVisible = element => {
+                    for (let current = element; current; current = current.parentElement) {
+                        const style = getComputedStyle(current);
+                        if (style.display === "none" || style.visibility === "hidden" ||
+                            Number(style.opacity) === 0) return false;
+                        if (current === root) break;
+                    }
+                    return true;
+                };
+                const belongs = element => {
+                    const nearest = element.parentElement?.closest(args.roots);
+                    if (root.matches(args.roots)) return nearest === root;
+                    return root.contains(element) && !nearest;
+                };
+                const excluded = element =>
+                    element.matches(args.excluded) ||
+                    Boolean(element.parentElement?.closest(args.excluded));
+                const hasBodyContainer = element =>
+                    root.matches(args.body) || element.matches(args.body) ||
+                    Boolean(element.parentElement?.closest(args.body));
+                const nearestBlock = element => {
+                    for (let current = element.parentElement; current;
+                         current = current.parentElement) {
+                        const display = getComputedStyle(current).display;
+                        if (["block", "flow-root", "flex", "grid", "list-item",
+                             "table", "table-cell", "table-caption"].includes(display)) {
+                            return current;
+                        }
+                        if (current === root) return root;
+                    }
+                    return root;
+                };
+                const stableNodeKey = textNode => {
+                    const parts = [];
+                    const owner = textNode.parentElement;
+                    for (let current = owner; current && current !== root;
+                         current = current.parentElement) {
+                        let sameTagIndex = 0;
+                        for (const sibling of current.parentElement?.children || []) {
+                            if (sibling.tagName !== current.tagName) continue;
+                            if (sibling === current) break;
+                            sameTagIndex++;
+                        }
+                        parts.push(`${current.tagName.toLowerCase()}:${sameTagIndex}`);
+                    }
+                    let textIndex = 0;
+                    for (const sibling of owner.childNodes) {
+                        if (sibling === textNode) break;
+                        if (sibling.nodeType === Node.TEXT_NODE) textIndex++;
+                    }
+                    return `${parts.reverse().join("/")}/text:${textIndex}`;
+                };
+                const scrollMetrics = element => {
+                    let scroller = element.parentElement;
+                    while (scroller && scroller !== document.body &&
+                           scroller !== document.documentElement) {
+                        const style = getComputedStyle(scroller);
+                        if (["auto", "scroll", "overlay"].includes(style.overflowY) &&
+                            scroller.scrollHeight > scroller.clientHeight + 1) break;
+                        scroller = scroller.parentElement;
+                    }
+                    const documentScroll = !scroller || scroller === document.body ||
+                        scroller === document.documentElement;
+                    if (documentScroll) {
+                        return {offset: window.scrollY, top: window.scrollY,
+                            bottom: window.scrollY + window.innerHeight};
+                    }
+                    const bounds = scroller.getBoundingClientRect();
+                    const offset = scroller.scrollTop - bounds.top - scroller.clientTop;
+                    return {
+                        offset,
+                        top: scroller.scrollTop,
+                        bottom: scroller.scrollTop + scroller.clientHeight,
+                    };
+                };
+                const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+                const nodes = [];
+                const blockIds = new WeakMap();
+                let nextBlockId = 0;
+                let totalLength = 0;
+                let rangeChecks = 0;
+                let truncated = false;
+                let node;
+                while ((node = walker.nextNode())) {
+                    const parent = node.parentElement;
+                    if (!parent || !belongs(parent) || excluded(parent) ||
+                        !hasBodyContainer(parent) || !cssVisible(parent)) continue;
+                    if (!node.length) continue;
+                    const length = Math.min(node.length, args.maxChars - totalLength);
+                    if (length <= 0) { truncated = true; break; }
+                    if (length < node.length) truncated = true;
+                    totalLength += length;
+                    const block = nearestBlock(parent);
+                    if (!blockIds.has(block)) blockIds.set(block, nextBlockId++);
+                    const clip = clipFor(parent);
+                    const metrics = scrollMetrics(parent);
+                    const expected = [];
+                    const visible = [];
+                    let deferredAbove = 0;
+                    let deferredBelow = 0;
+                    let deferredOther = 0;
+                    let nearestBelow = null;
+                    let frontier = null;
+                    const range = document.createRange();
+                    const inspect = (start, end) => {
+                        if (rangeChecks++ >= args.maxRangeChecks) {
+                            truncated = true;
+                            return;
+                        }
+                        range.setStart(node, start);
+                        range.setEnd(node, end);
+                        const rects = Array.from(range.getClientRects()).filter(rect =>
+                            rect.width > 0 && rect.height > 0
+                        );
+                        if (!rects.length) return;
+                        expected.push([start, end]);
+                        const states = rects.map(rect => ({
+                            visible: rect.right > clip.left && rect.left < clip.right &&
+                                rect.bottom > clip.top && rect.top < clip.bottom,
+                            fully: rect.left >= clip.left && rect.right <= clip.right &&
+                                rect.top >= clip.top && rect.bottom <= clip.bottom,
+                        }));
+                        if (states.every(state => state.fully)) {
+                            const text = node.data.slice(start, end);
+                            const top = Math.min(...rects.map(rect => rect.top));
+                            const bottom = Math.max(...rects.map(rect => rect.bottom));
+                            visible.push({
+                                start, end, text, top,
+                                contentY: bottom + metrics.offset,
+                            });
+                            frontier = Math.max(frontier ?? -Infinity,
+                                bottom + metrics.offset);
+                            return;
+                        }
+                        if (states.every(state => !state.visible)) {
+                            const above = rects.every(rect => rect.bottom <= clip.top);
+                            const below = rects.every(rect => rect.top >= clip.bottom);
+                            if (above) deferredAbove++;
+                            else if (below) {
+                                deferredBelow++;
+                                const distance = Math.max(0,
+                                    Math.min(...rects.map(rect => rect.top)) - clip.bottom);
+                                nearestBelow = Math.min(nearestBelow ?? Infinity, distance);
+                            } else deferredOther++;
+                            return;
+                        }
+                        if (end - start <= 1) {
+                            const top = Math.min(...rects.map(rect => rect.top));
+                            const bottom = Math.max(...rects.map(rect => rect.bottom));
+                            visible.push({
+                                start, end, text: node.data.slice(start, end), top,
+                                contentY: bottom + metrics.offset,
+                            });
+                            frontier = Math.max(frontier ?? -Infinity,
+                                bottom + metrics.offset);
+                            return;
+                        }
+                        const middle = start + Math.floor((end - start) / 2);
+                        inspect(start, middle);
+                        inspect(middle, end);
+                    };
+                    inspect(0, length);
+                    range.detach();
+                    const mergedVisible = [];
+                    for (const piece of visible.sort((a, b) => a.start - b.start)) {
+                        const previous = mergedVisible[mergedVisible.length - 1];
+                        if (previous && previous.end === piece.start &&
+                            Math.abs(previous.top - piece.top) < 0.5 &&
+                            Math.abs(previous.contentY - piece.contentY) < 0.5) {
+                            previous.end = piece.end;
+                            previous.text += piece.text;
+                        } else {
+                            mergedVisible.push({...piece});
+                        }
+                    }
+                    nodes.push({
+                        index: nodes.length,
+                        key: stableNodeKey(node),
+                        length,
+                        block: blockIds.get(block),
+                        expected,
+                        visible: mergedVisible,
+                        deferredAbove,
+                        deferredBelow,
+                        deferredOther,
+                        nearestBelow,
+                        frontier,
+                    });
+                    if (truncated) break;
+                    if (nodes.length >= args.maxNodes) { truncated = true; break; }
+                }
+                return {nodes, truncated};
+            }""",
+            {
+                "roots": _FEED_ROOT_SELECTOR,
+                "body": _BODY_TEXT_SELECTOR,
+                "excluded": _BODY_EXCLUSION_SELECTOR,
+                "maxChars": _MAX_BODY_CODEPOINTS,
+                "maxNodes": _MAX_BODY_TEXT_NODES,
+                "maxRangeChecks": _MAX_BODY_RANGE_CHECKS,
+            },
+        )
+
+        state: dict[str, _BodyTextProgress] | None = None
+        if fingerprint is not None:
+            state = self._body_text_progress.get(fingerprint)
+            if state is None:
+                if len(self._body_text_progress) >= _MAX_BODY_PROGRESS_POSTS:
+                    return _VisibleBodyRead(None, False, False, truncated=True)
+                state = {}
+                self._body_text_progress[fingerprint] = state
+        progress_state = {} if state is None else state
+
+        new_segments: list[VisibleBodySegment] = []
+        has_rendered_text = False
+        content_changed = False
+        deferred_above = 0
+        deferred_below = 0
+        nearest_deferred_below: float | None = None
+        frontier_content: float | None = None
+        for node in observation["nodes"]:
+            order = int(node["index"])
+            identity = str(node["key"])
+            length = int(node["length"])
+            block = int(node["block"])
+            expected = self._merge_ranges(
+                [(int(start), int(end)) for start, end in node["expected"]]
+            )
+            has_rendered_text = has_rendered_text or bool(expected)
+            deferred_above += int(node["deferredAbove"])
+            deferred_below += int(node["deferredBelow"])
+            if node["nearestBelow"] is not None:
+                distance = float(node["nearestBelow"])
+                nearest_deferred_below = min(
+                    nearest_deferred_below if nearest_deferred_below is not None else distance,
+                    distance,
+                )
+            if node["frontier"] is not None:
+                frontier_content = max(
+                    frontier_content
+                    if frontier_content is not None
+                    else float(node["frontier"]),
+                    float(node["frontier"]),
+                )
+
+            progress = progress_state.get(identity)
+            if progress is None:
+                progress = _BodyTextProgress(length, block, order)
+                progress_state[identity] = progress
+            elif length < progress.length:
+                progress.expected_ranges = [
+                    (start, min(end, length))
+                    for start, end in progress.expected_ranges
+                    if start < length
+                ]
+                progress.visited_ranges = [
+                    (start, min(end, length))
+                    for start, end in progress.visited_ranges
+                    if start < length
+                ]
+                progress.fragments = [
+                    _TextFragment(
+                        fragment.start,
+                        min(fragment.end, length),
+                        self._utf16_slice(fragment.text, 0, min(fragment.end, length) - fragment.start),
+                        fragment.viewport_y,
+                        fragment.content_y,
+                    )
+                    for fragment in progress.fragments
+                    if fragment.start < length
+                ]
+                progress.length = length
+            else:
+                progress.length = length
+            progress.block = block
+            progress.order = order
+            progress.expected_ranges = expected
+
+            current_visible = sorted(
+                node["visible"],
+                key=lambda piece: (int(piece["start"]), int(piece["end"])),
+            )
+            for piece in current_visible:
+                start = int(piece["start"])
+                end = int(piece["end"])
+                text = str(piece["text"])
+                for old in progress.fragments:
+                    overlap_start = max(start, old.start)
+                    overlap_end = min(end, old.end)
+                    if overlap_start >= overlap_end:
+                        continue
+                    old_text = self._utf16_slice(
+                        old.text,
+                        overlap_start - old.start,
+                        overlap_end - old.start,
+                    )
+                    new_text = self._utf16_slice(
+                        text,
+                        overlap_start - start,
+                        overlap_end - start,
+                    )
+                    if old_text != new_text:
+                        content_changed = True
+                        progress.visited_ranges.clear()
+                        progress.fragments.clear()
+                        break
+                uncovered = self._subtract_ranges(start, end, progress.visited_ranges)
+                for new_start, new_end in uncovered:
+                    fragment_text = self._utf16_slice(
+                        text,
+                        new_start - start,
+                        new_end - start,
+                    )
+                    if not fragment_text.strip():
+                        progress.visited_ranges = self._merge_ranges(
+                            [*progress.visited_ranges, (new_start, new_end)]
+                        )
+                        progress.fragments.append(
+                            _TextFragment(
+                                new_start,
+                                new_end,
+                                fragment_text,
+                                float(piece["top"]),
+                                float(piece["contentY"]),
+                            )
+                        )
+                        continue
+                    progress.visited_ranges = self._merge_ranges(
+                        [*progress.visited_ranges, (new_start, new_end)]
+                    )
+                    progress.fragments.append(
+                        _TextFragment(
+                            new_start,
+                            new_end,
+                            fragment_text,
+                            float(piece["top"]),
+                            float(piece["contentY"]),
+                        )
+                    )
+                    segment_key = sha256(
+                        self._body_progress_salt
+                        + f"{fingerprint or 'display'}:{identity}:{new_start}:{new_end}".encode()
+                    ).hexdigest()
+                    new_segments.append(
+                        VisibleBodySegment(
+                            segment_key,
+                            fragment_text,
+                            float(piece["top"]),
+                            float(piece["contentY"]),
+                        )
+                    )
+
+        has_text_state = has_rendered_text or bool(progress_state)
+        body_complete = bool(
+            fingerprint is not None
+            and progress_state
+            and has_rendered_text
+            and not observation["truncated"]
+            and not content_changed
+            and all(
+                not self._subtract_ranges(start, end, progress.visited_ranges)
+                for progress in progress_state.values()
+                for start, end in progress.expected_ranges
+            )
+        )
+        body_parts: list[str] = []
+        previous_block: int | None = None
+        for _identity, progress in sorted(
+            progress_state.items(), key=lambda item: item[1].order
+        ):
+            if previous_block is not None and progress.block != previous_block:
+                body_parts.append("\n")
+            for fragment in sorted(progress.fragments, key=lambda item: item.start):
+                body_parts.append(fragment.text)
+            previous_block = progress.block
+        body = "".join(body_parts)
+        self.last_scan_counts.new_visible_text_segments += len(new_segments)
+        self.last_scan_counts.deferred_above += deferred_above
+        self.last_scan_counts.deferred_below += deferred_below
+        if nearest_deferred_below is not None:
+            current = self.last_scan_counts.nearest_deferred_below_px
+            self.last_scan_counts.nearest_deferred_below_px = min(
+                nearest_deferred_below if current is None else current,
+                nearest_deferred_below,
+            )
+        if frontier_content is not None:
+            current_frontier = self.last_scan_counts.frontier_content_px
+            self.last_scan_counts.frontier_content_px = max(
+                frontier_content if current_frontier is None else current_frontier,
+                frontier_content,
+            )
+        return _VisibleBodyRead(
+            body if body.strip() else None,
+            body_complete,
+            has_text_state,
+            not content_changed,
+            tuple(new_segments),
+            deferred_above,
+            deferred_below,
+            nearest_deferred_below,
+            frontier_content,
+            bool(observation["truncated"]),
         )
 
     async def _read_card(
@@ -4274,6 +4906,7 @@ class ThreadsHomeReader:
         viewport_y: float = 0.0,
         require_body: bool = False,
         cached_body_fingerprints: set[str] | None = None,
+        visible_text_progress: bool = False,
     ) -> PostTarget:
         if not await root.is_visible():
             raise _CardNotReady(root)
@@ -4385,6 +5018,7 @@ class ThreadsHomeReader:
             )
 
         fingerprint = sha256(f"{url}\n{author}".encode()).hexdigest()
+        body_truncated = False
         cached_body = (
             self._cached_home_bodies.get(fingerprint)
             if not require_body
@@ -4410,35 +5044,62 @@ class ThreadsHomeReader:
                 viewport_y=viewport_y,
             )
         permalink_visible = True
+        visible_body: _VisibleBodyRead | None = None
         if currently_visible:
-            has_body_candidate, body_fully_visited = (
-                await self._visible_body_candidate_state(
+            if visible_text_progress:
+                visible_body = await self._read_visible_body_progress(
                     root,
+                    root_handle,
                     fingerprint=fingerprint,
                 )
-            )
-            if has_body_candidate and not body_fully_visited:
-                raise _CardDeferredOffscreen(
-                    fingerprint,
-                    "POST_BODY_PARTIALLY_VISIBLE",
+            else:
+                has_body_candidate, body_fully_visited = (
+                    await self._visible_body_candidate_state(
+                        root,
+                        fingerprint=fingerprint,
+                    )
                 )
+                if has_body_candidate and not body_fully_visited:
+                    raise _CardDeferredOffscreen(
+                        fingerprint,
+                        "POST_BODY_PARTIALLY_VISIBLE",
+                    )
             permalink_visible = await self._is_in_visible_scrollports(link)
-            if not permalink_visible and not has_body_candidate:
+            if (
+                not permalink_visible
+                and not visible_text_progress
+                and not has_body_candidate
+            ):
                 raise _CardDeferredOffscreen(
                     fingerprint,
                     "POST_PERMALINK_OUTSIDE_VISIBLE_SCROLLPORT",
                 )
 
-        body, body_available, body_truncated, body_signals = await self._extract_card_body(
-            root,
-            root_handle,
-            require_body=require_body,
-        )
-        if not body_available and body_signals:
-            raise _CardNotReady(
-                signals=body_signals,
-                reason_code="POST_BODY_PENDING",
+        if visible_text_progress and visible_body is not None:
+            body = visible_body.body
+            body_available = bool(body and body.strip())
+            body_complete = visible_body.complete and body_available
+            body_consistent = visible_body.consistent
+            body_segments = visible_body.segments
+            body_truncated = body_truncated or visible_body.truncated
+        else:
+            body, body_available, body_truncated, body_signals = (
+                await self._extract_card_body(
+                    root,
+                    root_handle,
+                    require_body=require_body,
+                )
             )
+            if not body_available and body_signals:
+                raise _CardNotReady(
+                    signals=body_signals,
+                    reason_code="POST_BODY_PENDING",
+                )
+            body_complete = body_available
+            body_consistent = True
+            body_segments = ()
+        if body and body.rstrip().endswith(("…", "...")):
+            body_truncated = True
         return PostTarget(
             url,
             author,
@@ -4447,6 +5108,9 @@ class ThreadsHomeReader:
             link,
             body_available=body_available,
             body_truncated=body_truncated,
+            body_complete=body_complete,
+            body_consistent=body_consistent,
+            visible_segments=body_segments,
             currently_visible=currently_visible and permalink_visible,
             viewport_y=viewport_y,
         )

@@ -1579,11 +1579,11 @@ window.addEventListener("wheel", event => {
                 terms=("hiring", "engineer"),
             )
             assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
-            assert result.home_sampled == 0
+            assert result.home_sampled == 1
             assert result.detail_reads == 0
-            assert result.scroll_attempts == result.scrolls == 0
+            assert result.scroll_attempts == result.scrolls > 0
             assert not result.viewport_coverage_complete
-            assert await page.evaluate("sessionStorage.getItem('wheel-target')") is None
+            assert await page.evaluate("sessionStorage.getItem('wheel-target')") is not None
 
         _run_offline_page(html, exercise)
         policy = policy_fingerprint(canonical_terms(("hiring", "engineer")))
@@ -3427,7 +3427,7 @@ article {{ box-sizing: border-box; height: 680px; padding-top: 430px; }}
 
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
-    assert "state=DEFERRED_OFFSCREEN" in output
+    assert "state=PENDING_HYDRATION" in output
     assert f"| {body}" in output
     assert output.count(f"| {body}") == 2
     assert "[BACK] post=1 status=FAILED anchor=CHANGED" in output
@@ -3494,7 +3494,8 @@ window.addEventListener("wheel", () => window.wheelCount++);
 
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
-    assert "reason=POST_BODY_PARTIALLY_VISIBLE" in output
+    assert "reason=VISIBLE_TEXT_PROGRESS" in output
+    assert "[SCROLL_PROGRESS]" in output
     for part in body_parts:
         assert output.count(part) == 1
     assert "[DETAIL]" not in output
@@ -3505,6 +3506,198 @@ window.addEventListener("wheel", () => window.wheelCount++);
     )
     assert checkpoint.home_sampled == 1
     assert checkpoint.detail_reads == 0
+
+
+def test_pressable_fragment_progress_keeps_identity_through_native_wheels_and_detail_back(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    detail_url = "https://www.threads.com/@candidate/post/eligible"
+    fragments = (
+        "Synthetic pressable fragment alpha",
+        "Synthetic pressable fragment bravo",
+        "Synthetic pressable fragment charlie",
+        "Synthetic pressable fragment delta",
+    )
+    eligible_body = "Hiring a backend engineer…"
+    detail_body = eligible_body
+    feed_html = f"""<!doctype html><html><head><style>
+html, body {{ margin: 0; }}
+nav {{ height: 36px; }}
+.card {{ position: relative; box-sizing: border-box; height: 240px; }}
+.tall {{ height: 840px; }}
+.identity {{ position: absolute; top: 4px; z-index: 2; }}
+.decorative {{ position: absolute; inset: 22px 0 auto; height: 800px; }}
+.card-body {{ position: absolute; top: 50px; left: 12px; right: 12px; z-index: 1; }}
+.tall .card-body {{ top: 70px; }}
+.card-body p {{ position: absolute; left: 0; height: 34px; margin: 0; }}
+.card-body p:nth-child(1) {{ top: 0; }}
+.card-body p:nth-child(2) {{ top: 220px; }}
+.card-body p:nth-child(3) {{ top: 440px; }}
+.card-body p:nth-child(4) {{ top: 650px; }}
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main>
+<div id="tall" class="card tall" data-pressable-container="true">
+  <div class="identity"><a href="/@candidate/post/tall"><time>now</time></a>
+  <a href="/@candidate">candidate</a></div>
+  <div class="decorative" aria-hidden="true"></div>
+  <div class="card-body">{''.join(f'<p>{part}</p>' for part in fragments)}</div>
+</div>
+<div class="card" data-pressable-container="true">
+  <div class="identity"><a href="/@candidate/post/weather"><time>1h</time></a>
+  <a href="/@candidate">candidate</a></div>
+  <div class="card-body"><p>A synthetic weather update</p></div>
+</div>
+<div class="card" data-pressable-container="true">
+  <div class="identity"><a href="/@candidate/post/eligible"><time>now</time></a>
+  <a href="/@candidate">candidate</a></div>
+  <div class="card-body"><p>{eligible_body}</p></div>
+</div></main><script>
+window.nativeWheelCount = Number(sessionStorage.getItem('synthetic-wheel-count') || 0);
+window.headerOffscreenAfterFirstWheel =
+  sessionStorage.getItem('synthetic-header-offscreen') === 'true';
+window.headerAttachedAfterFirstWheel =
+  sessionStorage.getItem('synthetic-header-attached') === 'true';
+window.addEventListener('wheel', () => {{
+  window.nativeWheelCount += 1;
+  sessionStorage.setItem('synthetic-wheel-count', String(window.nativeWheelCount));
+}});
+window.addEventListener('scroll', () => {{
+  if (window.nativeWheelCount !== 1) return;
+  const header = document.querySelector('#tall time').getBoundingClientRect();
+  window.headerOffscreenAfterFirstWheel = header.bottom <= 0;
+  window.headerAttachedAfterFirstWheel = document.querySelector('#tall time').isConnected;
+  sessionStorage.setItem(
+    'synthetic-header-offscreen', String(window.headerOffscreenAfterFirstWheel)
+  );
+  sessionStorage.setItem(
+    'synthetic-header-attached', String(window.headerAttachedAfterFirstWheel)
+  );
+}}, {{ once: true }});
+</script></body></html>"""
+    detail_html = f"""<!doctype html><html><body><main><article>
+<a href="/@candidate/post/eligible"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>{detail_body}</p>
+</article></main></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "synthetic-profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+    detail_visits = 0
+
+    async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            nonlocal detail_visits
+            detail_visits += 1
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=detail_html,
+            )
+
+        await page.route(detail_url, serve_detail)
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=3,
+            max_scrolls=8,
+            max_total_posts=10,
+            terms=("hiring", "engineer"),
+            detail=True,
+        )
+        assert result.status == "COMPLETE"
+        assert result.home_sampled == result.unique_verified_posts == 3
+        assert result.viewport_observations > result.unique_verified_posts
+        assert result.detail_reads == detail_visits == 1
+        assert result.scroll_attempts == result.scrolls
+        assert result.visible_text_segments >= len(fragments)
+        assert await page.evaluate("window.nativeWheelCount") == result.scroll_attempts
+        assert await page.evaluate("window.headerOffscreenAfterFirstWheel")
+        assert await page.evaluate("window.headerAttachedAfterFirstWheel")
+
+    _run_offline_page(feed_html, exercise)
+    output = capsys.readouterr().out
+    for fragment in fragments:
+        assert output.count(fragment) == 1
+    assert output.count("A synthetic weather update") == 1
+    assert output.count("Hiring a backend engineer") == 2
+    assert "[SCROLL_PROGRESS]" in output
+    assert "[SELECT]" in output
+    assert "[DETAIL] post=3 status=VERIFIED" in output
+    assert "[BACK] post=3 status=RESTORED anchor=MATCHED" in output
+    assert "[CHECKPOINT] status=SAVED completed_runs=1" in output
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring", "engineer"))),
+    )
+    assert checkpoint.completed_runs == 1
+    persisted = (
+        data_root
+        / "nurture"
+        / "checkpoints"
+        / f"{account.account_id}-{policy_fingerprint(canonical_terms(('hiring', 'engineer')))}.json"
+    ).read_text(encoding="utf-8")
+    assert all(
+        value not in persisted
+        for value in (*fragments, eligible_body, detail_body, detail_url, actor)
+    )
+
+
+def test_moved_wheels_without_new_content_stop_with_a_bounded_reason(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    feed_html = f"""<!doctype html><html><head><style>
+html, body {{ height: 100%; margin: 0; overflow: hidden; }}
+nav {{ height: 36px; }}
+#scroll-port {{ height: 300px; overflow-y: auto; margin-top: 8px; }}
+.card {{ position: relative; height: 700px; }}
+.decorative {{ height: 650px; }}
+.body {{ position: absolute; top: 60px; left: 12px; }}
+</style></head><body><nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main id="scroll-port"><div class="card" data-pressable-container="true">
+<a href="/@candidate/post/no-new-content"><time>now</time></a>
+<a href="/@candidate">candidate</a>
+<div class="decorative" aria-hidden="true"></div>
+<p class="body">Synthetic already-read weather update</p>
+</div></main></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "synthetic-profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+
+    async def exercise(page) -> None:
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=2,
+            max_scrolls=8,
+            max_total_posts=10,
+            terms=("hiring",),
+            detail=True,
+        )
+        assert result.status == "VERIFIED_IRRELEVANT"
+        assert result.scroll_attempts == result.scrolls == 3
+        assert result.viewport_coverage_complete
+        assert result.unresolved_gaps == 0
+
+    _run_offline_page(feed_html, exercise)
+    output = capsys.readouterr().out
+    assert "state=MOVED_NO_NEW_CONTENT" in output
+    assert "status=STOPPED reason=NO_NEW_CONTENT" in output
+    assert "[DETAIL]" not in output
+    assert "[CHECKPOINT] status=SAVED completed_runs=1" in output
 
 
 def test_pending_pressable_waits_for_missing_permalink_and_rescans() -> None:

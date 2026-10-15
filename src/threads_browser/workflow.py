@@ -13,7 +13,7 @@ from hashlib import sha256
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page, async_playwright
 
-from .feed.models import DisplayObservation, PostTarget
+from .feed.models import DisplayObservation, PostTarget, VisibleBodySegment
 from .feed.relevance import canonical_terms, classify_body
 from .reader import (
     ThreadsHomeReader,
@@ -99,6 +99,23 @@ def _print_observed_text(
         print(f"| {line}")
     print("<<< UNVERIFIED OBSERVED TEXT END >>>")
     return True
+
+
+def _print_visible_segments(
+    reference: str,
+    segments: tuple[VisibleBodySegment, ...],
+) -> int:
+    emitted = 0
+    for segment in segments:
+        print(
+            f"[TEXT_SEGMENT {reference}] y={segment.viewport_y:.1f} "
+            f"content_y={segment.content_y:.1f} chars={len(segment.text)}",
+            flush=True,
+        )
+        for line in _terminal_safe_post_text(segment.text).split("\n"):
+            print(f"| {line}", flush=True)
+        emitted += 1
+    return emitted
 
 
 def _print_detail_body(
@@ -208,6 +225,11 @@ class NurtureResult:
     unverified_relevant: int = 0
     skipped_rows: int = 0
     viewport_coverage_complete: bool = True
+    viewport_observations: int = 0
+    unique_verified_posts: int = 0
+    unique_deferred_posts: int = 0
+    unresolved_gaps: int = 0
+    visible_text_segments: int = 0
 
 
 def policy_fingerprint(terms: tuple[str, ...]) -> str:
@@ -286,9 +308,33 @@ async def run_page_workflow(
     streamed_home_fingerprints: set[str] = set()
     unresolved_deferred_fingerprints: set[str] = set()
     unresolved_deferred_without_identity = False
+    unique_deferred_fingerprints: set[str] = set()
+    fully_read_fingerprints: set[str] = set()
+    checkpoint_overlap_fingerprints: set[str] = set()
+    streamed_segment_ids: set[str] = set()
+    visible_text_segments = 0
+    consecutive_moved_no_content = 0
+    pending_scroll_baseline: tuple[float | None, float | None] | None = None
+
+    def reliability_metrics() -> dict[str, int]:
+        return {
+            "viewport_observations": observed_rows,
+            "unique_verified_posts": len(fully_read_fingerprints),
+            "unique_deferred_posts": len(unique_deferred_fingerprints),
+            "unresolved_gaps": (
+                len(unresolved_deferred_fingerprints)
+                + int(unresolved_deferred_without_identity)
+            ),
+            "visible_text_segments": visible_text_segments,
+        }
 
     async def advance_feed(*, scan_after_scroll: bool = False) -> bool:
+        nonlocal pending_scroll_baseline
         attempt = reader.scroll_attempts + 1
+        baseline = (
+            reader.last_scan_counts.frontier_content_px,
+            reader.last_scan_counts.nearest_deferred_below_px,
+        )
         if detail:
             print(f"[SCROLL] attempt={attempt} status=REQUESTED")
         try:
@@ -309,6 +355,8 @@ async def run_page_workflow(
                     f"[SCROLL] attempt={attempt} status=STOPPED "
                     f"reason={reader.last_scroll_stop_reason or 'NOT_ADVANCED'}"
                 )
+        if advanced:
+            pending_scroll_baseline = baseline
         return advanced
 
     def select_verified_fallback(targets: list[PostTarget]) -> None:
@@ -329,7 +377,6 @@ async def run_page_workflow(
             exhaustion_reason = "MAX_TOTAL_POSTS"
             break
         viewport_number += 1
-        duplicate_count_before_scan = reader.feed_duplicates
         viewport_relevant = 0
         viewport_irrelevant = 0
         viewport_unknown = 0
@@ -359,15 +406,23 @@ async def run_page_workflow(
             nonlocal viewport_observation_unknown, viewport_relevant
             nonlocal viewport_unverified_relevant, viewport_unknown
             nonlocal unresolved_deferred_without_identity
+            nonlocal visible_text_segments
 
             diagnostic = row.diagnostic
-            if diagnostic.state == "DEFERRED_OFFSCREEN":
-                if row.fingerprint in seen_this_run:
-                    pass
-                elif row.fingerprint is not None:
+            if diagnostic.state in {
+                "DEFERRED_OFFSCREEN",
+                "PARTIAL_BODY",
+                "PENDING_HYDRATION",
+            }:
+                if row.fingerprint is not None:
                     unresolved_deferred_fingerprints.add(row.fingerprint)
+                    unique_deferred_fingerprints.add(row.fingerprint)
                 else:
                     unresolved_deferred_without_identity = True
+            elif diagnostic.state == "VERIFIED" and row.fingerprint is not None:
+                unresolved_deferred_fingerprints.discard(row.fingerprint)
+            elif diagnostic.state != "NON_POST":
+                unresolved_deferred_without_identity = True
             if detail:
                 print(
                     f"[ROW row={diagnostic.row_index}] root={diagnostic.root_kind} "
@@ -382,17 +437,59 @@ async def run_page_workflow(
                 )
             target = row.target
             if target is not None:
-                if (
-                    diagnostic.state == "VERIFIED"
-                    and target.fingerprint not in provenance_verified_fingerprints
-                ):
+                if target.fingerprint not in provenance_verified_fingerprints:
                     provenance_verified_fingerprints.add(target.fingerprint)
                     provenance_verified += 1
-                if diagnostic.state != "VERIFIED" or not target.body:
+                if diagnostic.state == "PARTIAL_BODY":
+                    new_segments = tuple(
+                        segment
+                        for segment in target.visible_segments
+                        if segment.segment_id not in streamed_segment_ids
+                    )
+                    visible_text_segments += len(new_segments)
+                    streamed_segment_ids.update(
+                        segment.segment_id for segment in new_segments
+                    )
+                    if detail or show_post_text:
+                        _print_visible_segments(
+                            f"viewport={viewport_number} row={diagnostic.row_index}",
+                            new_segments,
+                        )
+                        if new_segments:
+                            streamed_home_fingerprints.add(target.fingerprint)
+                    return
+                if diagnostic.state != "VERIFIED" or not target.body or not target.body_complete:
                     return
                 unresolved_deferred_fingerprints.discard(target.fingerprint)
+                if target.fingerprint not in fully_read_fingerprints:
+                    fully_read_fingerprints.add(target.fingerprint)
+                    reader.last_scan_counts.new_verified_rows += 1
+                new_segments = tuple(
+                    segment
+                    for segment in target.visible_segments
+                    if segment.segment_id not in streamed_segment_ids
+                )
+                visible_text_segments += len(new_segments)
+                streamed_segment_ids.update(
+                    segment.segment_id for segment in new_segments
+                )
+                if (
+                    new_segments
+                    and target.fingerprint in streamed_home_fingerprints
+                    and (detail or show_post_text)
+                ):
+                    _print_visible_segments(
+                        f"viewport={viewport_number} row={diagnostic.row_index}",
+                        new_segments,
+                    )
                 if target.fingerprint in seen_this_run:
-                    duplicates += 1
+                    if (
+                        target.fingerprint in previously_seen
+                        and target.fingerprint in checkpoint_overlap_fingerprints
+                    ):
+                        duplicates += 1
+                    elif target.fingerprint in previously_seen:
+                        checkpoint_overlap_fingerprints.add(target.fingerprint)
                     if detail and target.fingerprint not in streamed_home_fingerprints:
                         print(
                             f"[POST post={post_numbers[target.fingerprint]}] "
@@ -420,8 +517,6 @@ async def run_page_workflow(
                 is_new = target.fingerprint not in previously_seen
                 if is_new:
                     new_fingerprints.add(target.fingerprint)
-                else:
-                    duplicates += 1
                 decision = classify_body(target.body, normalized_terms)
                 decisions_by_fingerprint[target.fingerprint] = decision
                 classified += 1
@@ -437,8 +532,20 @@ async def run_page_workflow(
                         ):
                             previewed_bodies += 1
                         streamed_home_fingerprints.add(target.fingerprint)
-                elif show_post_text and _print_post_text(
+                    else:
+                        print(
+                            f"[POST post={post_numbers[target.fingerprint]}] "
+                            f"status=VERIFIED decision={decision} "
+                            f"extent={'TRUNCATED' if target.body_truncated else 'COMPLETE'} "
+                            f"chars={len(target.body)} text=STREAMED",
+                            flush=True,
+                        )
+                elif (
+                    show_post_text
+                    and target.fingerprint not in streamed_home_fingerprints
+                    and _print_post_text(
                     viewport_number, decision, target.body
+                    )
                 ):
                     previewed_bodies += 1
                 if decision == "RELEVANT":
@@ -543,7 +650,6 @@ async def run_page_workflow(
             )
         except UiReadError as error:
             counts = reader.last_scan_counts
-            duplicates += reader.feed_duplicates - duplicate_count_before_scan
             rejection_reasons = ",".join(
                 f"{reason}:{count}"
                 for reason, count in sorted(counts.rejection_reasons.items())
@@ -604,11 +710,11 @@ async def run_page_workflow(
                     unverified_relevant=unverified_relevant,
                     skipped_rows=skipped_rows,
                     viewport_coverage_complete=False,
+                    **reliability_metrics(),
                 )
             if detail:
                 _detail_stop(error.code)
             raise
-        duplicates += reader.feed_duplicates - duplicate_count_before_scan
         scan_counts = reader.last_scan_counts
         if detail:
             print(
@@ -633,8 +739,71 @@ async def run_page_workflow(
         previous_unverified_rows = current_unverified_rows
         observed_rows += scan_counts.observed_rows
         skipped_rows += scan_counts.skipped_rows
-        if not scan_counts.coverage_complete and not reader.last_viewport_deferred_only:
-            viewport_coverage_complete = False
+        if not scan_counts.coverage_complete:
+            unresolved_states = {
+                row.state
+                for row in reader.last_candidate_diagnostics
+                if row.state not in {"NON_POST", "VERIFIED"}
+            }
+            known_identity_progress = bool(unresolved_states) and unresolved_states.issubset(
+                {"DEFERRED_OFFSCREEN", "PARTIAL_BODY", "PENDING_HYDRATION"}
+            ) and all(
+                row.identity_fingerprint is not None
+                for row in reader.last_candidate_diagnostics
+                if row.state
+                in {"DEFERRED_OFFSCREEN", "PARTIAL_BODY", "PENDING_HYDRATION"}
+            )
+            if not known_identity_progress:
+                unresolved_deferred_without_identity = True
+        viewport_coverage_complete = not (
+            unresolved_deferred_fingerprints or unresolved_deferred_without_identity
+        )
+
+        if pending_scroll_baseline is not None:
+            previous_frontier, previous_nearest = pending_scroll_baseline
+            current_frontier = scan_counts.frontier_content_px
+            frontier_delta = (
+                None
+                if previous_frontier is None or current_frontier is None
+                else current_frontier - previous_frontier
+            )
+            nearest = scan_counts.nearest_deferred_below_px
+            approached_deferred = (
+                previous_nearest is not None
+                and nearest is not None
+                and nearest < previous_nearest - 1
+            )
+            made_progress = bool(
+                scan_counts.new_visible_text_segments > 0
+                or scan_counts.new_verified_rows > 0
+                or (frontier_delta is not None and frontier_delta > 1)
+                or approached_deferred
+            )
+            consecutive_moved_no_content = (
+                0
+                if made_progress or not reader.last_scroll_near_end
+                else consecutive_moved_no_content + 1
+            )
+            print(
+                f"[SCROLL_PROGRESS] attempt={reader.scrolls} "
+                f"state={'ADVANCED_WITH_CONTENT' if made_progress else 'MOVED_NO_NEW_CONTENT'} "
+                f"new_segments={scan_counts.new_visible_text_segments} "
+                f"new_verified={scan_counts.new_verified_rows} "
+                f"frontier_delta_px={'UNKNOWN' if frontier_delta is None else f'{frontier_delta:.1f}'} "
+                f"deferred_above={scan_counts.deferred_above} "
+                f"deferred_below={scan_counts.deferred_below} "
+                f"nearest_below_px={'UNKNOWN' if nearest is None else f'{nearest:.1f}'} "
+                f"band={reader.last_scroll_band} "
+                f"end_proximity={'NEAR' if reader.last_scroll_near_end else 'FAR'} "
+                f"end_distance_px={'UNKNOWN' if reader.last_scroll_end_distance is None else f'{reader.last_scroll_end_distance:.1f}'} "
+                f"no_new_content_streak={consecutive_moved_no_content}",
+                flush=True,
+            )
+            pending_scroll_baseline = None
+            if consecutive_moved_no_content >= 2:
+                exhaustion_reason = "NO_NEW_CONTENT"
+                print("[SCROLL_PROGRESS] status=STOPPED reason=NO_NEW_CONTENT", flush=True)
+                break
         observation_status = (
             "RELEVANT_UNVERIFIED"
             if viewport_unverified_relevant
@@ -715,8 +884,11 @@ async def run_page_workflow(
                     unverified_relevant=unverified_relevant,
                     skipped_rows=skipped_rows,
                     viewport_coverage_complete=False,
+                    **reliability_metrics(),
                 )
-        if unresolved_deferred_fingerprints or unresolved_deferred_without_identity:
+        if (
+            unresolved_deferred_fingerprints or unresolved_deferred_without_identity
+        ) and not (unverified_relevant and not found_relevant):
             if reader.scroll_attempts < max_scrolls and await advance_feed():
                 continue
             if detail:
@@ -745,6 +917,7 @@ async def run_page_workflow(
                 unverified_relevant=unverified_relevant,
                 skipped_rows=skipped_rows,
                 viewport_coverage_complete=False,
+                **reliability_metrics(),
             )
         if not viewport_coverage_complete:
             can_continue_observing = bool(
@@ -846,6 +1019,7 @@ async def run_page_workflow(
             unverified_relevant=unverified_relevant,
             skipped_rows=skipped_rows,
             viewport_coverage_complete=False,
+            **reliability_metrics(),
         )
     if selected is None and not found_relevant:
         if exhaustion_reason in {"FEED_END_REACHED", "FEED_NOT_SCROLLABLE"}:
@@ -954,6 +1128,7 @@ async def run_page_workflow(
             unverified_relevant=unverified_relevant,
             skipped_rows=skipped_rows,
             viewport_coverage_complete=viewport_coverage_complete,
+            **reliability_metrics(),
         )
     elif len(seen_this_run) == 0:
         if show_post_text and previewed_bodies == 0:
@@ -1001,6 +1176,7 @@ async def run_page_workflow(
             unverified_relevant=unverified_relevant,
             skipped_rows=skipped_rows,
             viewport_coverage_complete=viewport_coverage_complete,
+            **reliability_metrics(),
         )
     elif pending_set or (
         found_relevant and exhaustion_reason == "FEED_END_REACHED"
@@ -1037,6 +1213,7 @@ async def run_page_workflow(
             unverified_relevant=unverified_relevant,
             skipped_rows=skipped_rows,
             viewport_coverage_complete=viewport_coverage_complete,
+            **reliability_metrics(),
         )
     elif exhaustion_reason == "FEED_END_REACHED":
         status = "FEED_END_REACHED"
@@ -1114,6 +1291,14 @@ async def run_page_workflow(
         unverified_relevant=unverified_relevant,
         skipped_rows=skipped_rows,
         viewport_coverage_complete=viewport_coverage_complete,
+        viewport_observations=observed_rows,
+        unique_verified_posts=len(fully_read_fingerprints),
+        unique_deferred_posts=len(unique_deferred_fingerprints),
+        unresolved_gaps=(
+            len(unresolved_deferred_fingerprints)
+            + int(unresolved_deferred_without_identity)
+        ),
+        visible_text_segments=visible_text_segments,
     )
 
 
