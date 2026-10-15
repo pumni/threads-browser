@@ -33,6 +33,7 @@ from .browser_ui.body_text import (
     _canonicalize_body_block,
     _VisibleBodyRead,
 )
+from .browser_ui.detail import DetailNavigator
 from .browser_ui.feed_rows import (
     _BODY_EXCLUSION_SELECTOR,
     _BODY_TEXT_SELECTOR,
@@ -237,6 +238,11 @@ class ThreadsHomeReader:
         self._cached_home_bodies: dict[str, tuple[str, bool]] = {}
         self._detail_return_anchor: tuple[str, float] | None = None
         self._detail_return_target: PostTarget | None = None
+        self._detail_navigator = DetailNavigator(
+            self,
+            timeout_ms=_DETAIL_TIMEOUT_MS,
+            max_permalink_candidates=_MAX_PERMALINK_CANDIDATES,
+        )
         self._reported_render_rescans: set[tuple[str, float | None]] = set()
         self._skipped_candidate_identities: set[str] = set()
         self._reported_candidate_skips: dict[tuple[str, str], set[str]] = {}
@@ -3573,218 +3579,16 @@ class ThreadsHomeReader:
         return matches[0]
 
     async def _detail_click_point(self, permalink: Locator) -> tuple[float, float]:
-        viewport = self._page.viewport_size
-        box = await permalink.bounding_box()
-        if (
-            viewport is None
-            or box is None
-            or box["width"] <= 0
-            or box["height"] <= 0
-            or not await self._is_in_visible_scrollports(permalink)
-        ):
-            raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED")
-        point = (
-            box["x"] + box["width"] / 2,
-            box["y"] + box["height"] / 2,
-        )
-        if not (0 <= point[0] < viewport["width"] and 0 <= point[1] < viewport["height"]):
-            raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED")
-        try:
-            hit_is_permalink = await permalink.evaluate(
-                """(node, point) => {
-                    const hit = document.elementFromPoint(point.x, point.y);
-                    return Boolean(hit && (hit === node || node.contains(hit)));
-                }""",
-                {"x": point[0], "y": point[1]},
-            )
-        except PlaywrightError:
-            raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED") from None
-        if not hit_is_permalink:
-            raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED")
-        return point
+        return await self._detail_navigator._detail_click_point(permalink)
 
     async def _read_detail(self, target: PostTarget) -> PostTarget:
-        if not target.currently_visible:
-            raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED")
-        deadline = self._readiness_deadline(_DETAIL_TIMEOUT_MS)
-        try:
-
-            def is_target_url(value: str) -> bool:
-                parsed = _post_url(value)
-                return parsed is not None and parsed == (target.url, target.author)
-
-            await self._wait_for_verified_feed(
-                deadline,
-                timeout_code="DETAIL_NAVIGATION_UNVERIFIED",
-            )
-            current = await self._revalidate_action_target(target)
-            click_point = await self._detail_click_point(current.permalink)
-            self._remaining_readiness_ms(
-                deadline,
-                "DETAIL_NAVIGATION_UNVERIFIED",
-            )
-            # Page.mouse.click sends input at the already-visible anchor point
-            # without Playwright's locator auto-scroll behavior.
-            try:
-                await self._page.mouse.click(*click_point)
-            except PlaywrightError:
-                raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED") from None
-            self._mark_ui_transition()
-            await self._page.wait_for_url(
-                is_target_url,
-                timeout=self._remaining_readiness_ms(
-                    deadline,
-                    "DETAIL_NAVIGATION_UNVERIFIED",
-                ),
-            )
-        except PlaywrightTimeoutError:
-            raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED") from None
-        if not _same_home_origin(self._page.url):
-            raise UiReadError("OFF_ORIGIN_REDIRECT")
-
-        async def read_detail_window(window_deadline: float) -> PostTarget:
-            last_timeout_code = "DETAIL_ROOT_UNVERIFIED"
-
-            async def observe() -> _RenderObservation[PostTarget] | None:
-                nonlocal last_timeout_code
-                self._remaining_readiness_ms(
-                    window_deadline,
-                    last_timeout_code,
-                )
-                if not _same_home_origin(self._page.url):
-                    raise UiReadError("OFF_ORIGIN_REDIRECT")
-                if not is_target_url(self._page.url):
-                    await self._check_blocker()
-                    raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED")
-                await self._check_blocker()
-                try:
-                    articles = self._page.get_by_role("article")
-                    matching: list[Locator] = []
-                    for index in range(await articles.count()):
-                        article = articles.nth(index)
-                        for link in await article.get_by_role("link").all():
-                            href = await link.get_attribute("href")
-                            parsed = None if href is None else _post_url(href)
-                            if parsed is not None and parsed[0] == target.url:
-                                matching.append(article)
-                                break
-                            if href is not None and _post_url_hint(href) and parsed is None:
-                                raise UiReadError("DETAIL_PROVENANCE_UNVERIFIED")
-                    if len(matching) > 1:
-                        raise UiReadError("DETAIL_ROOT_AMBIGUOUS")
-                    root = matching[0] if matching else await self._detail_permalink_card(target)
-                    detail = await self._read_card(
-                        root,
-                        require_body=target.body is not None,
-                    )
-                    self._remaining_readiness_ms(
-                        window_deadline,
-                        last_timeout_code,
-                    )
-                    if not detail.body_available:
-                        last_timeout_code = "DETAIL_BODY_UNVERIFIED"
-                        return None
-                    signature = (
-                        detail.url,
-                        detail.author,
-                        detail.body,
-                        detail.body_available,
-                        len(matching),
-                    )
-                    return _RenderObservation(
-                        signature,
-                        detail,
-                        ready_state="DETAIL_VERIFIED",
-                    )
-                except _CardNotReady as pending:
-                    last_timeout_code = pending.timeout_code or "DETAIL_ROOT_UNVERIFIED"
-                    await self._wait_for_pending_card(pending, window_deadline)
-                    return None
-
-            try:
-                return await self._await_render_settled(
-                    "DETAIL",
-                    window_deadline,
-                    timeout_code="DETAIL_ROOT_UNVERIFIED",
-                    observe=observe,
-                )
-            except UiReadError as error:
-                if (
-                    error.code == "DETAIL_ROOT_UNVERIFIED"
-                    and last_timeout_code != "DETAIL_ROOT_UNVERIFIED"
-                ):
-                    raise UiReadError(last_timeout_code) from None
-                raise
-
-        detail = await self._recoverable_stage(
-            "DETAIL",
-            "DETAIL_ROOT_UNVERIFIED",
-            read_detail_window,
-            recoverable_codes=(
-                "DETAIL_ROOT_UNVERIFIED",
-                "DETAIL_BODY_UNVERIFIED",
-            ),
-        )
-        if detail.url != target.url or detail.author != target.author:
-            raise UiReadError("DETAIL_PROVENANCE_UNVERIFIED")
-        if detail.body is None or target.body is None:
-            raise UiReadError("DETAIL_BODY_UNVERIFIED")
-        home_body = " ".join(normalize_text(target.body).split())
-        detail_body = " ".join(normalize_text(detail.body).split())
-        body_matches = detail_body == home_body
-        prefix = home_body
-        if target.body_truncated and not body_matches:
-            prefix = home_body.rstrip(" .…")
-            body_matches = bool(prefix) and detail_body.startswith(prefix)
-        if not body_matches:
-            raise UiReadError("DETAIL_BODY_UNVERIFIED")
-        self._detail_return_anchor = (target.fingerprint, target.viewport_y)
-        self._detail_return_target = target
-        return detail
+        return await self._detail_navigator._read_detail(target)
 
     async def _detail_permalink_card(self, target: PostTarget) -> Locator:
-        region = await self._content_region(
-            prefer_main=True,
-            error_code="DETAIL_REGION_AMBIGUOUS",
-        )
-        permalinks = region.locator('a[href*="/post/"]')
-        scan_limit = min(await permalinks.count(), _MAX_PERMALINK_CANDIDATES)
-        for index in range(scan_limit):
-            permalink = permalinks.nth(index)
-            if not await permalink.is_visible():
-                continue
-            if await self._is_outside_content_landmark(permalink):
-                continue
-            href = await permalink.get_attribute("href")
-            parsed_post = None if href is None else _post_url(href)
-            if parsed_post is None:
-                if href is not None and _post_url_hint(href):
-                    raise UiReadError("DETAIL_PROVENANCE_UNVERIFIED")
-                continue
-            if parsed_post[0] != target.url:
-                continue
-            root, _ = await self._resolve_permalink_card(
-                permalink,
-                target.url,
-                target.author,
-            )
-            return root
-        path = urlsplit(target.url).path
-        matching_permalink = region.locator(f'a[href$="{path}"]')
-        raise _CardNotReady(matching_permalink.first, in_viewport=True)
+        return await self._detail_navigator._detail_permalink_card(target)
 
     async def return_to_home(self) -> None:
-        await self._go_back_to_home()
-        anchor = self._detail_return_anchor
-        target = self._detail_return_target
-        if anchor is None or target is None:
-            raise UiReadError("RETURN_CONTEXT_CHANGED")
-        try:
-            current = await self._revalidate_action_target(target)
-        except UiReadError:
-            raise UiReadError("RETURN_CONTEXT_CHANGED") from None
-        if current.fingerprint != anchor[0] or abs(current.viewport_y - anchor[1]) > 48:
-            raise UiReadError("RETURN_CONTEXT_CHANGED")
+        await self._detail_navigator.return_to_home()
 
     async def _for_you_control(self, *, timeout_ms: int | None = None) -> Locator:
         links = self._page.get_by_role("link", name=_FOR_YOU_NAME)
