@@ -6,12 +6,10 @@ from threads_browser.errors import UiReadError
 from threads_browser.feed import DisplayObservation, HomeSample, PostTarget
 from threads_browser.feed.relevance import canonical_terms, classify_body, normalize_text
 from threads_browser.feed.urls import _post_url, _profile_author, _same_home_origin
-from threads_browser.reader import (
-    DisplayObservation as ReaderDisplayObservation,
-    HomeSample as ReaderHomeSample,
-    PostTarget as ReaderPostTarget,
-    UiReadError as ReaderUiReadError,
-)
+from threads_browser.reader import DisplayObservation as ReaderDisplayObservation
+from threads_browser.reader import HomeSample as ReaderHomeSample
+from threads_browser.reader import PostTarget as ReaderPostTarget
+from threads_browser.reader import UiReadError as ReaderUiReadError
 
 
 def test_reader_exports_keep_identity() -> None:
