@@ -2198,6 +2198,7 @@ class ThreadsHomeReader:
                         viewport_y=box["y"],
                         cached_body_fingerprints=prefer_new_fingerprints,
                         expected_root_handle=root_handle,
+                        allow_hydration_retry=structure.readable_body_candidates == 0,
                     )
                     self.last_scan_timings.stabilize_ms += round(
                         (time.perf_counter() - stabilize_started) * 1000
@@ -2409,6 +2410,9 @@ class ThreadsHomeReader:
                                     viewport_y=box["y"],
                                     cached_body_fingerprints=(prefer_new_fingerprints),
                                     expected_root_handle=candidate_dom_handles.get(row_index),
+                                    allow_hydration_retry=(
+                                        structure.readable_body_candidates == 0
+                                    ),
                                 )
                                 if not body_stable:
                                     self.last_scan_timings.wait_reason = "CARD_BODY_NOT_STABLE"
@@ -4209,6 +4213,7 @@ class ThreadsHomeReader:
         viewport_y: float,
         cached_body_fingerprints: set[str] | None,
         expected_root_handle: JSHandle | None = None,
+        allow_hydration_retry: bool = False,
     ) -> tuple[PostTarget, bool]:
         """Require the same row identity and body across a bounded dwell."""
         if expected_root_handle is None:
@@ -4250,7 +4255,11 @@ class ThreadsHomeReader:
                     }.values()
                 )
                 return replace(settled, visible_segments=segments), True
-            if attempt == 0 and await self._wait_for_stable_card_dom(root):
+            if (
+                allow_hydration_retry
+                and attempt == 0
+                and await self._wait_for_stable_card_dom(root)
+            ):
                 target = await self._read_card(
                     root,
                     currently_visible=True,
