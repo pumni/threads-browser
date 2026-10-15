@@ -113,10 +113,12 @@ def test_offline_chromium_cli_reads_once_and_resumes_without_double_counting(
 ) -> None:
     actor = "offline.operator"
     old_url = "https://www.threads.com/@candidate/post/old"
-    target_url = "https://www.threads.com/@candidate/post/one"
+    old_relevant_url = "https://www.threads.com/@candidate/post/one"
+    new_relevant_url = "https://www.threads.com/@candidate/post/two"
     old_body = "A weather update"
-    body = "Hiring a frontend engineer in Vietnam"
-    feed_html = f"""<!doctype html>
+    old_relevant_body = "Hiring a backend engineer in Vietnam"
+    new_relevant_body = "Hiring a frontend engineer in Vietnam"
+    first_feed_html = f"""<!doctype html>
 <html><head><style>article {{ min-height: 900px; }}</style></head><body>
 <nav aria-label="Main" role="navigation">
   <a aria-current="page" aria-label="For you" href="/">For you</a>
@@ -130,14 +132,29 @@ def test_offline_chromium_cli_reads_once_and_resumes_without_double_counting(
 <article>
   <a href="/@candidate/post/one"><time>1h</time></a>
   <a href="/@candidate">@candidate</a>
-  <p>{body}</p>
+  <p>{old_relevant_body}</p>
 </article>
 </body></html>"""
-    detail_html = f"""<!doctype html><html><body>
+    second_feed_html = first_feed_html.replace(
+        "</body>",
+        f"""<article>
+  <a href="/@candidate/post/two"><time>now</time></a>
+  <a href="/@candidate">@candidate</a>
+  <p>{new_relevant_body}</p>
+</article></body>""",
+    )
+    old_detail_html = f"""<!doctype html><html><body>
 <article>
   <a href="/@candidate/post/one"><time>1h</time></a>
   <a href="/@candidate">@candidate</a>
-  <p>{body}</p>
+  <p>{old_relevant_body}</p>
+</article>
+</body></html>"""
+    new_detail_html = f"""<!doctype html><html><body>
+<article>
+  <a href="/@candidate/post/two"><time>now</time></a>
+  <a href="/@candidate">@candidate</a>
+  <p>{new_relevant_body}</p>
 </article>
 </body></html>"""
     account_root = tmp_path / "data"
@@ -147,14 +164,17 @@ def test_offline_chromium_cli_reads_once_and_resumes_without_double_counting(
     store = CheckpointStore(account_root)
     monkeypatch.setenv("THREADS_BROWSER_DATA_ROOT", str(account_root))
     requests: list[str] = []
+    feed_version = {"value": 1}
 
     async def respond(route: Route) -> None:
         url = route.request.url
         requests.append(url)
         if url == HOME_URL:
-            html = feed_html
-        elif url == target_url:
-            html = detail_html
+            html = (first_feed_html, second_feed_html)[feed_version["value"] - 1]
+        elif url == old_relevant_url:
+            html = old_detail_html
+        elif url == new_relevant_url:
+            html = new_detail_html
         elif _is_offline_profile_url(url):
             html = "<!doctype html><html><body><h1>Local profile</h1></body></html>"
         else:
@@ -182,6 +202,7 @@ def test_offline_chromium_cli_reads_once_and_resumes_without_double_counting(
 
     first_code = main(command)
     first = capsys.readouterr()
+    feed_version["value"] = 2
     second_code = main(command)
     second = capsys.readouterr()
 
@@ -193,35 +214,45 @@ def test_offline_chromium_cli_reads_once_and_resumes_without_double_counting(
     assert "home_relevant_ratio=0.50" in first.out
     assert "detail_reads=1 scroll_attempts=1 scrolls=1 skipped_unverified=0" in first.out
     assert second_code == 0, second.out + second.err
-    assert "NURTURE status=NO_NEW_RELEVANT_POST source=HOME_FOR_YOU" in second.out
-    assert "home_sampled=2 home_new=0" in second.out
-    assert "home_relevant=1 home_irrelevant=1" in second.out
-    assert "home_relevant_ratio=0.50" in second.out
-    assert "duplicates=2 detail_reads=0" in second.out
-    assert "scroll_attempts=1 scrolls=1" in second.out
+    assert "NURTURE status=COMPLETE source=HOME_FOR_YOU" in second.out
+    assert "home_sampled=3 home_new=1" in second.out
+    assert "home_relevant=2 home_irrelevant=1" in second.out
+    assert "home_relevant_ratio=0.67" in second.out
+    assert "duplicates=2 detail_reads=1" in second.out
+    assert "scroll_attempts=2 scrolls=2" in second.out
     assert all(
         value not in first.out + first.err + second.out + second.err
-        for value in (str(profile), actor, old_body, body, old_url, target_url)
+        for value in (
+            str(profile),
+            actor,
+            old_body,
+            old_relevant_body,
+            new_relevant_body,
+            old_url,
+            old_relevant_url,
+            new_relevant_url,
+        )
     )
 
     assert requests
     assert all(urlsplit(url).netloc == "www.threads.com" for url in requests)
-    assert {HOME_URL, target_url}.issubset(requests)
-    assert requests.count(target_url) == 1
+    assert {HOME_URL, old_relevant_url, new_relevant_url}.issubset(requests)
+    assert requests.count(old_relevant_url) == 1
+    assert requests.count(new_relevant_url) == 1
     checkpoint = store.load(
         account.account_id,
         policy_fingerprint(canonical_terms(("hiring", "engineer"))),
     )
     assert checkpoint.completed_runs == 2
-    assert checkpoint.home_sampled == 4
-    assert checkpoint.home_new == 2
-    assert checkpoint.home_relevant == 2
+    assert checkpoint.home_sampled == 5
+    assert checkpoint.home_new == 3
+    assert checkpoint.home_relevant == 3
     assert checkpoint.home_irrelevant == 2
     assert checkpoint.duplicates == 2
-    assert checkpoint.detail_reads == 1
-    assert checkpoint.scroll_attempts == 2
-    assert checkpoint.scrolls == 2
-    assert len(checkpoint.seen_fingerprints) == 2
+    assert checkpoint.detail_reads == 2
+    assert checkpoint.scroll_attempts == 3
+    assert checkpoint.scrolls == 3
+    assert len(checkpoint.seen_fingerprints) == 3
     assert checkpoint.pending_read_fingerprints == ()
     checkpoint_path = (
         account_root
@@ -231,10 +262,91 @@ def test_offline_chromium_cli_reads_once_and_resumes_without_double_counting(
     )
     persisted = checkpoint_path.read_text(encoding="utf-8")
     assert old_body not in persisted
-    assert body not in persisted
+    assert old_relevant_body not in persisted
+    assert new_relevant_body not in persisted
     assert old_url not in persisted
-    assert target_url not in persisted
+    assert old_relevant_url not in persisted
+    assert new_relevant_url not in persisted
     assert actor not in persisted
+
+
+def test_nested_feed_scroll_is_observed_and_no_movement_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actor = "offline.operator"
+    second_url = "https://www.threads.com/@candidate/post/second"
+    body = "Hiring a frontend engineer in Vietnam"
+
+    def nested_feed_html(*, prevent_wheel: bool = False) -> str:
+        prevent = (
+            "window.addEventListener('wheel', event => event.preventDefault(), "
+            "{passive: false});"
+            if prevent_wheel
+            else ""
+        )
+        return f"""<!doctype html><html><head><style>
+html, body {{ height: 100%; margin: 0; overflow: hidden; }}
+nav {{ height: 40px; }}
+#scroll-port {{ height: calc(100vh - 40px); overflow-y: auto; }}
+.post-card {{ box-sizing: border-box; height: 760px; padding-top: 80px; }}
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><div id="scroll-port">
+  <div class="post-card"><a href="/@candidate/post/first"><time>2h</time></a>
+    <a href="/@candidate">@candidate</a><p>A weather update</p></div>
+  <div class="post-card"><a href="/@candidate/post/second"><time>1h</time></a>
+    <a href="/@candidate">@candidate</a><p>{body}</p></div>
+</div><script>{prevent}</script></body></html>"""
+
+    monkeypatch.setattr(reader_module, "_READINESS_TIMEOUT_MS", 500)
+    monkeypatch.setattr(reader_module, "_READINESS_RECHECK_INTERVAL_MS", 20)
+
+    async def scrolling_exercise(page) -> None:
+        assert await page.get_by_role("main").count() == 0
+        assert await page.get_by_role("feed").count() == 0
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        before = await reader.scan_viewport(1)
+        assert len(before) == 1
+        assert await reader.advance_feed()
+        positions = await page.evaluate(
+            """() => ({
+                inner: document.querySelector("#scroll-port").scrollTop,
+                document: document.scrollingElement.scrollTop,
+            })"""
+        )
+        assert positions["inner"] > 1
+        assert positions["document"] == 0
+        after = await reader.scan_viewport(
+            1,
+            scanned_fingerprints={before[0].fingerprint},
+        )
+        assert len(after) == 1
+        assert after[0].url == second_url
+        assert reader.scroll_attempts == 1
+        assert reader.scrolls == 1
+
+    async def stalled_exercise(page) -> None:
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        assert len(await reader.scan_viewport(1)) == 1
+        with pytest.raises(UiReadError) as caught:
+            await reader.advance_feed()
+        assert caught.value.code == "HOME_SCROLL_UNVERIFIED"
+        positions = await page.evaluate(
+            """() => ({
+                inner: document.querySelector("#scroll-port").scrollTop,
+                document: document.scrollingElement.scrollTop,
+            })"""
+        )
+        assert positions == {"inner": 0, "document": 0}
+        assert reader.scroll_attempts == 1
+        assert reader.scrolls == 0
+
+    _run_offline_page(nested_feed_html(), scrolling_exercise)
+    _run_offline_page(nested_feed_html(prevent_wheel=True), stalled_exercise)
 
 
 def test_non_article_permalink_cards_sample_and_verify_detail() -> None:

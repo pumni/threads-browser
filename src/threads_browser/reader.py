@@ -594,10 +594,10 @@ class ThreadsHomeReader:
             self._readiness_deadline(_READINESS_TIMEOUT_MS),
             timeout_code="HOME_SCROLL_SURFACE_UNVERIFIED",
         )
-        point = await self._safe_feed_scroll_point()
         surface = await self._scroll_surface()
-        initial_position = await surface.evaluate("element => element.scrollTop")
         try:
+            point = await self._safe_feed_scroll_point(surface)
+            initial_position = await surface.evaluate("element => element.scrollTop")
             await self._page.mouse.move(*point)
             self.scroll_attempts += 1
             await self._page.mouse.wheel(0, 850)
@@ -605,6 +605,9 @@ class ThreadsHomeReader:
             print(f"SCROLL attempt={self.scroll_attempts} observed=0")
             await surface.dispose()
             raise UiReadError("HOME_SCROLL_FAILED") from None
+        except BaseException:
+            await surface.dispose()
+            raise
 
         async def observe_scroll(window_deadline: float) -> bool:
             while True:
@@ -921,15 +924,17 @@ class ThreadsHomeReader:
                 return True
         return False
 
-    async def _safe_feed_scroll_point(self) -> tuple[float, float]:
-        if not await self._visible_feed_evidence():
-            raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
+    async def _safe_feed_scroll_point(self, surface: JSHandle) -> tuple[float, float]:
         viewport = self._page.viewport_size
         if viewport is None:
             raise UiReadError("FEED_VIEWPORT_UNVERIFIED")
-        region = await self._content_region()
-        box = await region.bounding_box()
-        if box is None:
+        box = await surface.evaluate(
+            """element => {
+                const rect = element.getBoundingClientRect();
+                return {x: rect.x, y: rect.y, width: rect.width, height: rect.height};
+            }"""
+        )
+        if not box or box["width"] <= 0 or box["height"] <= 0:
             raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
         left = max(0.0, box["x"])
         right = min(float(viewport["width"]), box["x"] + box["width"])
@@ -945,10 +950,10 @@ class ThreadsHomeReader:
         )
         for y in ys:
             for x in xs:
-                safe = await region.evaluate(
-                    """(region, point) => {
+                safe = await surface.evaluate(
+                    """(surface, point) => {
                         const target = document.elementFromPoint(point.x, point.y);
-                        if (!target || !region.contains(target)) return false;
+                        if (!target || !surface.contains(target)) return false;
                         const excluded = target.closest(
                             "nav, aside, footer, [role='navigation'], [role='menu'], " +
                             "[role='complementary'], [role='dialog'], [role='search'], " +
@@ -967,25 +972,59 @@ class ThreadsHomeReader:
         raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
 
     async def _scroll_surface(self) -> JSHandle:
+        if not await self._visible_feed_evidence():
+            raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
         region = await self._content_region()
         region_handle = await region.element_handle()
         if region_handle is None:
             raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
         try:
             surface = await self._page.evaluate_handle(
-                """region => {
-                for (let element = region; element && element !== document.documentElement;
-                     element = element.parentElement) {
-                    const style = window.getComputedStyle(element);
-                    const scrollable = style.overflowY === "auto" ||
-                        style.overflowY === "scroll" || style.overflowY === "overlay";
-                    if (scrollable && element.scrollHeight > element.clientHeight + 1) {
-                        return element;
+                """([region, maxCandidates]) => {
+                const root = document.scrollingElement;
+                const visibleFeedLink = link => {
+                    if (!link.isConnected || link.closest(
+                        "nav, aside, footer, [role='navigation'], [role='menu'], " +
+                        "[role='complementary'], [role='dialog'], [role='search'], " +
+                        "[role='banner'], [role='contentinfo']"
+                    )) return false;
+                    const style = window.getComputedStyle(link);
+                    const rect = link.getBoundingClientRect();
+                    return style.display !== "none" && style.visibility !== "hidden" &&
+                        rect.width > 0 && rect.height > 0 && rect.bottom > 0 &&
+                        rect.right > 0 && rect.top < window.innerHeight &&
+                        rect.left < window.innerWidth;
+                };
+                const isScrollable = element => {
+                    if (element.scrollHeight <= element.clientHeight + 1) return false;
+                    if (element === root) return true;
+                    const overflow = window.getComputedStyle(element).overflowY;
+                    return overflow === "auto" || overflow === "scroll" ||
+                        overflow === "overlay";
+                };
+                const links = Array.from(
+                    region.querySelectorAll('a[href*="/post/"]')
+                ).slice(0, maxCandidates).filter(visibleFeedLink);
+                if (!links.length) return null;
+
+                const candidates = new Set();
+                for (const link of links) {
+                    for (let element = link.parentElement; element;
+                         element = element.parentElement) {
+                        if (isScrollable(element)) candidates.add(element);
                     }
                 }
-                return document.scrollingElement;
+                const innermost = Array.from(candidates).filter(candidate =>
+                    !Array.from(candidates).some(other =>
+                        candidate !== other && candidate.contains(other)
+                    )
+                );
+                if (innermost.length !== 1) return null;
+                const surface = innermost[0];
+                if (!links.every(link => surface.contains(link))) return null;
+                return surface;
                 }""",
-                region_handle,
+                arg=[region_handle, _MAX_PERMALINK_CANDIDATES],
             )
         finally:
             await region_handle.dispose()

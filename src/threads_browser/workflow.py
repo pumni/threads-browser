@@ -138,8 +138,6 @@ async def run_page_workflow(
         if viewport_selected is not None:
             selected = viewport_selected
             break
-        if found_relevant:
-            break
         if len(seen_this_run) >= max_total_posts:
             exhaustion_reason = "MAX_TOTAL_POSTS"
             break
