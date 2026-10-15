@@ -4223,33 +4223,45 @@ class ThreadsHomeReader:
             visible_text_progress=True,
             expected_root_handle=expected_root_handle,
         )
-        # Measure stability between completed samples. DOM extraction can take
-        # longer than the existing hydration wait on a busy feed; that work
-        # already provides elapsed time and must not make a stable row fail.
-        await asyncio.sleep(max(1, _BODY_STABILITY_INTERVAL_MS) / 1000)
-        settled = await self._read_card(
-            root,
-            currently_visible=True,
-            viewport_y=viewport_y,
-            cached_body_fingerprints=cached_body_fingerprints,
-            visible_text_progress=True,
-            expected_root_handle=expected_root_handle,
-        )
-        body_same = (
-            _canonicalize_body(target.body or "") == _canonicalize_body(settled.body or "")
-            and target.body_complete == settled.body_complete
-            and target.body_truncated == settled.body_truncated
-        )
-        identity_same = target.url == settled.url and target.author == settled.author
-        if not body_same or not identity_same or not settled.body_consistent:
+        for attempt in range(2):
+            # Measure stability between completed samples. DOM extraction can
+            # take longer than the interval on a busy feed, so compare actual
+            # content and retry once after hydration settles if it changed.
+            await asyncio.sleep(max(1, _BODY_STABILITY_INTERVAL_MS) / 1000)
+            settled = await self._read_card(
+                root,
+                currently_visible=True,
+                viewport_y=viewport_y,
+                cached_body_fingerprints=cached_body_fingerprints,
+                visible_text_progress=True,
+                expected_root_handle=expected_root_handle,
+            )
+            body_same = (
+                _canonicalize_body(target.body or "") == _canonicalize_body(settled.body or "")
+                and target.body_complete == settled.body_complete
+                and target.body_truncated == settled.body_truncated
+            )
+            identity_same = target.url == settled.url and target.author == settled.author
+            if body_same and identity_same and settled.body_consistent:
+                segments = tuple(
+                    {
+                        segment.segment_id: segment
+                        for segment in target.visible_segments + settled.visible_segments
+                    }.values()
+                )
+                return replace(settled, visible_segments=segments), True
+            if attempt == 0 and await self._wait_for_stable_card_dom(root):
+                target = await self._read_card(
+                    root,
+                    currently_visible=True,
+                    viewport_y=viewport_y,
+                    cached_body_fingerprints=cached_body_fingerprints,
+                    visible_text_progress=True,
+                    expected_root_handle=expected_root_handle,
+                )
+                continue
             return settled, False
-        segments = tuple(
-            {
-                segment.segment_id: segment
-                for segment in target.visible_segments + settled.visible_segments
-            }.values()
-        )
-        return replace(settled, visible_segments=segments), True
+        raise AssertionError("bounded card stability retry exhausted")
 
     async def _visible_body_candidate_state(
         self,
