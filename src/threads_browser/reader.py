@@ -61,6 +61,7 @@ from .browser_ui.loading import (
     RenderObservation as _RenderObservation,
 )
 from .browser_ui.scrolling import NativeWheelScrollEngine, ScrollGestureResult
+from .browser_ui.session import HomeSession
 from .errors import UiReadError
 from .feed.models import (
     BodyReadEvidence,
@@ -113,7 +114,6 @@ _MAX_PERMALINK_CANDIDATES = 40
 _MAX_FEED_ROOTS_PER_TYPE = 40
 _MAX_VISIBLE_ROW_CANDIDATES = 40
 _UNSUPPORTED_CONFIRMATION_SCANS = 3
-_FOR_YOU_NAME = re.compile(r"^for you$", re.IGNORECASE)
 _PROFILE_NAME = re.compile(r"^(?:profile|your profile|account)$", re.IGNORECASE)
 _MORE_NAME = re.compile(r"^(?:more|see more|read more)$", re.IGNORECASE)
 _ReadinessResult = TypeVar("_ReadinessResult")
@@ -238,6 +238,9 @@ class ThreadsHomeReader:
         self._cached_home_bodies: dict[str, tuple[str, bool]] = {}
         self._detail_return_anchor: tuple[str, float] | None = None
         self._detail_return_target: PostTarget | None = None
+        self._home_session = HomeSession(
+            self, readiness_timeout_ms=_READINESS_TIMEOUT_MS
+        )
         self._detail_navigator = DetailNavigator(
             self,
             timeout_ms=_DETAIL_TIMEOUT_MS,
@@ -1009,7 +1012,9 @@ class ThreadsHomeReader:
         before = await self.scan_viewport(max_posts)
         before_by_fingerprint = {target.fingerprint: target for target in before}
         self.feed_duplicates += len(before) - len(before_by_fingerprint)
-        await self.advance_feed()
+        advanced = await self.advance_feed()
+        if not advanced and self.last_scroll_stop_reason == "FEED_NOT_SCROLLABLE":
+            raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
         after = await self.scan_viewport(
             max_posts,
             scanned_fingerprints=set(before_by_fingerprint),
@@ -3591,125 +3596,28 @@ class ThreadsHomeReader:
         await self._detail_navigator.return_to_home()
 
     async def _for_you_control(self, *, timeout_ms: int | None = None) -> Locator:
-        links = self._page.get_by_role("link", name=_FOR_YOU_NAME)
-        tabs = self._page.get_by_role("tab", name=_FOR_YOU_NAME)
-        try:
-            await expect(links.or_(tabs).first).to_be_visible(
-                timeout=timeout_ms or _READINESS_TIMEOUT_MS
-            )
-        except (AssertionError, PlaywrightTimeoutError):
-            raise UiReadError("HOME_UI_UNVERIFIED") from None
-        matches = await self._visible_for_you_controls()
-        if len(matches) > 1:
-            raise UiReadError("FOR_YOU_CONTROL_AMBIGUOUS")
-        if not matches:
-            raise UiReadError("HOME_UI_UNVERIFIED")
-        return matches[0]
+        return await self._home_session._for_you_control(timeout_ms=timeout_ms)
 
     async def _visible_for_you_controls(self) -> list[Locator]:
-        matches: list[Locator] = []
-        links = self._page.get_by_role("link", name=_FOR_YOU_NAME)
-        tabs = self._page.get_by_role("tab", name=_FOR_YOU_NAME)
-        for controls in (links, tabs):
-            for index in range(await controls.count()):
-                control = controls.nth(index)
-                if await control.is_visible():
-                    matches.append(control)
-        return matches
+        return await self._home_session._visible_for_you_controls()
 
-    @staticmethod
-    async def _for_you_is_active(control: Locator) -> bool:
-        return (
-            await control.get_attribute("aria-current") == "page"
-            or await control.get_attribute("aria-selected") == "true"
-        )
+    async def _for_you_is_active(self, control: Locator) -> bool:
+        return await self._home_session._for_you_is_active(control)
 
     @staticmethod
     def _is_for_you_route(value: str) -> bool:
-        try:
-            parsed = urlsplit(value)
-        except ValueError:
-            return False
-        return (
-            parsed.scheme == "https"
-            and parsed.netloc.casefold() == "www.threads.com"
-            and parsed.path == "/for_you"
-            and not parsed.query
-            and not parsed.fragment
-        )
+        return HomeSession._is_for_you_route(value)
 
     @staticmethod
     def _is_home_navigation_url(value: str) -> bool:
-        try:
-            parsed = urlsplit(str(value))
-        except ValueError:
-            return False
-        return (
-            parsed.scheme == "https"
-            and parsed.netloc.casefold() == "www.threads.com"
-            and parsed.path in {"/", "/home", "/for_you"}
-            and not parsed.query
-            and not parsed.fragment
-        )
+        return HomeSession._is_home_navigation_url(value)
 
     async def _require_feed_url(
         self,
         *,
         route_error_code: str = "HOME_UI_UNVERIFIED",
     ) -> None:
-        if not _same_home_origin(self._page.url):
-            raise UiReadError("OFF_ORIGIN_REDIRECT")
-        try:
-            parsed = urlsplit(self._page.url)
-        except ValueError:
-            raise UiReadError("HOME_UI_UNVERIFIED") from None
-        if parsed.path not in {"/", "/home", "/for_you"} or parsed.query or parsed.fragment:
-            path = parsed.path.casefold()
-            if "challenge" in path or "checkpoint" in path:
-                raise UiReadError("CHALLENGE_REQUIRED")
-            if path in {"/login", "/accounts/login"}:
-                raise UiReadError("LOGIN_REQUIRED")
-            actor = _profile_author(self._page.url)
-            if actor is not None and actor != self._expected_actor:
-                raise UiReadError("ACTOR_MISMATCH")
-            raise UiReadError(route_error_code)
-        await self._check_blocker()
-        if self._home_url is None:
-            return
-        if self._page.url != self._home_url:
-            raise UiReadError(route_error_code)
-        if self._verified_actor_route is None:
-            raise UiReadError("ACTOR_UNVERIFIED")
-        verified_actor = _profile_author(self._verified_actor_route)
-        if verified_actor != self._expected_actor:
-            raise UiReadError("ACTOR_MISMATCH")
-        profile_controls = await self._visible_navigation_controls("link")
-        profile_controls.extend(await self._visible_navigation_controls("button"))
-        if len(profile_controls) > 1:
-            raise UiReadError("PROFILE_CONTROL_AMBIGUOUS")
-        if not profile_controls:
-            profile_controls = await self._visible_navigation_profile_text()
-        if len(profile_controls) > 1:
-            raise UiReadError("PROFILE_CONTROL_AMBIGUOUS")
-        if not profile_controls:
-            raise UiReadError("PROFILE_CONTROL_NOT_READY")
-        profile_href = await profile_controls[0].get_attribute("href")
-        if profile_href is not None:
-            profile_destination = urljoin(self._page.url, profile_href)
-            if not _same_home_origin(profile_destination):
-                raise UiReadError("OFF_ORIGIN_REDIRECT")
-            profile_actor = _profile_author(profile_destination)
-            if profile_actor is not None and profile_actor != self._expected_actor:
-                raise UiReadError("ACTOR_MISMATCH")
-
-        for_you_controls = await self._visible_for_you_controls()
-        if not for_you_controls:
-            raise UiReadError("FOR_YOU_CONTROL_NOT_READY")
-        if len(for_you_controls) > 1:
-            raise UiReadError("FOR_YOU_CONTROL_AMBIGUOUS")
-        active = await self._for_you_is_active(for_you_controls[0])
-        if not active and not self._is_for_you_route(self._page.url):
-            raise UiReadError("FOR_YOU_STATE_CHANGED")
+        await self._home_session._require_feed_url(route_error_code=route_error_code)
 
     async def _wait_for_verified_feed(
         self,
@@ -3718,51 +3626,14 @@ class ThreadsHomeReader:
         timeout_code: str,
         route_error_code: str = "HOME_UI_UNVERIFIED",
     ) -> None:
-        while True:
-            self._remaining_readiness_ms(deadline, timeout_code)
-            try:
-                await self._require_feed_url(route_error_code=route_error_code)
-            except UiReadError as error:
-                if error.code not in {
-                    "PROFILE_CONTROL_NOT_READY",
-                    "FOR_YOU_CONTROL_NOT_READY",
-                }:
-                    raise
-                await self._wait_for_pending_card(
-                    _CardNotReady(
-                        self._page.locator("body"),
-                        condition="retry",
-                    ),
-                    deadline,
-                )
-            else:
-                return
+        await self._home_session._wait_for_verified_feed(
+            deadline,
+            timeout_code=timeout_code,
+            route_error_code=route_error_code,
+        )
 
     async def _check_blocker(self) -> None:
-        title = normalize_text(await self._page.title())
-        headings = self._page.get_by_role("heading")
-        parts = [title]
-        for heading in await headings.all():
-            if await heading.is_visible():
-                parts.append(normalize_text(await heading.inner_text()))
-        visible_labels = " ".join(parts)
-        if any(marker in visible_labels for marker in ("log in", "sign in", "login")):
-            raise UiReadError("LOGIN_REQUIRED")
-        if any(
-            marker in visible_labels
-            for marker in ("challenge", "checkpoint", "verify your identity", "security check")
-        ):
-            raise UiReadError("CHALLENGE_REQUIRED")
-        if any(
-            marker in visible_labels
-            for marker in (
-                "rate limit",
-                "too many requests",
-                "try again later",
-                "temporarily blocked",
-            )
-        ):
-            raise UiReadError("RATE_LIMITED")
+        await self._home_session._check_blocker()
 
     async def _extract_card_body(
         self,
@@ -4038,6 +3909,12 @@ class ThreadsHomeReader:
         visible_body: _VisibleBodyRead | None = None
         if currently_visible:
             if visible_text_progress:
+                buttons = root.get_by_role("button", name=_MORE_NAME)
+                for index in range(min(await buttons.count(), _MAX_CARD_LINKS)):
+                    button = buttons.nth(index)
+                    if await self._belongs_to_card(button, root, root_handle) and await button.is_visible():
+                        body_truncated = True
+                        break
                 visible_body = await self._read_visible_body_progress(
                     root,
                     root_handle,

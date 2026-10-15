@@ -120,6 +120,7 @@ async def run_page_workflow(
     viewport_number = 0
     exhaustion_reason = "MAX_SCROLLS"
     pending_scroll_baseline: dict[str, object] | None = None
+    unverified_observation_cap_exceeded = False
 
     def reliability_metrics() -> dict[str, int]:
         return coverage.reliability_metrics(
@@ -187,6 +188,13 @@ async def run_page_workflow(
         if selected.fingerprint not in dedupe.pending_set:
             dedupe.pending.append(selected.fingerprint)
             dedupe.pending_set.add(selected.fingerprint)
+
+    def only_unverified_observations() -> bool:
+        return (
+            not dedupe.seen_this_run
+            and not unverified_observation_cap_exceeded
+            and bool(stats.observed_rows or stats.body_extracted)
+        )
 
     while True:
         remaining = max_total_posts - len(dedupe.seen_this_run)
@@ -338,6 +346,8 @@ async def run_page_workflow(
 
             if diagnostic.state == "VERIFIED":
                 if row.fingerprint is not None:
+                    if row.fingerprint not in coverage.provenance_verified:
+                        stats.provenance_verified += 1
                     coverage.mark_verified(row.fingerprint, diagnostic.observation_id)
                 elif diagnostic.observation_id is not None:
                     coverage.unresolved_observations.discard(diagnostic.observation_id)
@@ -666,6 +676,10 @@ async def run_page_workflow(
             raise
         state.transition(WorkflowPhase.OBSERVING)
         scan_counts = reader.last_scan_counts
+        unverified_observation_cap_exceeded = (
+            unverified_observation_cap_exceeded
+            or scan_counts.observed_rows > min(max_posts, remaining)
+        )
         if detail:
             print(
                 f"[VIEWPORT {viewport_number}] observed={scan_counts.observed_rows} "
@@ -896,7 +910,7 @@ async def run_page_workflow(
                     f"scan={'PARTIAL' if reader.last_viewport_can_wheel else 'NOT_COMMITTED'} "
                     f"wheel={'ALLOWED' if reader.last_viewport_can_wheel else 'BLOCKED'}"
                 )
-            if not reader.last_viewport_can_wheel:
+            if not reader.last_viewport_can_wheel and not only_unverified_observations():
                 if detail:
                     _detail_stop("VIEWPORT_COVERAGE_INCOMPLETE")
                 return NurtureResult(
@@ -929,8 +943,14 @@ async def run_page_workflow(
                     **reliability_metrics(),
                 )
         if (
-            coverage.deferred or coverage.unresolved_observations or coverage.unrepresented_gaps
-        ) and not (stats.unverified_relevant and not stats.found_relevant):
+            (
+                coverage.deferred
+                or coverage.unresolved_observations
+                or coverage.unrepresented_gaps
+            )
+            and not (stats.unverified_relevant and not stats.found_relevant)
+            and not only_unverified_observations()
+        ):
             if reader.scroll_attempts < max_scrolls and await advance_feed():
                 continue
             if reader.scroll_attempts >= max_scrolls:
@@ -1058,7 +1078,7 @@ async def run_page_workflow(
     )
     if (
         not stats.viewport_coverage_complete or coverage.has_unresolved_gaps
-    ) and not unverified_relevance_only:
+    ) and not unverified_relevance_only and not only_unverified_observations():
         if detail:
             _detail_stop("VIEWPORT_COVERAGE_INCOMPLETE")
         else:

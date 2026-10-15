@@ -8,13 +8,20 @@ from collections.abc import Awaitable, Callable
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page, async_playwright
 
+from .nurture.diagnostics import _terminal_safe_post_text
 from .nurture.engine import NurtureResult
 from .nurture.engine import run_page_workflow as _execute_page_workflow
 from .nurture.state import policy_fingerprint
 from .reader import ThreadsHomeReader, UiReadError
 from .storage import BrowserAccount, BrowserDataError, CheckpointStore, ensure_safe_browser_profile
 
-__all__ = ["NurtureResult", "policy_fingerprint", "run_browser_nurture", "run_page_workflow"]
+__all__ = [
+    "NurtureResult",
+    "_terminal_safe_post_text",
+    "policy_fingerprint",
+    "run_browser_nurture",
+    "run_page_workflow",
+]
 
 
 def _detail_terminal_ready() -> bool:

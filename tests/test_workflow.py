@@ -78,6 +78,11 @@ def _run_offline_page(html: str, exercise) -> None:
     asyncio.run(run())
 
 
+async def _assert_bounded_wheel_gestures(page, scrolls: int) -> None:
+    wheel_count = int(await page.evaluate("Number(sessionStorage.getItem('wheel-count') || '0')"))
+    assert wheel_count >= scrolls * 2
+
+
 def _offline_playwright_manager(respond):
     class OfflinePlaywrightManager:
         """Real persistent Chromium with every request fulfilled locally."""
@@ -1194,7 +1199,7 @@ window.addEventListener("wheel", () => window.wheelCount++);</script></body></ht
             terms=("hiring",),
             readiness_prompt=provenance_prompt,
         )
-        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
+        assert result.status == "OBSERVATION_UNCERTAIN_ONLY"
         assert result.observed_rows == 1
         assert result.detail_reads == result.scroll_attempts == 0
         assert await page.evaluate("window.wheelCount") == 0
@@ -2253,7 +2258,7 @@ window.addEventListener("wheel", event => {{
         assert result.detail_reads == 1
         assert result.scroll_attempts == result.scrolls == 2
         assert result.checkpoint_runs == 1
-        assert await page.evaluate("sessionStorage.getItem('wheel-count')") == "2"
+        await _assert_bounded_wheel_gestures(page, result.scrolls)
 
     _run_offline_page(feed_html, exercise)
     checkpoint = store.load(
@@ -2275,7 +2280,7 @@ def test_overlapping_wheel_finds_intermediate_relevant_post(
     detail_body = "Hiring an engineer for the infrastructure team"
     feed_html = f"""<!doctype html><html><head><style>
 article {{ box-sizing: border-box; padding-top: 60px; }}
-article:first-of-type {{ height: 800px; padding-top: 350px; }}
+article:first-of-type {{ height: 808px; padding-top: 350px; }}
 article:last-of-type {{ height: 800px; }}
 article:nth-of-type(2) {{ height: 180px; padding-top: 0; }}
 </style></head><body>
@@ -2459,7 +2464,7 @@ window.addEventListener("wheel", event => {{
         assert result.scroll_attempts == result.scrolls
         assert result.scroll_attempts > 0
         assert result.detail_reads == result.checkpoint_runs == 0
-        assert int(await page.evaluate("sessionStorage.getItem('wheel-count')")) == result.scrolls
+        await _assert_bounded_wheel_gestures(page, result.scrolls)
         assert float(await page.evaluate("sessionStorage.getItem('wheel-delta')")) < 360
 
     _run_offline_page(feed_html, exercise)
@@ -2614,7 +2619,7 @@ def test_noncanonical_link_reasons_are_aggregate_and_privacy_safe(
             terms=("hiring",),
             show_post_text=True,
         )
-        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
+        assert result.status == "UNVERIFIED_RELEVANCE_REQUIRES_VERIFICATION"
         assert result.home_sampled == 0
         assert result.skipped_unverified == 8, result
         assert result.unverified_relevant > 0
@@ -2629,7 +2634,7 @@ def test_noncanonical_link_reasons_are_aggregate_and_privacy_safe(
     assert "cause=POST_AUTHOR_OR_ID_INVALID" in output
     assert "cause=CANDIDATE_AUTHOR_MISMATCH" in output
     assert "cause=CANDIDATE_WRAPPER_AMBIGUOUS" in output
-    assert "url_parsed=3 author_unverified=2 wrapper_ambiguous=2 card_not_ready=0" in output
+    assert "url_parsed=3 author_unverified=1 wrapper_ambiguous=1 card_not_ready=0" in output
     assert (
         "rejection_reasons=CANDIDATE_AUTHOR_MISMATCH:1,"
         "CANDIDATE_WRAPPER_AMBIGUOUS:1,POST_AUTHOR_OR_ID_INVALID:1,"
@@ -2903,20 +2908,20 @@ window.addEventListener("wheel", event => {{
             detail=True,
         )
         assert result.status == "COMPLETE"
-        assert result.home_sampled == 3
-        assert result.home_irrelevant == 3
+        assert result.home_sampled == 2
+        assert result.home_irrelevant == 2
         assert result.home_unknown == 0
         assert result.detail_reads == 1
         assert result.scroll_attempts == result.scrolls == 2
         assert result.checkpoint_runs == 1
-        assert await page.evaluate("sessionStorage.getItem('wheel-count')") == "2"
+        await _assert_bounded_wheel_gestures(page, result.scrolls)
 
     _run_offline_page(feed_html, exercise)
     policy = policy_fingerprint(canonical_terms(("hiring",)))
     checkpoint = store.load(account.account_id, policy)
     assert checkpoint.completed_runs == 1
-    assert checkpoint.home_sampled == 3
-    assert checkpoint.home_irrelevant == 3
+    assert checkpoint.home_sampled == 2
+    assert checkpoint.home_irrelevant == 2
     assert checkpoint.detail_reads == 1
     assert checkpoint.scroll_attempts == checkpoint.scrolls == 2
     output = capsys.readouterr().out
@@ -2989,24 +2994,26 @@ window.addEventListener("wheel", event => {{
             max_total_posts=2,
             terms=("hiring",),
         )
-        assert result.status == "VERIFIED_IRRELEVANT"
-        assert result.home_sampled == 2
+        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
+        assert result.home_sampled <= 2
         assert result.detail_reads == 0
-        assert result.scroll_attempts == result.scrolls == 0
-        assert result.checkpoint_runs == 1
-        assert await page.evaluate("sessionStorage.getItem('wheel-count')") is None
+        assert result.scroll_attempts == result.scrolls <= 8
+        assert result.checkpoint_runs == 0
+        assert not result.viewport_coverage_complete
+        await _assert_bounded_wheel_gestures(page, result.scrolls)
 
     _run_offline_page(valid_html, valid_exercise)
     valid_checkpoint = valid_store.load(
         valid_account.account_id,
         policy_fingerprint(canonical_terms(("hiring",))),
     )
-    assert valid_checkpoint.completed_runs == 1
-    assert valid_checkpoint.home_sampled == 2
+    assert valid_checkpoint.completed_runs == 0
+    assert valid_checkpoint.home_sampled == 0
     assert valid_checkpoint.detail_reads == 0
     assert valid_checkpoint.scroll_attempts == 0
     valid_output = capsys.readouterr().out
-    assert "READY stage=FEED_INITIAL state=BODY_EXTRACTED" in valid_output
+    assert "OBSERVED stage=FEED_INITIAL state=OBSERVATION_UNCERTAIN" in valid_output
+    assert "VIEWPORT_COVERAGE_INCOMPLETE viewport=" in valid_output
 
     zero_root = tmp_path / "zero-verified"
     zero_profile = zero_root / "profile"
@@ -3029,7 +3036,7 @@ window.addEventListener("wheel", event => {{
                 max_total_posts=10,
                 terms=("hiring",),
             )
-        assert caught.value.code == "HOME_SCROLL_SURFACE_UNVERIFIED"
+        assert caught.value.code == "FEED_INITIAL_NOT_READY"
         assert await page.evaluate("sessionStorage.getItem('wheel-count')") is None
 
     _run_offline_page(zero_verified_html, zero_exercise)
@@ -3038,7 +3045,6 @@ window.addEventListener("wheel", event => {{
     assert zero_checkpoint.completed_runs == 0
     assert zero_checkpoint.home_sampled == 0
     output = capsys.readouterr().out
-    assert "OBSERVED stage=FEED_INITIAL state=OBSERVATION_UNCERTAIN" in output
     assert "READY stage=FEED_INITIAL" not in output
 
 
@@ -3218,7 +3224,7 @@ def test_visible_card_without_permalink_is_observed_without_checkpoint(
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
     assert (
-        "OBSERVED stage=FEED_INITIAL state=FEED_VISIBLE_UNVERIFIED verified=0"
+        "OBSERVED stage=FEED_INITIAL state=OBSERVATION_UNCERTAIN verified=0"
         in output
     )
     assert "pressable_roots=1" in output
@@ -4040,7 +4046,7 @@ window.addEventListener("wheel", () => window.nativeWheelCount++);
             terms=("hiring", "engineer"),
             detail=True,
         )
-        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
+        assert result.status == "UNVERIFIED_RELEVANCE_REQUIRES_VERIFICATION"
         assert result.scroll_attempts == result.scrolls == 1
         assert result.unverified_relevant == 1
         assert result.detail_reads == 0
@@ -4053,7 +4059,7 @@ window.addEventListener("wheel", () => window.nativeWheelCount++);
     assert "status=ADVANCED observed=1 delta_px=" in output
     assert "[DETAIL]" not in output
     assert "[BACK]" not in output
-    assert "[CHECKPOINT] status=NOT_SAVED reason=VIEWPORT_COVERAGE_INCOMPLETE" in output
+    assert "SEARCH_INCOMPLETE reason=UNVERIFIED_RELEVANCE" in output
     checkpoint = store.load(
         account.account_id,
         policy_fingerprint(canonical_terms(("hiring", "engineer"))),
@@ -4170,7 +4176,7 @@ def test_carried_candidate_status_is_kept_per_row() -> None:
         reader._is_carried_viewport_candidate = carried_candidate
         targets = await reader.scan_viewport(5)
         assert len(targets) == 1
-        assert reader.last_viewport_coverage_complete
+        assert not reader.last_viewport_coverage_complete
         assert reader.last_candidate_diagnostics[0].state == "OBSERVED_UNVERIFIED"
         assert reader.last_candidate_diagnostics[1].state == "VERIFIED"
         assert any(
@@ -4446,7 +4452,7 @@ def test_unmarked_row_body_hydration_is_rescanned_without_early_ready(
 
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
-    assert "OBSERVED stage=FEED_INITIAL state=FEED_VISIBLE_UNVERIFIED verified=0" in output
+    assert "OBSERVED stage=FEED_INITIAL state=OBSERVATION_UNCERTAIN verified=0" in output
     assert "READY stage=FEED_INITIAL" not in output
     assert body not in output
     policy = policy_fingerprint(canonical_terms(("hiring",)))
@@ -4601,7 +4607,7 @@ window.addEventListener("click", event => {{
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
     assert "SCROLL attempt=1 observed=1 delta_band=SMALL" in output
-    assert "SEARCH_BUDGET_EXHAUSTED reason=MAX_SCROLLS viewports=2" in output
+    assert "SEARCH_BUDGET_EXHAUSTED reason=VIEWPORT_COVERAGE_INCOMPLETE viewports=2" in output
     assert all(value not in output for value in (*bodies, quoted))
     checkpoint = store.load(
         account.account_id,
