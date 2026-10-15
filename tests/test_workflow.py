@@ -16,6 +16,7 @@ from playwright.async_api import async_playwright as real_async_playwright
 
 from threads_browser import reader as reader_module
 from threads_browser import workflow
+from threads_browser.browser_ui.geometry import with_scrollport_geometry
 from threads_browser.cli import main
 from threads_browser.reader import (
     HOME_URL,
@@ -224,6 +225,11 @@ def test_offline_chromium_cli_reads_once_and_resumes_without_double_counting(
     second_summary = next(
         (line for line in second.out.splitlines() if line.startswith("NURTURE ")), ""
     )
+    second_scroll_diagnostics = "\n".join(
+        line
+        for line in second.out.splitlines()
+        if line.startswith(("[SCROLL_PROGRESS]", "[SCROLL_GEOMETRY]"))
+    )
 
     assert first_code == 0, first.out + first.err
     assert first_summary.startswith("NURTURE status=COMPLETE source=HOME_FOR_YOU")
@@ -235,7 +241,7 @@ def test_offline_chromium_cli_reads_once_and_resumes_without_double_counting(
     assert second_code == 0, second.out + second.err
     assert second_summary.startswith(
         "NURTURE status=COMPLETE source=HOME_FOR_YOU"
-    ), second_summary
+    ), f"{second_summary}\n{second_scroll_diagnostics}"
     assert "home_sampled=3 home_new=1" in second_summary
     assert "home_relevant=2 home_irrelevant=1" in second_summary
     assert "home_relevant_ratio=0.67" in second_summary
@@ -4767,6 +4773,69 @@ nav {{ height: 36px; }}
             or diagnostic.state in {"VERIFIED", "NON_POST"}
             for diagnostic in reader.last_candidate_diagnostics
         )
+
+    _run_offline_page(feed_html, exercise)
+
+
+def test_document_scroll_keeps_viewport_clip_and_reads_row_below_viewport() -> None:
+    actor = "offline.operator"
+    feed_html = f"""<!doctype html><html><head><style>
+html {{ overflow-x: hidden; }}
+body {{ margin: 0; }}
+nav {{ height: 36px; }}
+article {{ box-sizing: border-box; height: 720px; padding: 8px; }}
+</style></head><body><nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<article id="first">
+  <a href="/@candidate/post/document-first"><time>now</time></a>
+  <a href="/@candidate">candidate</a><p>A synthetic first row.</p>
+</article>
+<article id="below">
+  <a href="/@candidate/post/document-below"><time>1h</time></a>
+  <a href="/@candidate">candidate</a><p>A synthetic row below the viewport.</p>
+</article>
+</body></html>"""
+
+    async def exercise(page) -> None:
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        before = await reader.scan_viewport(4)
+        assert len(before) == 1
+
+        clip_expression = with_scrollport_geometry("""node => {
+            /*SCROLLPORT_GEOMETRY*/
+            const rect = node.getBoundingClientRect();
+            const clip = clipFor(node);
+            return {
+                scrollY: window.scrollY,
+                viewportHeight: window.innerHeight,
+                rectTop: rect.top,
+                rectBottom: rect.bottom,
+                clipTop: clip.top,
+                clipBottom: clip.bottom,
+            };
+        }""")
+        before_clip = await page.locator("#below").evaluate(clip_expression)
+        assert before_clip["scrollY"] == 0
+        assert before_clip["rectTop"] >= before_clip["clipBottom"]
+
+        assert await reader.advance_feed(scan_after_scroll=False)
+        after_clip = await page.locator("#below").evaluate(clip_expression)
+        assert after_clip["scrollY"] > 0
+        assert after_clip["clipTop"] == before_clip["clipTop"]
+        assert after_clip["clipBottom"] == before_clip["clipBottom"]
+        assert after_clip["rectTop"] < after_clip["clipBottom"]
+        assert after_clip["rectBottom"] > after_clip["clipTop"]
+
+        after = await reader.scan_viewport(4)
+        loaded = next(
+            (target for target in after if target.url.endswith("/post/document-below")),
+            None,
+        )
+        assert loaded is not None
+        assert loaded.body is not None
+        assert loaded.currently_visible
 
     _run_offline_page(feed_html, exercise)
 
