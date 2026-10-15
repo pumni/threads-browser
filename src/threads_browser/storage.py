@@ -494,7 +494,7 @@ def _decode_checkpoint(
         or counts["home_new"] > counts["home_sampled"]
         or counts["detail_reads"] > counts["home_new"]
         or counts["scrolls"] > counts["scroll_attempts"]
-        or counts["scroll_attempts"] > counts["completed_runs"]
+        or counts["scroll_attempts"] > counts["completed_runs"] * 20
     ):
         raise BrowserDataError("STATE_INVALID")
     return Checkpoint(

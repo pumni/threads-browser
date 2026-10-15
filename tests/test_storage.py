@@ -55,8 +55,8 @@ def test_checkpoint_resume_is_strict_atomic_and_contains_only_fingerprints(
         home_new=1,
         home_relevant=1,
         detail_reads=1,
-        scroll_attempts=1,
-        scrolls=1,
+        scroll_attempts=3,
+        scrolls=3,
         seen_fingerprints=("b" * 64,),
     )
     store.save(saved)

@@ -28,10 +28,27 @@ def _parser() -> argparse.ArgumentParser:
     add.add_argument("--profile-dir", required=True, type=Path)
     nurture = commands.add_parser("nurture", help="run a bounded read-only workflow")
     nurture_commands = nurture.add_subparsers(dest="nurture_command", required=True)
-    run = nurture_commands.add_parser("run", help="sample Home / For You once")
+    run = nurture_commands.add_parser("run", help="search Home / For You within bounded budgets")
     run.add_argument("alias")
     run.add_argument("--headed", action="store_true", help="confirm headed one-shot operation")
-    run.add_argument("--max-posts", required=True, type=int)
+    run.add_argument(
+        "--max-posts",
+        required=True,
+        type=int,
+        help="maximum verified posts to classify per viewport (1-20)",
+    )
+    run.add_argument(
+        "--max-scrolls",
+        type=int,
+        default=8,
+        help="maximum observed read-only feed advances (0-20; default: 8)",
+    )
+    run.add_argument(
+        "--max-total-posts",
+        type=int,
+        default=40,
+        help="maximum distinct verified posts per run (1-400; default: 40)",
+    )
     run.add_argument(
         "--term",
         action="append",
@@ -97,6 +114,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not 1 <= args.max_posts <= 20:
                 print("ERROR POST_LIMIT_INVALID", file=sys.stderr)
                 return 1
+            if not 0 <= args.max_scrolls <= 20:
+                print("ERROR SCROLL_LIMIT_INVALID", file=sys.stderr)
+                return 1
+            if not 1 <= args.max_total_posts <= 400:
+                print("ERROR TOTAL_SCAN_LIMIT_INVALID", file=sys.stderr)
+                return 1
             account = accounts.get(args.alias)
             lock = profile_lock(data_root, account)
             with lock:
@@ -110,6 +133,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                             CheckpointStore(data_root),
                             max_posts=args.max_posts,
                             terms=tuple(args.term),
+                            max_scrolls=args.max_scrolls,
+                            max_total_posts=args.max_total_posts,
                             readiness_prompt=(
                                 _prompt_readiness_extension
                                 if sys.stdin.isatty() and sys.stdout.isatty()

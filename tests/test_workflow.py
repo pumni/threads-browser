@@ -191,7 +191,7 @@ def test_offline_chromium_cli_reads_once_and_resumes_without_double_counting(
     assert "home_sampled=2 home_new=2" in first.out
     assert "home_relevant=1 home_irrelevant=1" in first.out
     assert "home_relevant_ratio=0.50" in first.out
-    assert "detail_reads=1 scroll_attempts=1 scrolls=1 checkpoint_runs=1" in first.out
+    assert "detail_reads=1 scroll_attempts=1 scrolls=1 skipped_unverified=0" in first.out
     assert second_code == 0, second.out + second.err
     assert "NURTURE status=NO_NEW_RELEVANT_POST source=HOME_FOR_YOU" in second.out
     assert "home_sampled=2 home_new=0" in second.out
@@ -706,12 +706,12 @@ window.addEventListener("wheel", () => window.wheelCount++);</script></body></ht
                 terms=("hiring",),
                 readiness_prompt=provenance_prompt,
             )
-        assert caught.value.code == "FEED_INITIAL_NOT_READY"
-        assert await page.evaluate("window.wheelCount") == 0
-        assert provenance_prompts == [("FEED_INITIAL", 2)]
+        assert caught.value.code == "HOME_SCROLL_UNVERIFIED"
+        assert await page.evaluate("window.wheelCount") == 1
+        assert provenance_prompts == [("HOME_SCROLL", 2)]
 
     with monkeypatch.context() as short_recovery:
-        short_recovery.setattr(reader_module, "_READINESS_TIMEOUT_MS", 100)
+        short_recovery.setattr(reader_module, "_READINESS_TIMEOUT_MS", 500)
         short_recovery.setattr(reader_module, "_READINESS_RECHECK_INTERVAL_MS", 20)
         _run_offline_page(malformed_html, malformed_exercise)
     policy = policy_fingerprint(canonical_terms(("hiring",)))
@@ -722,7 +722,7 @@ window.addEventListener("wheel", () => window.wheelCount++);</script></body></ht
     assert checkpoint.scrolls == 0
     output = capsys.readouterr().out
     assert "SKIPPED stage=FEED_INITIAL reason=CANDIDATE_AMBIGUOUS count=2" in output
-    assert "STOP stage=FEED_INITIAL code=FEED_INITIAL_NOT_READY" in output
+    assert "SCROLL attempt=1 observed=0" in output
     assert "Two identities in one card" not in output
 
     no_movement_html = f"""<!doctype html><html><head><style>
@@ -1509,3 +1509,335 @@ def test_default_desktop_profile_is_rejected_before_browser_startup(
             )
         )
     assert launch_error.value.code == "PROFILE_UNAVAILABLE"
+
+
+def test_relevance_search_finds_visible_post_after_two_observed_advances(
+    tmp_path: Path,
+) -> None:
+    actor = "offline.operator"
+    detail_url = "https://www.threads.com/@candidate/post/relevant-third"
+    detail_body = "Hiring a senior engineer"
+    feed_html = f"""<!doctype html><html><head><style>
+article {{ box-sizing: border-box; height: 600px; padding-top: 60px; }}
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main>
+<article><a href="/@candidate/post/first"><time>3h</time></a>
+  <a href="/@candidate">@candidate</a><p>A weather update</p></article>
+<article><a href="/@candidate/post/second"><time>2h</time></a>
+  <a href="/@candidate">@candidate</a><p>A local event</p></article>
+<article><a href="/@candidate/post/relevant-third"><time>1h</time></a>
+  <a href="/@candidate">@candidate</a><p>{detail_body}</p></article>
+</main><script>
+window.addEventListener("wheel", event => {{
+  event.preventDefault();
+  const count = Number(sessionStorage.getItem("wheel-count") || "0") + 1;
+  sessionStorage.setItem("wheel-count", String(count));
+  window.scrollBy(0, 560);
+}}, {{ passive: false }});
+</script></body></html>"""
+    detail_html = f"""<!doctype html><html><body><main><article>
+<a href="/@candidate/post/relevant-third"><time>1h</time></a>
+<a href="/@candidate">@candidate</a><p>{detail_body}</p>
+</article></main></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+
+    async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=detail_html,
+            )
+
+        await page.route(detail_url, serve_detail)
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=1,
+            max_scrolls=5,
+            max_total_posts=20,
+            terms=("hiring", "engineer"),
+        )
+        assert result.status == "COMPLETE"
+        assert result.home_sampled == 3
+        assert result.home_new == 3
+        assert result.home_relevant == 1
+        assert result.home_irrelevant == 2
+        assert result.detail_reads == 1
+        assert result.scroll_attempts == result.scrolls == 2
+        assert result.checkpoint_runs == 1
+        assert await page.evaluate("sessionStorage.getItem('wheel-count')") == "2"
+
+    _run_offline_page(feed_html, exercise)
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring", "engineer"))),
+    )
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.home_sampled == 3
+    assert checkpoint.detail_reads == 1
+    assert checkpoint.scroll_attempts == checkpoint.scrolls == 2
+
+
+def test_noncanonical_first_viewport_can_advance_to_verified_relevant_post(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    detail_url = "https://www.threads.com/@candidate/post/later-valid"
+    invalid_urls = (
+        "/@candidate/post/bad/one",
+        "/@candidate/post/bad/two",
+    )
+    detail_body = "We are hiring a platform engineer"
+    feed_html = f"""<!doctype html><html><head><style>
+.post-card {{ box-sizing: border-box; height: 760px; padding-top: 60px; }}
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main>
+<div class="post-card"><a href="{invalid_urls[0]}">Permalink A</a>
+  <a href="{invalid_urls[1]}">Permalink B</a><p>Hiring content must be skipped</p></div>
+<div class="post-card"><a href="/@candidate/post/later-valid"><time>1h</time></a>
+  <a href="/@candidate">@candidate</a><p>{detail_body}</p></div>
+</main><script>
+window.addEventListener("wheel", event => {{
+  event.preventDefault();
+  const count = Number(sessionStorage.getItem("wheel-count") || "0") + 1;
+  sessionStorage.setItem("wheel-count", String(count));
+  window.scrollBy(0, 560);
+}}, {{ passive: false }});
+</script></body></html>"""
+    detail_html = f"""<!doctype html><html><body><main><article>
+<a href="/@candidate/post/later-valid"><time>1h</time></a>
+<a href="/@candidate">@candidate</a><p>{detail_body}</p>
+</article></main></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+
+    async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=detail_html,
+            )
+
+        await page.route(detail_url, serve_detail)
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=1,
+            max_scrolls=3,
+            max_total_posts=10,
+            terms=("hiring", "engineer"),
+        )
+        assert result.status == "COMPLETE"
+        assert result.home_sampled == result.home_new == 1
+        assert result.home_relevant == 1
+        assert result.skipped_unverified == 2
+        assert result.scroll_attempts == result.scrolls == 1
+        assert result.detail_reads == 1
+        assert await page.evaluate("sessionStorage.getItem('wheel-count')") == "1"
+
+    _run_offline_page(feed_html, exercise)
+    output = capsys.readouterr().out
+    assert "SKIPPED stage=FEED_INITIAL reason=CANDIDATE_NONCANONICAL count=2" in output
+    assert "SCANNING viewport=1 verified=0 relevant=0 skipped=2" in output
+    assert all(value not in output for value in (*invalid_urls, "Hiring content must be skipped"))
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring", "engineer"))),
+    )
+    assert checkpoint.home_sampled == 1
+    assert checkpoint.home_relevant == 1
+
+
+def test_irrelevant_posts_exhaust_scroll_budget_as_completed_read_only_search(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    feed_html = f"""<!doctype html><html><head><style>
+article {{ box-sizing: border-box; height: 600px; padding-top: 60px; }}
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main>
+<article><a href="/@candidate/post/one"><time>3h</time></a>
+  <a href="/@candidate">@candidate</a><p>A weather update</p></article>
+<article><a href="/@candidate/post/two"><time>2h</time></a>
+  <a href="/@candidate">@candidate</a><p>A local event</p></article>
+<article><a href="/@candidate/post/three"><time>1h</time></a>
+  <a href="/@candidate">@candidate</a><p>A music note</p></article>
+</main><script>
+window.addEventListener("wheel", event => {{
+  event.preventDefault();
+  const count = Number(sessionStorage.getItem("wheel-count") || "0") + 1;
+  sessionStorage.setItem("wheel-count", String(count));
+  window.scrollBy(0, 560);
+}}, {{ passive: false }});
+</script></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+
+    async def exercise(page) -> None:
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=1,
+            max_scrolls=2,
+            max_total_posts=20,
+            terms=("hiring",),
+        )
+        assert result.status == "NO_RELEVANT_POST_IN_BUDGET"
+        assert result.home_sampled == 3
+        assert result.home_irrelevant == 3
+        assert result.home_unknown == 0
+        assert result.detail_reads == 0
+        assert result.scroll_attempts == result.scrolls == 2
+        assert result.checkpoint_runs == 1
+        assert await page.evaluate("sessionStorage.getItem('wheel-count')") == "2"
+
+    _run_offline_page(feed_html, exercise)
+    policy = policy_fingerprint(canonical_terms(("hiring",)))
+    checkpoint = store.load(account.account_id, policy)
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.home_sampled == 3
+    assert checkpoint.home_irrelevant == 3
+    assert checkpoint.scroll_attempts == checkpoint.scrolls == 2
+    assert "SEARCH_BUDGET_EXHAUSTED reason=MAX_SCROLLS viewports=3" in capsys.readouterr().out
+
+
+def test_total_scan_budget_and_zero_verified_exhaustion_are_truthful(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    valid_html = f"""<!doctype html><html><head><style>
+article {{ box-sizing: border-box; height: 600px; padding-top: 60px; }}
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main>
+<article><a href="/@candidate/post/one"><time>3h</time></a>
+  <a href="/@candidate">@candidate</a><p>A weather update</p></article>
+<article><a href="/@candidate/post/two"><time>2h</time></a>
+  <a href="/@candidate">@candidate</a><p>A local event</p></article>
+<article><a href="/@candidate/post/three"><time>1h</time></a>
+  <a href="/@candidate">@candidate</a><p>A music note</p></article>
+</main><script>
+window.addEventListener("wheel", event => {{
+  event.preventDefault();
+  const count = Number(sessionStorage.getItem("wheel-count") || "0") + 1;
+  sessionStorage.setItem("wheel-count", String(count));
+  window.scrollBy(0, 560);
+}}, {{ passive: false }});
+</script></body></html>"""
+    zero_verified_html = f"""<!doctype html><html><head><style>
+.post-card {{ box-sizing: border-box; height: 600px; padding-top: 60px; }}
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main>
+<div class="post-card"><a href="/@candidate/post/bad/one">Permalink</a></div>
+<div class="post-card"><a href="/@candidate/post/bad/two">Permalink</a></div>
+<div class="post-card"><a href="/@candidate/post/bad/three">Permalink</a></div>
+</main><script>
+window.addEventListener("wheel", event => {{
+  event.preventDefault();
+  const count = Number(sessionStorage.getItem("wheel-count") || "0") + 1;
+  sessionStorage.setItem("wheel-count", String(count));
+  window.scrollBy(0, 560);
+}}, {{ passive: false }});
+</script></body></html>"""
+    valid_root = tmp_path / "valid"
+    valid_profile = valid_root / "profile"
+    valid_profile.mkdir(parents=True)
+    valid_account = AccountStore(valid_root / "data").add(
+        "offline",
+        actor,
+        valid_profile,
+    )
+    valid_store = CheckpointStore(valid_root / "data")
+
+    async def valid_exercise(page) -> None:
+        result = await workflow.run_page_workflow(
+            page,
+            valid_account,
+            valid_store,
+            max_posts=1,
+            max_scrolls=8,
+            max_total_posts=2,
+            terms=("hiring",),
+        )
+        assert result.status == "NO_RELEVANT_POST_IN_BUDGET"
+        assert result.home_sampled == 2
+        assert result.scroll_attempts == result.scrolls == 1
+        assert result.checkpoint_runs == 1
+        assert await page.evaluate("sessionStorage.getItem('wheel-count')") == "1"
+
+    _run_offline_page(valid_html, valid_exercise)
+    valid_checkpoint = valid_store.load(
+        valid_account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert valid_checkpoint.completed_runs == 1
+    assert valid_checkpoint.home_sampled == 2
+    assert valid_checkpoint.scroll_attempts == 1
+
+    zero_root = tmp_path / "zero-verified"
+    zero_profile = zero_root / "profile"
+    zero_profile.mkdir(parents=True)
+    zero_account = AccountStore(zero_root / "data").add(
+        "offline",
+        actor,
+        zero_profile,
+    )
+    zero_store = CheckpointStore(zero_root / "data")
+
+    async def zero_exercise(page) -> None:
+        result = await workflow.run_page_workflow(
+            page,
+            zero_account,
+            zero_store,
+            max_posts=1,
+            max_scrolls=2,
+            max_total_posts=10,
+            terms=("hiring",),
+        )
+        assert result.status == "NO_VERIFIED_POSTS_IN_BUDGET"
+        assert result.home_sampled == result.home_new == 0
+        assert result.home_relevant == result.home_irrelevant == 0
+        assert result.scroll_attempts == result.scrolls == 2
+        assert result.checkpoint_runs == 0
+        assert await page.evaluate("sessionStorage.getItem('wheel-count')") == "2"
+
+    _run_offline_page(zero_verified_html, zero_exercise)
+    zero_policy = policy_fingerprint(canonical_terms(("hiring",)))
+    zero_checkpoint = zero_store.load(zero_account.account_id, zero_policy)
+    assert zero_checkpoint.completed_runs == 0
+    assert zero_checkpoint.home_sampled == 0
+    output = capsys.readouterr().out
+    assert "SEARCH_BUDGET_EXHAUSTED reason=MAX_TOTAL_POSTS viewports=2" in output
+    assert "SEARCH_BUDGET_EXHAUSTED reason=MAX_SCROLLS viewports=3" in output

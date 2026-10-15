@@ -16,6 +16,7 @@ from playwright.async_api import (
     Error as PlaywrightError,
 )
 from playwright.async_api import (
+    JSHandle,
     Locator,
     Page,
     expect,
@@ -117,7 +118,7 @@ class PostTarget:
     body: str | None = field(repr=False)
     fingerprint: str
     permalink: Locator = field(repr=False)
-    visible_after_scroll: bool = field(default=False, repr=False)
+    currently_visible: bool = field(default=False, repr=False)
     viewport_y: float = field(default=0.0, repr=False)
 
     def __repr__(self) -> str:
@@ -192,7 +193,7 @@ def _same_home_origin(value: str) -> bool:
 
 
 class ThreadsHomeReader:
-    """Reads one Home / For You sample and at most one exact visible post."""
+    """Reads verified visible Home / For You posts and at most one exact post."""
 
     def __init__(
         self,
@@ -565,29 +566,44 @@ class ThreadsHomeReader:
             recoverable_codes=("RETURN_UNVERIFIED",),
         )
 
-    async def sample_and_scroll(self, max_posts: int) -> HomeSample:
+    async def scan_viewport(
+        self,
+        max_posts: int,
+        *,
+        scanned_fingerprints: set[str] | None = None,
+    ) -> tuple[PostTarget, ...]:
         if not 1 <= max_posts <= 20:
             raise UiReadError("POST_LIMIT_INVALID")
-        before, scroll_anchor = await self._wait_for_home_targets(
+        initial_viewport = self.scrolls == 0
+        targets, _ = await self._wait_for_home_targets(
             max_posts,
-            timeout_code="FEED_INITIAL_NOT_READY",
+            timeout_code=(
+                "FEED_INITIAL_NOT_READY"
+                if initial_viewport
+                else "FEED_SCROLL_NOT_READY"
+            ),
+            currently_visible=True,
+            prefer_new_fingerprints=scanned_fingerprints,
+            stage="FEED_INITIAL" if initial_viewport else "FEED_SCROLL",
         )
-        before_by_fingerprint = {target.fingerprint: target for target in before}
-        before_by_url = {target.url: target for target in before}
-        self.feed_duplicates = len(before) - len(before_by_fingerprint)
-        self.scroll_attempts = 0
-        self.scrolls = 0
-        anchor_box = await before[0].permalink.bounding_box()
-        if anchor_box is None:
-            raise UiReadError("HOME_SCROLL_UNVERIFIED")
+        return targets
+
+    async def advance_feed(self) -> bool:
+        """Issue one read-only wheel event and require observed scroll displacement."""
+        await self._wait_for_verified_feed(
+            self._readiness_deadline(_READINESS_TIMEOUT_MS),
+            timeout_code="HOME_SCROLL_SURFACE_UNVERIFIED",
+        )
+        point = await self._safe_feed_scroll_point()
+        surface = await self._scroll_surface()
+        initial_position = await surface.evaluate("element => element.scrollTop")
         try:
-            await self._page.mouse.move(
-                scroll_anchor["x"] + scroll_anchor["width"] / 2,
-                scroll_anchor["y"] + scroll_anchor["height"] / 2,
-            )
-            self.scroll_attempts = 1
+            await self._page.mouse.move(*point)
+            self.scroll_attempts += 1
             await self._page.mouse.wheel(0, 850)
         except PlaywrightError:
+            print(f"SCROLL attempt={self.scroll_attempts} observed=0")
+            await surface.dispose()
             raise UiReadError("HOME_SCROLL_FAILED") from None
 
         async def observe_scroll(window_deadline: float) -> bool:
@@ -601,55 +617,53 @@ class ThreadsHomeReader:
                     timeout_code="HOME_SCROLL_UNVERIFIED",
                 )
                 if await self._wait_for_scroll_movement(
-                    before[0].permalink,
-                    anchor_box["y"],
+                    surface,
+                    initial_position,
                     window_deadline,
                 ):
-                    return True
-                try:
-                    current, _ = await self._visible_targets(
-                        max_posts,
-                        visible_after_scroll=True,
-                        prefer_new_fingerprints=set(before_by_fingerprint),
-                        stage="FEED_SCROLL",
-                    )
-                except _CardNotReady as pending:
-                    await self._wait_for_pending_card(
-                        pending,
+                    await self._wait_for_verified_feed(
                         window_deadline,
+                        timeout_code="HOME_SCROLL_UNVERIFIED",
                     )
-                    continue
-                if any(
-                    target.url in before_by_url
-                    and abs(target.viewport_y - before_by_url[target.url].viewport_y) > 1
-                    for target in current
-                ):
                     return True
-                pending = await self._feed_readiness_signals()
-                if not pending:
-                    pending = _CardNotReady(
+                await self._wait_for_pending_card(
+                    _CardNotReady(
                         self._page.locator("body"),
                         condition="mutation",
-                    )
-                await self._wait_for_pending_card(pending, window_deadline)
+                    ),
+                    window_deadline,
+                )
 
-        scroll_observed = await self._recoverable_stage(
-            "HOME_SCROLL",
-            "HOME_SCROLL_UNVERIFIED",
-            observe_scroll,
-        )
-        after, _ = await self._wait_for_home_targets(
+        try:
+            await self._recoverable_stage(
+                "HOME_SCROLL",
+                "HOME_SCROLL_UNVERIFIED",
+                observe_scroll,
+            )
+        except UiReadError:
+            print(f"SCROLL attempt={self.scroll_attempts} observed=0")
+            raise
+        finally:
+            await surface.dispose()
+        self.scrolls += 1
+        print(f"SCROLL attempt={self.scroll_attempts} observed=1")
+        return True
+
+    async def sample_and_scroll(self, max_posts: int) -> HomeSample:
+        """Compatibility helper for callers that need a before/after sample."""
+        self.scroll_attempts = 0
+        self.scrolls = 0
+        self.feed_duplicates = 0
+        before = await self.scan_viewport(max_posts)
+        before_by_fingerprint = {target.fingerprint: target for target in before}
+        self.feed_duplicates += len(before) - len(before_by_fingerprint)
+        await self.advance_feed()
+        after = await self.scan_viewport(
             max_posts,
-            timeout_code="HOME_SCROLL_UNVERIFIED",
-            visible_after_scroll=True,
-            prefer_new_fingerprints=set(before_by_fingerprint),
-            stage="FEED_SCROLL",
+            scanned_fingerprints=set(before_by_fingerprint),
         )
         after_by_fingerprint = {target.fingerprint: target for target in after}
         self.feed_duplicates += len(after) - len(after_by_fingerprint)
-        if not scroll_observed:
-            raise UiReadError("HOME_SCROLL_UNVERIFIED")
-        self.scrolls = 1
         for fingerprint in after_by_fingerprint:
             if fingerprint in before_by_fingerprint:
                 self.feed_duplicates += 1
@@ -714,7 +728,7 @@ class ThreadsHomeReader:
         max_posts: int,
         *,
         timeout_code: str,
-        visible_after_scroll: bool = False,
+        currently_visible: bool = False,
         prefer_new_fingerprints: set[str] | None = None,
         stage: str | None = None,
     ) -> tuple[tuple[PostTarget, ...], dict[str, float]]:
@@ -734,7 +748,7 @@ class ThreadsHomeReader:
                 try:
                     targets, scroll_anchor = await self._visible_targets(
                         max_posts,
-                        visible_after_scroll=visible_after_scroll,
+                        currently_visible=currently_visible,
                         prefer_new_fingerprints=prefer_new_fingerprints,
                         stage=stage_name,
                     )
@@ -751,6 +765,13 @@ class ThreadsHomeReader:
                         timeout_code=timeout_code,
                     )
                     return targets, scroll_anchor
+                if await self._visible_feed_evidence():
+                    self._remaining_readiness_ms(window_deadline, timeout_code)
+                    await self._wait_for_verified_feed(
+                        window_deadline,
+                        timeout_code=timeout_code,
+                    )
+                    return (), {}
                 pending = await self._feed_readiness_signals()
                 if not pending:
                     pending = _CardNotReady(
@@ -868,30 +889,130 @@ class ThreadsHomeReader:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
+    async def _visible_feed_evidence(self) -> bool:
+        viewport = self._page.viewport_size
+        if viewport is None:
+            return False
+        articles = self._page.get_by_role("article")
+        for index in range(min(await articles.count(), _MAX_PERMALINK_CANDIDATES)):
+            article = articles.nth(index)
+            if not await article.is_visible():
+                continue
+            if await self._is_outside_content_landmark(article):
+                continue
+            links = article.locator('a[href*="/post/"]')
+            for link_index in range(await links.count()):
+                permalink = links.nth(link_index)
+                if not await permalink.is_visible():
+                    continue
+                box = await permalink.bounding_box()
+                if box is not None and self._intersects_viewport(box, viewport):
+                    return True
+        region = await self._content_region()
+        permalinks = region.locator('a[href*="/post/"]')
+        for index in range(min(await permalinks.count(), _MAX_PERMALINK_CANDIDATES)):
+            permalink = permalinks.nth(index)
+            if not await permalink.is_visible():
+                continue
+            if await self._is_outside_content_landmark(permalink):
+                continue
+            box = await permalink.bounding_box()
+            if box is not None and self._intersects_viewport(box, viewport):
+                return True
+        return False
+
+    async def _safe_feed_scroll_point(self) -> tuple[float, float]:
+        if not await self._visible_feed_evidence():
+            raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
+        viewport = self._page.viewport_size
+        if viewport is None:
+            raise UiReadError("FEED_VIEWPORT_UNVERIFIED")
+        region = await self._content_region()
+        box = await region.bounding_box()
+        if box is None:
+            raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
+        left = max(0.0, box["x"])
+        right = min(float(viewport["width"]), box["x"] + box["width"])
+        top = max(0.0, box["y"])
+        bottom = min(float(viewport["height"]), box["y"] + box["height"])
+        if left >= right or top >= bottom:
+            raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
+        xs = (left + (right - left) * 0.55, left + (right - left) * 0.75)
+        ys = (
+            top + (bottom - top) * 0.4,
+            top + (bottom - top) * 0.6,
+            top + (bottom - top) * 0.8,
+        )
+        for y in ys:
+            for x in xs:
+                safe = await region.evaluate(
+                    """(region, point) => {
+                        const target = document.elementFromPoint(point.x, point.y);
+                        if (!target || !region.contains(target)) return false;
+                        const excluded = target.closest(
+                            "nav, aside, footer, [role='navigation'], [role='menu'], " +
+                            "[role='complementary'], [role='dialog'], [role='search'], " +
+                            "[role='banner'], [role='contentinfo']"
+                        );
+                        const control = target.closest(
+                            "a, button, input, select, textarea, [role='button'], " +
+                            "[role='link'], [role='tab'], [role='menuitem']"
+                        );
+                        return !excluded && !control;
+                    }""",
+                    {"x": x, "y": y},
+                )
+                if safe:
+                    return x, y
+        raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
+
+    async def _scroll_surface(self) -> JSHandle:
+        region = await self._content_region()
+        region_handle = await region.element_handle()
+        if region_handle is None:
+            raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
+        try:
+            surface = await self._page.evaluate_handle(
+                """region => {
+                for (let element = region; element && element !== document.documentElement;
+                     element = element.parentElement) {
+                    const style = window.getComputedStyle(element);
+                    const scrollable = style.overflowY === "auto" ||
+                        style.overflowY === "scroll" || style.overflowY === "overlay";
+                    if (scrollable && element.scrollHeight > element.clientHeight + 1) {
+                        return element;
+                    }
+                }
+                return document.scrollingElement;
+                }""",
+                region_handle,
+            )
+        finally:
+            await region_handle.dispose()
+        if await surface.evaluate("element => element === null"):
+            await surface.dispose()
+            raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
+        return surface
+
     async def _wait_for_scroll_movement(
         self,
-        permalink: Locator,
-        initial_y: float,
+        surface: JSHandle,
+        initial_position: float,
         deadline: float,
     ) -> bool:
-        handle = await permalink.element_handle()
-        if handle is None:
-            return False
         result = None
-        outcome: str | None = None
         try:
             result = await self._page.wait_for_function(
-                "([element, initialY]) => !element.isConnected ? 'detached' "
-                ": Math.abs(element.getBoundingClientRect().y - initialY) > 1 "
-                "? 'moved' : false",
-                arg=[handle, initial_y],
+                "([element, initialPosition]) => element !== null && "
+                "element.isConnected && Math.abs(element.scrollTop - initialPosition) > 1",
+                arg=[surface, initial_position],
                 timeout=min(
                     self._remaining_readiness_ms(deadline, "HOME_SCROLL_UNVERIFIED"),
                     _READINESS_RECHECK_INTERVAL_MS,
                 ),
                 polling="raf",
             )
-            outcome = await result.json_value()
+            return bool(await result.json_value())
         except PlaywrightTimeoutError:
             return False
         except PlaywrightError:
@@ -902,17 +1023,12 @@ class ThreadsHomeReader:
                     await result.dispose()
                 except PlaywrightError:
                     pass
-            try:
-                await handle.dispose()
-            except PlaywrightError:
-                pass
-        return outcome == "moved"
 
     async def _visible_targets(
         self,
         max_posts: int,
         *,
-        visible_after_scroll: bool = False,
+        currently_visible: bool = False,
         prefer_new_fingerprints: set[str] | None = None,
         stage: str = "FEED",
     ) -> tuple[tuple[PostTarget, ...], dict[str, float] | None]:
@@ -926,13 +1042,13 @@ class ThreadsHomeReader:
         if article_count == 0:
             return await self._visible_permalink_targets(
                 max_posts,
-                visible_after_scroll=visible_after_scroll,
+                currently_visible=currently_visible,
                 prefer_new_fingerprints=prefer_new_fingerprints,
                 stage=stage,
             )
-        scan_limit = min(article_count, max_posts + 20)
-        visible_limit = max_posts if prefer_new_fingerprints is None else max_posts + 20
+        scan_limit = min(article_count, min(max_posts + 20, _MAX_PERMALINK_CANDIDATES))
         pending_cards: list[_CardNotReady] = []
+        scanned_fingerprints: set[str] = set()
         for index in range(scan_limit):
             article = articles.nth(index)
             if not await article.is_visible():
@@ -946,10 +1062,27 @@ class ThreadsHomeReader:
                 or box["y"] + box["height"] <= 0
             ):
                 continue
+            if currently_visible:
+                permalinks = article.locator('a[href*="/post/"]')
+                permalink_count = await permalinks.count()
+                visible_permalink = False
+                for link_index in range(permalink_count):
+                    permalink = permalinks.nth(link_index)
+                    if not await permalink.is_visible():
+                        continue
+                    permalink_box = await permalink.bounding_box()
+                    if (
+                        permalink_box is not None
+                        and self._intersects_viewport(permalink_box, viewport)
+                    ):
+                        visible_permalink = True
+                        break
+                if permalink_count and not visible_permalink:
+                    continue
             try:
                 target = await self._read_card(
                     article,
-                    visible_after_scroll=visible_after_scroll,
+                    currently_visible=currently_visible,
                     viewport_y=box["y"],
                 )
             except _CardNotReady as pending:
@@ -958,16 +1091,30 @@ class ThreadsHomeReader:
             except _UnverifiedFeedCandidate as error:
                 self._record_skipped_candidate(stage, error)
                 continue
+            if currently_visible:
+                permalink_box = await target.permalink.bounding_box()
+                if (
+                    permalink_box is None
+                    or not self._intersects_viewport(permalink_box, viewport)
+                ):
+                    continue
+            if (
+                target.fingerprint in scanned_fingerprints
+                or (
+                    prefer_new_fingerprints is not None
+                    and target.fingerprint in prefer_new_fingerprints
+                )
+            ):
+                self.feed_duplicates += 1
+                continue
+            scanned_fingerprints.add(target.fingerprint)
             targets.append(target)
             if scroll_anchor is None:
                 scroll_anchor = box
-            if len(targets) >= visible_limit:
+            if len(targets) >= max_posts:
                 break
         if not targets and pending_cards:
             raise _CardNotReady.combine(pending_cards)
-        if prefer_new_fingerprints is not None:
-            targets.sort(key=lambda target: target.fingerprint in prefer_new_fingerprints)
-            targets = targets[:max_posts]
         return tuple(targets), scroll_anchor
 
     @staticmethod
@@ -1130,7 +1277,7 @@ class ThreadsHomeReader:
         self,
         max_posts: int,
         *,
-        visible_after_scroll: bool,
+        currently_visible: bool,
         prefer_new_fingerprints: set[str] | None,
         stage: str,
     ) -> tuple[tuple[PostTarget, ...], dict[str, float] | None]:
@@ -1143,15 +1290,18 @@ class ThreadsHomeReader:
             await permalinks.count(),
             min(max_posts + 20, _MAX_PERMALINK_CANDIDATES),
         )
-        visible_limit = max_posts if prefer_new_fingerprints is None else max_posts + 20
         targets_by_url: dict[str, PostTarget] = {}
         scroll_anchor: dict[str, float] | None = None
         pending_cards: list[_CardNotReady] = []
+        scanned_fingerprints: set[str] = set()
         for index in range(scan_limit):
             permalink = permalinks.nth(index)
             if not await permalink.is_visible():
                 continue
             if await self._is_outside_content_landmark(permalink):
+                continue
+            permalink_box = await permalink.bounding_box()
+            if permalink_box is None or not self._intersects_viewport(permalink_box, viewport):
                 continue
             href = await permalink.get_attribute("href")
             parsed_post = None if href is None else _post_url(href)
@@ -1167,9 +1317,7 @@ class ThreadsHomeReader:
                     )
                 continue
             if parsed_post[0] in targets_by_url:
-                continue
-            permalink_box = await permalink.bounding_box()
-            if permalink_box is None or not self._intersects_viewport(permalink_box, viewport):
+                self.feed_duplicates += 1
                 continue
 
             try:
@@ -1182,7 +1330,7 @@ class ThreadsHomeReader:
                     continue
                 target = await self._read_card(
                     root,
-                    visible_after_scroll=visible_after_scroll,
+                    currently_visible=currently_visible,
                     viewport_y=box["y"],
                 )
             except _CardNotReady as pending:
@@ -1201,18 +1349,30 @@ class ThreadsHomeReader:
                     ),
                 )
                 continue
+            if (
+                target.fingerprint in scanned_fingerprints
+                or (
+                    prefer_new_fingerprints is not None
+                    and target.fingerprint in prefer_new_fingerprints
+                )
+            ):
+                self.feed_duplicates += 1
+                targets_by_url[target.url] = target
+                continue
+            scanned_fingerprints.add(target.fingerprint)
             if scroll_anchor is None:
                 scroll_anchor = box
             targets_by_url[target.url] = target
-            if len(targets_by_url) >= visible_limit:
+            if len(scanned_fingerprints) >= max_posts:
                 break
 
         if not targets_by_url and pending_cards:
             raise _CardNotReady.combine(pending_cards)
-        targets = list(targets_by_url.values())
-        if prefer_new_fingerprints is not None:
-            targets.sort(key=lambda target: target.fingerprint in prefer_new_fingerprints)
-            targets = targets[:max_posts]
+        targets = [
+            target
+            for target in targets_by_url.values()
+            if target.fingerprint in scanned_fingerprints
+        ]
         return tuple(targets), scroll_anchor
 
     async def read_detail(self, target: PostTarget) -> PostTarget:
@@ -1223,10 +1383,28 @@ class ThreadsHomeReader:
             raise
 
     async def _read_detail(self, target: PostTarget) -> PostTarget:
-        if not target.visible_after_scroll:
+        if not target.currently_visible:
             raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED")
         deadline = self._readiness_deadline(_DETAIL_TIMEOUT_MS)
         try:
+            await self._wait_for_verified_feed(
+                deadline,
+                timeout_code="DETAIL_NAVIGATION_UNVERIFIED",
+            )
+            if not await target.permalink.is_visible():
+                raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED")
+            box = await target.permalink.bounding_box()
+            viewport = self._page.viewport_size
+            if (
+                box is None
+                or viewport is None
+                or not self._intersects_viewport(box, viewport)
+            ):
+                raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED")
+            href = await target.permalink.get_attribute("href")
+            parsed = None if href is None else _post_url(href)
+            if parsed != (target.url, target.author):
+                raise UiReadError("DETAIL_PROVENANCE_UNVERIFIED")
             remaining = self._remaining_readiness_ms(
                 deadline,
                 "DETAIL_NAVIGATION_UNVERIFIED",
@@ -1513,7 +1691,7 @@ class ThreadsHomeReader:
         self,
         article: Locator,
         *,
-        visible_after_scroll: bool = False,
+        currently_visible: bool = False,
         viewport_y: float = 0.0,
         require_body: bool = False,
     ) -> PostTarget:
@@ -1607,6 +1785,6 @@ class ThreadsHomeReader:
             body,
             fingerprint,
             link,
-            visible_after_scroll,
+            currently_visible,
             viewport_y,
         )

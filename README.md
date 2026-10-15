@@ -1,6 +1,6 @@
 # Threads Browser
 
-A small, independent, read-only Playwright CLI for bounded Home / For You observation.
+A small, independent, read-only Playwright CLI for bounded Home / For You exploration.
 
 ## Setup
 
@@ -13,15 +13,15 @@ Register an existing, separately provisioned, dedicated Chromium automation prof
 
     uv run threads-browser account add my-account --actor "@example" --profile-dir "C:\Users\you\AppData\Local\ThreadsBrowser\profiles\my-account"
 
-Run one headed, read-only Home / For You sample. Terms are local relevance hints; they are not search queries and do not navigate to Search.
+Run a headed, read-only Home / For You search. `--max-posts` caps verified posts classified in each viewport; the defaults allow up to eight observed wheel advances and forty distinct verified posts per run. Terms are local relevance hints; they are not search queries and do not navigate to Search.
 
-    uv run threads-browser nurture run my-account --headed --max-posts 10 --term hiring --term tuyển-dụng
+    uv run threads-browser nurture run my-account --headed --max-posts 2 --max-scrolls 8 --max-total-posts 40 --term hiring --term tuyển-dụng
 
 The data root defaults to %LOCALAPPDATA%\ThreadsBrowser on Windows and ~/.local/share/threads-browser elsewhere. Set THREADS_BROWSER_DATA_ROOT to choose another private root. Account metadata and versioned checkpoints stay there; post text and raw post URLs are not persisted or printed.
 
 ## Scope and limits
 
-The command verifies that For you is active and checks the visible profile control against the expected actor. It samples up to `--max-posts` visible cards before and after one wheel action, deduplicates them by permalink, and prioritizes after-scroll cards when choosing what to open. It opens at most one relevant unread card, verifies its URL and author, returns to the feed, and atomically saves counts plus hashed dedupe and pending-read fingerprints. Relevant cards that could not be opened remain eligible on later runs; a card is removed from pending state after a verified detail read. `home_sampled` and `home_relevant_ratio` include all distinct cards in the bounded sample for that run; `home_new` and `duplicates` report dedupe counts separately. `scroll_attempts` counts the wheel action, while `scrolls` increases only when the after-sample shows a new permalink or a sampled card changes its viewport position. If movement is not observable, the run stops with `HOME_SCROLL_UNVERIFIED` without saving a completed checkpoint. It never likes, follows, replies, posts, sends messages, or accesses the official API.
+The command verifies that For you is active and checks the visible profile control against the expected actor. It classifies verified posts at each viewport, then advances with one mouse wheel only when that viewport has no relevant match. A rejected candidate is skipped without reading its body or using it as a target. The scan stops at either budget, or as soon as it finds a relevant unread post to open. It opens at most one Detail, verifies the canonical URL, author, and body, returns to the feed, and atomically saves counts plus fingerprint-only dedupe and pending-read state. Relevant posts that could not be opened remain eligible on later runs; a post is removed from pending state after a verified Detail read. `home_sampled` and `home_relevant_ratio` include distinct verified posts in the run; `home_new` and `duplicates` report dedupe separately. `scroll_attempts` counts issued wheel events, while `scrolls` counts advances with observed scroll displacement. `NO_RELEVANT_POST_IN_BUDGET` is a completed bounded search; `NO_VERIFIED_POSTS_IN_BUDGET` means the run found no post it could classify and does not save a completed checkpoint. A stalled wheel stops with `HOME_SCROLL_UNVERIFIED` without a checkpoint. The CLI never likes, follows, replies, posts, sends messages, or accesses the official API.
 
 Every invocation prints ui=UNVERIFIED_LIVE_UI. Actor verification searches accessible navigation for one uniquely named Profile/Your profile/Account link or button; if none exists, it accepts one visible exact-text Profile target in navigation. It clicks that target, checks the resulting on-site /@actor route against the registered actor, and returns to the exact Home URL. Missing or ambiguous controls, clicks without navigation, and unverified profile routes stop with fixed stage-specific codes. The reader supports semantic article cards and bounded non-article containers anchored by a canonical on-origin permalink plus matching author link; ambiguous multi-post containers fail closed. Body extraction requires one visible paragraph. The non-article path has only been exercised against local Chromium fixtures; owner diagnostics establish that live permalink links exist, but not their containing card structure. Owner-run, headed UAT is still required to establish compatibility with the current Threads UI. Login, challenge, redirect, ambiguous posts, and unsupported UI stop with a reason code.
 
