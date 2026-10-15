@@ -5,12 +5,11 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import Literal, TypeVar
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit
 
 from playwright.async_api import (
     Error as PlaywrightError,
@@ -25,8 +24,33 @@ from playwright.async_api import (
     TimeoutError as PlaywrightTimeoutError,
 )
 
-THREADS_ORIGIN = "https://www.threads.com"
-HOME_URL = f"{THREADS_ORIGIN}/"
+from .errors import UiReadError
+from .feed.models import DisplayObservation, HomeSample, PostTarget
+from .feed.relevance import canonical_terms, classify_body, normalize_text
+from .feed.urls import (
+    _USERNAME,
+    HOME_URL,
+    THREADS_ORIGIN,
+    _CandidateDiagnosticReason,
+    _post_url,
+    _post_url_rejection_reason,
+    _profile_author,
+    _same_home_origin,
+)
+
+__all__ = [
+    "HOME_URL",
+    "THREADS_ORIGIN",
+    "DisplayObservation",
+    "HomeSample",
+    "PostTarget",
+    "ThreadsHomeReader",
+    "UiReadError",
+    "canonical_terms",
+    "classify_body",
+    "normalize_text",
+]
+
 _NAVIGATION_TIMEOUT_MS = 20_000
 _DETAIL_TIMEOUT_MS = 15_000
 _READINESS_TIMEOUT_MS = 8_000
@@ -55,29 +79,10 @@ _BODY_EXCLUSION_SELECTOR = (
     '[role="complementary"], [role="dialog"], [role="search"], '
     '[role="textbox"], [contenteditable="true"], blockquote, [role="quote"]'
 )
-_USERNAME = re.compile(r"[A-Za-z0-9._]{1,30}")
-_POST_PATH = re.compile(r"/@(?P<author>[A-Za-z0-9._]{1,30})/post/(?P<post>[A-Za-z0-9_-]{1,120})")
-_PROFILE_PATH = re.compile(r"/@(?P<author>[A-Za-z0-9._]{1,30})/?")
 _FOR_YOU_NAME = re.compile(r"^for you$", re.IGNORECASE)
 _PROFILE_NAME = re.compile(r"^(?:profile|your profile|account)$", re.IGNORECASE)
 _MORE_NAME = re.compile(r"^(?:more|see more|read more)$", re.IGNORECASE)
-_CandidateDiagnosticReason = Literal[
-    "POST_LINK_HAS_QUERY_OR_FRAGMENT",
-    "POST_PATH_SHAPE_INVALID",
-    "POST_ORIGIN_INVALID",
-    "POST_AUTHOR_OR_ID_INVALID",
-    "CANDIDATE_WRAPPER_AMBIGUOUS",
-    "CANDIDATE_AUTHOR_MISMATCH",
-]
 _ReadinessResult = TypeVar("_ReadinessResult")
-
-
-class UiReadError(Exception):
-    code: str
-
-    def __init__(self, code: str) -> None:
-        self.code = code
-        super().__init__(code)
 
 
 class _UnverifiedFeedCandidate(UiReadError):
@@ -139,40 +144,6 @@ class _CardNotReady(Exception):
     @classmethod
     def combine(cls, pending: list[_CardNotReady]) -> _CardNotReady:
         return cls(signals=tuple(signal for item in pending for signal in item.signals))
-
-
-@dataclass(frozen=True, slots=True, repr=False)
-class PostTarget:
-    url: str = field(repr=False)
-    author: str = field(repr=False)
-    body: str | None = field(repr=False)
-    fingerprint: str
-    permalink: Locator = field(repr=False)
-    body_available: bool = field(default=False, repr=False)
-    currently_visible: bool = field(default=False, repr=False)
-    viewport_y: float = field(default=0.0, repr=False)
-
-    def __repr__(self) -> str:
-        return "PostTarget(<private>)"
-
-
-@dataclass(frozen=True, slots=True)
-class HomeSample:
-    targets: tuple[PostTarget, ...]
-    observed_targets: tuple[PostTarget, ...]
-    skipped_unverified: int = 0
-
-
-@dataclass(frozen=True, slots=True, repr=False)
-class DisplayObservation:
-    """Locally read card text without verified post identity."""
-
-    body: str | None = field(default=None, repr=False)
-    status: str = "OBSERVED_UNVERIFIED"
-    viewport_y: float = field(default=0.0, repr=False)
-
-    def __repr__(self) -> str:
-        return f"DisplayObservation(status={self.status!r}, body=<private>)"
 
 
 @dataclass(slots=True)
@@ -248,87 +219,6 @@ class _VisibleTargets:
     signature: tuple[object, ...] = field(repr=False)
     candidate_roots: tuple[Locator, ...] = field(default=(), repr=False)
     pending_roots: tuple[Locator, ...] = field(default=(), repr=False)
-
-
-def normalize_text(value: str) -> str:
-    return unicodedata.normalize("NFKC", value).casefold().strip()
-
-
-def canonical_terms(terms: tuple[str, ...]) -> tuple[str, ...]:
-    cleaned = tuple(dict.fromkeys(normalize_text(term) for term in terms if term.strip()))
-    if not cleaned or any(len(term) > 100 for term in cleaned):
-        raise UiReadError("TERMS_INVALID")
-    return cleaned
-
-
-def classify_body(body: str | None, terms: tuple[str, ...]) -> str:
-    if body is None or not body.strip():
-        return "UNKNOWN"
-    normalized = normalize_text(body)
-    return "RELEVANT" if any(term in normalized for term in terms) else "IRRELEVANT"
-
-
-def _post_url(value: str) -> tuple[str, str] | None:
-    try:
-        parsed = urlsplit(urljoin(HOME_URL, value))
-    except ValueError:
-        return None
-    match = _POST_PATH.fullmatch(parsed.path)
-    if (
-        parsed.scheme != "https"
-        or parsed.netloc.casefold() != "www.threads.com"
-        or parsed.query
-        or parsed.fragment
-        or match is None
-    ):
-        return None
-    canonical = urlunsplit(("https", "www.threads.com", parsed.path, "", ""))
-    return canonical, match.group("author").casefold()
-
-
-def _post_url_rejection_reason(value: str) -> _CandidateDiagnosticReason:
-    try:
-        parsed = urlsplit(urljoin(HOME_URL, value))
-    except ValueError:
-        return "POST_ORIGIN_INVALID"
-    if parsed.query or parsed.fragment:
-        return "POST_LINK_HAS_QUERY_OR_FRAGMENT"
-    if parsed.scheme != "https" or parsed.netloc.casefold() != "www.threads.com":
-        return "POST_ORIGIN_INVALID"
-    segments = parsed.path.split("/")
-    if len(segments) != 4 or segments[0] != "" or segments[2] != "post":
-        return "POST_PATH_SHAPE_INVALID"
-    author = segments[1][1:] if segments[1].startswith("@") else ""
-    post_id = segments[3]
-    if _USERNAME.fullmatch(author) is None or re.fullmatch(
-        r"[A-Za-z0-9_-]{1,120}", post_id
-    ) is None:
-        return "POST_AUTHOR_OR_ID_INVALID"
-    return "POST_PATH_SHAPE_INVALID"
-
-
-def _profile_author(value: str) -> str | None:
-    try:
-        parsed = urlsplit(urljoin(HOME_URL, value))
-    except ValueError:
-        return None
-    if (
-        parsed.scheme != "https"
-        or parsed.netloc.casefold() != "www.threads.com"
-        or parsed.query
-        or parsed.fragment
-    ):
-        return None
-    match = _PROFILE_PATH.fullmatch(parsed.path)
-    return None if match is None else match.group("author").casefold()
-
-
-def _same_home_origin(value: str) -> bool:
-    try:
-        parsed = urlsplit(value)
-    except ValueError:
-        return False
-    return parsed.scheme == "https" and parsed.netloc.casefold() == "www.threads.com"
 
 
 class ThreadsHomeReader:

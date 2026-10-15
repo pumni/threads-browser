@@ -11,14 +11,9 @@ from hashlib import sha256
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page, async_playwright
 
-from .reader import (
-    DisplayObservation,
-    ThreadsHomeReader,
-    UiReadError,
-    _FeedScanCounts,
-    canonical_terms,
-    classify_body,
-)
+from .feed.models import DisplayObservation
+from .feed.relevance import canonical_terms, classify_body
+from .reader import ThreadsHomeReader, UiReadError, _FeedScanCounts
 from .storage import (
     BrowserAccount,
     BrowserDataError,
