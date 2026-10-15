@@ -39,11 +39,11 @@ from .feed.urls import (
 )
 
 __all__ = [
-    "DisplayObservation",
     "HOME_URL",
+    "THREADS_ORIGIN",
+    "DisplayObservation",
     "HomeSample",
     "PostTarget",
-    "THREADS_ORIGIN",
     "ThreadsHomeReader",
     "UiReadError",
     "canonical_terms",
