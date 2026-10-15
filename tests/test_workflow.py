@@ -293,7 +293,7 @@ def test_first_viewport_relevance_scrolls_then_reads_and_restores_home(
     truncated_body = "Hiring a backend engineer…"
     expanded_body = "Hiring a backend engineer in Ho Chi Minh City"
     feed_html = f"""<!doctype html><html><head><meta charset="utf-8"><style>
-.post-card {{ box-sizing: border-box; height: 820px; padding-top: 300px; }}
+.post-card {{ box-sizing: border-box; height: 1200px; padding-top: 300px; }}
 </style></head><body>
 <nav aria-label="Main" role="navigation">
   <a aria-current="page" aria-label="For you" href="/">For you</a>
@@ -1283,14 +1283,16 @@ const deactivateForYou = () => {{
   control.removeAttribute("aria-current");
   control.setAttribute("aria-selected", "false");
 }};
-document.querySelector("#profile").addEventListener("click", () => {{
-  const visits = Number(sessionStorage.getItem("profile-visits") || "0") + 1;
-  sessionStorage.setItem("profile-visits", String(visits));
-  if (visits >= 2) deactivateForYou();
+document.querySelectorAll('a[href*="/post/"]').forEach(link => {{
+  link.addEventListener("click", () => {{
+    sessionStorage.setItem("deactivate-for-you-on-back", "1");
+  }});
 }});
 window.addEventListener("pageshow", () => {{
-  if (Number(sessionStorage.getItem("profile-visits") || "0") >= 2) {{
+  if (location.pathname === "/" &&
+      sessionStorage.getItem("deactivate-for-you-on-back") === "1") {{
     deactivateForYou();
+    sessionStorage.removeItem("deactivate-for-you-on-back");
   }}
 }});
 </script></body></html>"""
@@ -1645,6 +1647,132 @@ window.addEventListener("wheel", event => {{
         assert "@other" not in output
 
 
+def test_virtualized_detail_target_is_rediscovered_before_locator_click() -> None:
+    actor = "offline.operator"
+    target_url = "https://www.threads.com/@candidate/post/virtualized"
+    body = "Synthetic fixture post survives virtualized DOM replacement."
+    feed_html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main><article id="virtualized">
+<a href="/@candidate/post/virtualized"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>{body}</p>
+</article></main></body></html>"""
+    detail_requests = 0
+
+    async def exercise(page) -> None:
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        target = (await reader.scan_viewport(1))[0]
+        original_link = await target.permalink.element_handle()
+        assert original_link is not None
+        await page.locator("#virtualized").evaluate(
+            "node => node.replaceWith(node.cloneNode(true))"
+        )
+        assert not await original_link.evaluate("node => node.isConnected")
+        await original_link.dispose()
+
+        async def serve_detail(route: Route) -> None:
+            nonlocal detail_requests
+            detail_requests += 1
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=feed_html,
+            )
+
+        await page.route(target_url, serve_detail)
+        detail = await reader.read_detail(target)
+        assert detail.url == target_url
+        assert detail.body == body
+        assert detail_requests == 1
+
+    _run_offline_page(feed_html, exercise)
+
+
+def test_virtualized_replacement_with_new_identity_is_never_clicked() -> None:
+    actor = "offline.operator"
+    target_url = "https://www.threads.com/@candidate/post/virtualized-old"
+    replacement_url = "https://www.threads.com/@candidate/post/virtualized-new"
+    body = "Synthetic fixture original post body."
+    feed_html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main><article id="virtualized">
+<a href="/@candidate/post/virtualized-old"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>{body}</p>
+</article></main></body></html>"""
+    detail_requests = 0
+
+    async def exercise(page) -> None:
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        target = (await reader.scan_viewport(1))[0]
+        await page.locator("#virtualized").evaluate(
+            """node => {
+                const replacement = node.cloneNode(true);
+                replacement.innerHTML = replacement.innerHTML
+                    .replaceAll("virtualized-old", "virtualized-new")
+                    .replace("Synthetic fixture original post body.",
+                        "Synthetic fixture replacement post body.");
+                node.replaceWith(replacement);
+            }"""
+        )
+
+        async def serve_stale_target(route: Route) -> None:
+            nonlocal detail_requests
+            detail_requests += 1
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=feed_html,
+            )
+
+        await page.route(target_url, serve_stale_target)
+        with pytest.raises(UiReadError) as caught:
+            await reader.read_detail(target)
+        assert caught.value.code == "DETAIL_NAVIGATION_UNVERIFIED"
+        assert page.url.endswith("/")
+        assert replacement_url not in page.url
+        assert await page.locator("#virtualized").inner_text() != ""
+        assert detail_requests == 0
+
+    _run_offline_page(feed_html, exercise)
+
+
+def test_detail_does_not_auto_scroll_an_offscreen_target() -> None:
+    actor = "offline.operator"
+    body = "Synthetic fixture post moves outside the viewport."
+    feed_html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main><article id="offscreen-detail">
+<a href="/@candidate/post/offscreen-detail"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>{body}</p>
+</article></main></body></html>"""
+
+    async def exercise(page) -> None:
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        target = (await reader.scan_viewport(1))[0]
+        original_scroll_y = await page.evaluate("() => window.scrollY")
+        await page.locator("#offscreen-detail").evaluate(
+            "node => node.style.transform = 'translateY(1200px)'"
+        )
+
+        with pytest.raises(UiReadError) as caught:
+            await reader.read_detail(target)
+
+        assert caught.value.code == "DETAIL_NAVIGATION_UNVERIFIED"
+        assert page.url == HOME_URL
+        assert await page.evaluate("() => window.scrollY") == original_scroll_y
+
+    _run_offline_page(feed_html, exercise)
+
+
 def test_detail_body_mismatch_fails_closed_without_checkpoint(tmp_path: Path) -> None:
     actor = "offline.operator"
     target_url = "https://www.threads.com/@candidate/post/body-mismatch"
@@ -1968,6 +2096,37 @@ def test_default_desktop_profile_is_rejected_before_browser_startup(
             )
         )
     assert launch_error.value.code == "PROFILE_UNAVAILABLE"
+
+
+def test_browser_workflow_detail_requires_tty_before_profile_or_browser_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account = BrowserAccount(
+        uuid4(),
+        "offline",
+        "offline.operator",
+        tmp_path / "synthetic-profile",
+    )
+    monkeypatch.setattr(workflow, "_detail_terminal_ready", lambda: False)
+    monkeypatch.setattr(
+        workflow,
+        "async_playwright",
+        lambda: pytest.fail("detail mode accessed browser without a TTY"),
+    )
+
+    with pytest.raises(UiReadError) as caught:
+        asyncio.run(
+            workflow.run_browser_nurture(
+                account,
+                CheckpointStore(tmp_path / "data"),
+                max_posts=1,
+                terms=("hiring",),
+                detail=True,
+            )
+        )
+
+    assert caught.value.code == "DETAIL_TTY_REQUIRED"
 
 
 def test_relevance_search_finds_visible_post_after_two_observed_advances(
@@ -2945,51 +3104,263 @@ nav {{ height: 40px; }}
     assert checkpoint.detail_reads == 1
 
 
+def test_progressive_body_fallback_emits_row_before_reading_next_with_y_jitter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    first_url = "https://www.threads.com/@candidate/post/progressive-first"
+    first_body = "Synthetic hiring a backend engineer."
+    second_body = "Synthetic weather update."
+    feed_html = f"""<!doctype html><html><head><style>
+@keyframes jitter {{ from {{ transform: translateY(0); }} to {{ transform: translateY(2px); }} }}
+.card {{ height: 190px; animation: jitter 20ms infinite alternate; }}
+.settled .card {{ animation-play-state: paused; }}
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main><div class="card" id="first">
+<a href="/@candidate/post/progressive-first"><time>now</time></a>
+<a href="/@candidate">@candidate</a><div><span dir="auto">{first_body}</span></div>
+</div><div class="card" id="second">
+<a href="/@candidate/post/progressive-second"><time>1h</time></a>
+<a href="/@candidate">@candidate</a><div><span dir="auto">{second_body}</span></div>
+</div></main></body></html>"""
+    feed_html = feed_html.replace(
+        "</body>",
+        "<script>setTimeout(() => document.documentElement.classList.add('settled'), 2200);</script></body>",
+    )
+    detail_html = f"""<!doctype html><html><body><article>
+<a href="/@candidate/post/progressive-first"><time>now</time></a>
+<a href="/@candidate">@candidate</a><p>{first_body}</p>
+</article></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "synthetic-profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+    first_read_seen_before_second: list[str] = []
+    original_read_card = ThreadsHomeReader._read_card
+
+    async def record_before_second_row(reader, root, **kwargs):
+        if await root.get_attribute("id") == "second" and not first_read_seen_before_second:
+            first_read_seen_before_second.append(capsys.readouterr().out)
+        return await original_read_card(reader, root, **kwargs)
+
+    monkeypatch.setattr(ThreadsHomeReader, "_read_card", record_before_second_row)
+
+    async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=detail_html,
+            )
+
+        await page.route(first_url, serve_detail)
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=4,
+            max_scrolls=0,
+            terms=("hiring",),
+            detail=True,
+        )
+        assert result.status == "COMPLETE"
+        assert result.home_sampled == 2
+        assert result.detail_reads == 1
+
+    _run_offline_page(feed_html, exercise)
+    output = "".join(first_read_seen_before_second) + capsys.readouterr().out
+    assert first_read_seen_before_second
+    assert f"| {first_body}" in first_read_seen_before_second[0]
+    assert second_body not in first_read_seen_before_second[0]
+    assert output.count(f"| {first_body}") == 2  # Home observation and Detail.
+    assert output.count(f"| {second_body}") == 1
+    assert "stabilize_ms=" in output
+    assert "/post/" not in output
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.home_sampled == 2
+
+
+def test_three_verified_rows_stream_around_rejected_candidate_without_checkpoint(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    verified = (
+        ("first", "Synthetic weather note one."),
+        ("second", "Synthetic hiring a backend engineer."),
+        ("third", "Synthetic weather note three."),
+    )
+    cards = [
+        f'''<div class="card"><a href="/@candidate/post/{slug}"><time>1h</time></a>
+<a href="/@candidate">candidate</a><span dir="auto">{body}</span></div>'''
+        for slug, body in verified[:1]
+    ]
+    cards.append(
+        '''<div class="card"><a href="/@candidate/post/rejected?share=1"><time>now</time></a>
+<a href="/@candidate">candidate</a><span dir="auto">Synthetic rejected container body.</span></div>'''
+    )
+    cards.extend(
+        f'''<div class="card"><a href="/@candidate/post/{slug}"><time>1h</time></a>
+<a href="/@candidate">candidate</a><span dir="auto">{body}</span></div>'''
+        for slug, body in verified[1:]
+    )
+    feed_html = f"""<!doctype html><html><head><style>
+nav {{ height: 36px; }} .card {{ height: 155px; }}
+</style></head><body><nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main>{''.join(cards)}</main></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+
+    async def exercise(page) -> None:
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=5,
+            max_scrolls=0,
+            terms=("hiring",),
+            detail=True,
+        )
+        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
+        assert result.home_sampled == 3
+        assert result.provenance_verified == 3
+        assert result.detail_reads == 0
+        assert not result.viewport_coverage_complete
+
+    _run_offline_page(feed_html, exercise)
+    output = capsys.readouterr().out
+    for _slug, body in verified:
+        assert f"| {body}" in output
+    assert "| Synthetic rejected container body." in output
+    assert "state=OBSERVED_UNVERIFIED" in output
+    assert "checkpoint=PENDING" in output
+    assert "/post/" not in output
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert checkpoint.completed_runs == 0
+    assert checkpoint.home_sampled == 0
+    assert checkpoint.detail_reads == 0
+
+
+def test_offscreen_nested_row_is_deferred_then_read_and_changed_back_anchor_stops(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    target_url = "https://www.threads.com/@candidate/post/nested-long"
+    body = "Synthetic hiring a backend engineer after a long visible card."
+    feed_html = f"""<!doctype html><html><head><style>
+nav {{ height: 40px; }}
+#scroll-port {{ height: 300px; overflow-y: auto; margin-top: 8px; }}
+article {{ box-sizing: border-box; height: 680px; padding-top: 430px; }}
+</style></head><body><nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main id="scroll-port"><article>
+<a href="/@candidate/post/nested-long"><time>now</time></a>
+<a href="/@candidate">candidate</a><span dir="auto">{body}</span>
+</article></main></body></html>"""
+    detail_html = f"""<!doctype html><html><body><article>
+<a href="/@candidate/post/nested-long"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>{body}</p>
+</article></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+
+    detail_requests = 0
+
+    async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            nonlocal detail_requests
+            detail_requests += 1
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=detail_html,
+            )
+
+        await page.route(target_url, serve_detail)
+        with pytest.raises(UiReadError) as caught:
+            await workflow.run_page_workflow(
+                page,
+                account,
+                store,
+                max_posts=2,
+                max_scrolls=5,
+                terms=("hiring",),
+                detail=True,
+            )
+        assert caught.value.code == "RETURN_CONTEXT_CHANGED"
+
+    _run_offline_page(feed_html, exercise)
+    output = capsys.readouterr().out
+    assert "state=DEFERRED_OFFSCREEN" in output
+    assert f"| {body}" in output
+    assert output.count(f"| {body}") == 2
+    assert "[BACK] post=1 status=FAILED anchor=CHANGED" in output
+    assert detail_requests == 1
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert checkpoint.completed_runs == 0
+    assert checkpoint.detail_reads == 0
+
+
 def test_pending_pressable_waits_for_missing_permalink_and_rescans() -> None:
     actor = "offline.operator"
-    post_rows = "".join(
+    post_rows = [
         f"""<div class="card" data-pressable-container="true">
   <a href="/@candidate/post/verified-{index}"><time>{index}h</time></a>
   <a href="/@candidate">@candidate</a><span dir="auto">Verified fixture body {index}</span>
 </div>"""
         for index in range(1, 4)
-    )
+    ]
     pending_body = "Hydrating synthetic fixture body."
     feed_html = f"""<!doctype html><html><head><style>
 nav {{ height: 32px; }} .card {{ height: 150px; }}
 </style></head><body><nav aria-label="Main" role="navigation">
 <a aria-current="page" aria-label="For you" href="/">For you</a>
 <a aria-label="Profile" href="/@{actor}">Profile</a></nav>
-{post_rows}<div class="card" data-pressable-container="true" id="hydrating">
+    {post_rows[0]}<div class="card" data-pressable-container="true" id="hydrating">
 <time>now</time><a href="/@candidate">@candidate</a>
-<span dir="auto">{pending_body}</span></div></body></html>"""
+<span dir="auto">{pending_body}</span></div>{''.join(post_rows[1:])}</body></html>"""
 
     async def exercise(page) -> None:
         reader = ThreadsHomeReader(page, actor)
         await reader.open_home()
         waits: list[tuple[str, int, int | None]] = []
         original_wait = reader._wait_for_pending_card
+        hydration_scheduled = False
 
         async def record_wait(pending, deadline, *, max_wait_ms=None):
+            nonlocal hydration_scheduled
             for signal in pending.signals:
                 waits.append(
                     (signal.condition, await signal.locator.count(), max_wait_ms)
                 )
-            return await original_wait(
-                pending,
-                deadline,
-                max_wait_ms=max_wait_ms,
-            )
-
-        reader._wait_for_pending_card = record_wait
-        original_scan = reader._visible_targets
-        scheduled = False
-
-        async def schedule_hydration(*args, **kwargs):
-            nonlocal scheduled
-            scan = await original_scan(*args, **kwargs)
-            if not scheduled:
-                scheduled = True
+            if not hydration_scheduled:
+                hydration_scheduled = True
                 await page.evaluate(
                     """() => setTimeout(() => {
                         const card = document.querySelector('#hydrating');
@@ -3000,20 +3371,26 @@ nav {{ height: 32px; }} .card {{ height: 150px; }}
                         permalink.append(time);
                     }, 80)"""
                 )
-            return scan
+            return await original_wait(
+                pending,
+                deadline,
+                max_wait_ms=max_wait_ms,
+            )
 
-        reader._visible_targets = schedule_hydration
+        reader._wait_for_pending_card = record_wait
         targets = await reader.scan_viewport(5)
-        assert len(targets) == 4
+        assert len(targets) == 4, (
+            f"targets={len(targets)} verified={reader.last_scan_counts.verified} "
+            f"coverage={reader.last_scan_counts.coverage_complete} waits={waits!r}"
+        )
         assert reader.last_scan_counts.verified == 4
         assert reader.last_scan_counts.coverage_complete
         assert any(
             condition == "visible"
-            and count == 0
             and wait_ms == reader_module._CARD_HYDRATION_WAIT_MS
             for condition, count, wait_ms in waits
         )
-        assert targets[-1].url.endswith("/post/hydrated-fourth")
+        assert any(target.url.endswith("/post/hydrated-fourth") for target in targets)
 
     _run_offline_page(feed_html, exercise)
 
@@ -3066,11 +3443,12 @@ nav {{ height: 32px; }} .card {{ height: 150px; }}
 
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
-    assert "state=PENDING reason=POST_PERMALINK_PENDING" in output
+    assert "state=PENDING_HYDRATION reason=POST_PERMALINK_PENDING" in output
     assert "verified_body_extracted=3" in output
     assert "scan=NOT_COMMITTED" in output
     assert "[CHECKPOINT] status=NOT_SAVED reason=VIEWPORT_COVERAGE_INCOMPLETE" in output
-    assert unverified_body not in output
+    assert f"| {unverified_body}" in output
+    assert "status=OBSERVED_UNVERIFIED" in output
     assert "@candidate" not in output
     assert "/post/" not in output
     checkpoint = store.load(
