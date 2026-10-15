@@ -80,6 +80,7 @@ from .feed.urls import (
     _post_url_rejection_reason,
     _post_url_structure,
     _profile_author,
+    _rejected_post_link_blocks_candidate,
     _same_home_origin,
 )
 
@@ -157,6 +158,18 @@ class _HomeRowObservation:
     candidate: bool = True
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _TrackedRowIdentity:
+    """Keep transient DOM identity, observation ID, and post fingerprint distinct."""
+
+    dom_handle: JSHandle = field(repr=False)
+    observation_id: str = field(repr=False)
+    fingerprint: str | None = field(default=None, repr=False)
+
+    def __repr__(self) -> str:
+        return "TrackedRowIdentity(<private>)"
+
+
 @dataclass(frozen=True, slots=True)
 class _FeedTargetsObservation:
     targets: tuple[PostTarget, ...]
@@ -168,6 +181,7 @@ class _FeedTargetsObservation:
     render_signature: tuple[object, ...] = field(default=(), repr=False)
     candidate_roots: tuple[Locator, ...] = field(default=(), repr=False)
     candidate_observation_ids: tuple[str, ...] = field(default=(), repr=False)
+    candidate_identities: tuple[_TrackedRowIdentity, ...] = field(default=(), repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +195,7 @@ class _VisibleTargets:
     candidate_roots: tuple[Locator, ...] = field(default=(), repr=False)
     pending_signals: tuple[_CardWaitSignal, ...] = field(default=(), repr=False)
     candidate_observation_ids: tuple[str, ...] = field(default=(), repr=False)
+    candidate_identities: tuple[_TrackedRowIdentity, ...] = field(default=(), repr=False)
 
 
 class ThreadsHomeReader:
@@ -231,10 +246,9 @@ class ThreadsHomeReader:
         self.last_scroll_geometry: dict[str, object] | None = None
         self._last_viewport_signature: tuple[object, ...] | None = None
         self._last_viewport_candidate_roots: tuple[Locator, ...] = ()
-        self._last_viewport_candidate_observation_ids: tuple[str, ...] = ()
-        self._carried_viewport_candidate_roots: tuple[Locator, ...] = ()
-        self._carried_viewport_candidate_observation_ids: tuple[str, ...] = ()
-        self._carried_viewport_candidate_handles: tuple[JSHandle, ...] = ()
+        self._last_viewport_candidate_identities: tuple[_TrackedRowIdentity, ...] = ()
+        self._carried_viewport_candidate_identities: tuple[_TrackedRowIdentity, ...] = ()
+        self._pending_viewport_candidate_identities: tuple[_TrackedRowIdentity, ...] = ()
         self._cached_home_bodies: dict[str, tuple[str, bool]] = {}
         self._detail_return_anchor: tuple[str, float] | None = None
         self._detail_return_target: PostTarget | None = None
@@ -925,8 +939,10 @@ class ThreadsHomeReader:
                 self.last_display_observations = rendered.display_observations
                 self.last_viewport_coverage_complete = rendered.coverage_complete
                 self.last_viewport_observed_rows = rendered.observed_rows
-                self._last_viewport_candidate_roots = rendered.candidate_roots
-                self._last_viewport_candidate_observation_ids = rendered.candidate_observation_ids
+                await self._remember_viewport_candidates(
+                    rendered.candidate_roots,
+                    rendered.candidate_identities,
+                )
                 return observed_delta
 
             try:
@@ -1367,6 +1383,7 @@ class ThreadsHomeReader:
             scan.signature,
             scan.candidate_roots,
             scan.candidate_observation_ids,
+            scan.candidate_identities,
         )
         return _RenderObservation(
             scan.signature,
@@ -1485,24 +1502,21 @@ class ThreadsHomeReader:
                     raise UiReadError(timeout_code)
             return scan
 
-        try:
-            scan = await self._recoverable_stage(
-                stage_name,
-                timeout_code,
-                attempt,
-                recoverable_codes=(timeout_code,),
-            )
-        except UiReadError as error:
-            if error.code in {timeout_code, "FEED_VISIBLE_UNSUPPORTED"}:
-                print(f"STOP stage={stage_name} code={error.code}")
-            raise
+        scan = await self._recoverable_stage(
+            stage_name,
+            timeout_code,
+            attempt,
+            recoverable_codes=(timeout_code,),
+        )
         self.last_display_observations = scan.display_observations
         self.last_viewport_coverage_complete = scan.coverage_complete
         self.last_viewport_observed_rows = scan.observed_rows
         self.last_scan_counts.coverage_complete = scan.coverage_complete
         self._last_viewport_signature = scan.signature
-        self._last_viewport_candidate_roots = scan.candidate_roots
-        self._last_viewport_candidate_observation_ids = scan.candidate_observation_ids
+        await self._remember_viewport_candidates(
+            scan.candidate_roots,
+            scan.candidate_identities,
+        )
         self.last_viewport_deferred_only = (
             not scan.coverage_complete
             and any(
@@ -1740,14 +1754,10 @@ class ThreadsHomeReader:
         if region_handle is None:
             self.last_scan_counts.scroll_surface_status = "UNVERIFIED"
             raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
-        row_handles: list[JSHandle] = []
+        row_handles = [
+            identity.dom_handle for identity in self._last_viewport_candidate_identities
+        ]
         try:
-            for root in self._last_viewport_candidate_roots:
-                handle = await root.element_handle()
-                if handle is None:
-                    self.last_scan_counts.scroll_surface_status = "UNVERIFIED"
-                    raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
-                row_handles.append(handle)
             surface_state = await self._page.evaluate_handle(
                 _with_scrollport_geometry("""([region, rows, maxCandidates]) => {
                 /*SCROLLPORT_GEOMETRY*/
@@ -1821,8 +1831,6 @@ class ThreadsHomeReader:
             )
         finally:
             await region_handle.dispose()
-            for handle in row_handles:
-                await handle.dispose()
         state_handle = await surface_state.get_property("state")
         state = await state_handle.json_value()
         await state_handle.dispose()
@@ -1843,19 +1851,51 @@ class ThreadsHomeReader:
         self.last_scan_counts.scroll_surface_status = "VALIDATED"
         return surface
 
-    async def _is_carried_viewport_candidate(self, root: Locator) -> str | None:
-        handles = self._carried_viewport_candidate_handles
-        if not handles:
+    async def _is_carried_viewport_candidate(
+        self, root: Locator
+    ) -> _TrackedRowIdentity | None:
+        identities = self._carried_viewport_candidate_identities
+        if not identities:
             return None
         matched_index = await root.evaluate(
             "(node, previous) => previous.findIndex(item => node === item)",
-            list(handles),
+            [identity.dom_handle for identity in identities],
         )
         if matched_index < 0:
             return None
-        if matched_index >= len(self._carried_viewport_candidate_observation_ids):
+        if matched_index >= len(identities):
             return None
-        return self._carried_viewport_candidate_observation_ids[matched_index]
+        return identities[matched_index]
+
+    async def _same_dom_element(self, root: Locator, handle: JSHandle) -> bool:
+        try:
+            return bool(await root.evaluate("(node, expected) => node === expected", handle))
+        except PlaywrightError:
+            return False
+
+    async def _discard_pending_viewport_candidates(self) -> None:
+        retained = {id(identity.dom_handle) for identity in self._last_viewport_candidate_identities}
+        for identity in self._pending_viewport_candidate_identities:
+            if id(identity.dom_handle) not in retained:
+                await identity.dom_handle.dispose()
+        self._pending_viewport_candidate_identities = ()
+
+    async def _remember_viewport_candidates(
+        self,
+        roots: tuple[Locator, ...],
+        identities: tuple[_TrackedRowIdentity, ...],
+    ) -> None:
+        retained = {id(identity.dom_handle) for identity in identities}
+        previous = (
+            *self._last_viewport_candidate_identities,
+            *self._pending_viewport_candidate_identities,
+        )
+        self._last_viewport_candidate_roots = roots
+        self._last_viewport_candidate_identities = identities
+        self._pending_viewport_candidate_identities = ()
+        for identity in previous:
+            if id(identity.dom_handle) not in retained:
+                await identity.dom_handle.dispose()
 
     async def _visible_targets(
         self,
@@ -1866,6 +1906,7 @@ class ThreadsHomeReader:
         stage: str = "FEED",
         on_row: Callable[[_HomeRowObservation], Awaitable[None]] | None = None,
     ) -> _VisibleTargets:
+        await self._discard_pending_viewport_candidates()
         viewport = self._page.viewport_size
         if viewport is None:
             raise UiReadError("FEED_VIEWPORT_UNVERIFIED")
@@ -1949,6 +1990,9 @@ class ThreadsHomeReader:
         candidate_rows: list[
             tuple[int, Locator, _CandidateStructure, bool, _CandidateDiagnostic, str]
         ] = []
+        candidate_dom_handles: dict[int, JSHandle] = {}
+        candidate_prior_fingerprints: dict[int, str | None] = {}
+        matched_previous_identity_handles: set[int] = set()
         diagnostics: list[_CandidateDiagnostic] = []
         for index, root in enumerate(roots):
             structure = structures[index]
@@ -1989,12 +2033,28 @@ class ThreadsHomeReader:
                 )
                 and root_kind in {"ARTICLE", "ROLE_ARTICLE", "PRESSABLE"}
             )
-            carried_observation_id = await self._is_carried_viewport_candidate(root)
-            carried_row = carried_observation_id is not None
+            unresolved_post_root = bool(
+                (structure.visible_post_links and not structure.canonical_post_links)
+                or (structure.canonical_post_links and not structure.profile_anchor_candidates)
+            )
+            carried_identity = await self._is_carried_viewport_candidate(root)
+            carried_row = carried_identity is not None
+            if carried_identity is not None:
+                matched_previous_identity_handles.add(id(carried_identity.dom_handle))
             if has_row_cues or semantic_row or carried_row:
+                root_handle = await root.element_handle()
+                if root_handle is not None:
+                    candidate_dom_handles[index] = root_handle
+                candidate_prior_fingerprints[index] = (
+                    None if carried_identity is None else carried_identity.fingerprint
+                )
                 diagnostic.state = "PENDING"
                 diagnostic.reason = "POST_ROW_REQUIRES_VERIFICATION"
-                diagnostic.observation_id = carried_observation_id or secrets.token_hex(8)
+                diagnostic.observation_id = (
+                    secrets.token_hex(8)
+                    if carried_identity is None
+                    else carried_identity.observation_id
+                )
                 candidate_rows.append(
                     (
                         index,
@@ -2005,14 +2065,19 @@ class ThreadsHomeReader:
                         diagnostic.observation_id,
                     )
                 )
-        for handle in self._carried_viewport_candidate_handles:
-            await handle.dispose()
-        self._carried_viewport_candidate_handles = ()
+            elif unresolved_post_root:
+                diagnostic.state = "DEFERRED_IDENTITY"
+                diagnostic.reason = "POST_ROOT_UNRESOLVED"
+                diagnostic.observation_id = secrets.token_hex(8)
         self.last_candidate_diagnostics = tuple(diagnostics)
-        counts.observed_rows = len(candidate_rows)
+        unresolved_root_count = sum(
+            diagnostic.reason == "POST_ROOT_UNRESOLVED" for diagnostic in diagnostics
+        )
+        counts.observed_rows = len(candidate_rows) + unresolved_root_count
         counts.coverage_complete = (
             not roots_truncated
-            and len(candidate_rows) <= max_posts
+            and counts.observed_rows <= max_posts
+            and unresolved_root_count == 0
             and not any(structure.visible_times > 1 for _, _, structure, _, _, _ in candidate_rows)
         )
         targets: list[PostTarget] = []
@@ -2038,6 +2103,47 @@ class ThreadsHomeReader:
                 continue
             processed_candidates += 1
             root, structure, carried_row, diagnostic, _ = candidate
+            root_handle = candidate_dom_handles.get(row_index)
+            if root_handle is None:
+                counts.skipped_rows += 1
+                counts.uncertain_rows += 1
+                counts.coverage_complete = False
+                diagnostic.state = "REJECTED"
+                diagnostic.reason = "POST_ROOT_IDENTITY_UNAVAILABLE"
+                await emit_row(diagnostic)
+                continue
+            if not await self._same_dom_element(root, root_handle):
+                replacement_handle = await root.element_handle()
+                await root_handle.dispose()
+                if replacement_handle is None:
+                    candidate_dom_handles.pop(row_index, None)
+                    counts.skipped_rows += 1
+                    counts.uncertain_rows += 1
+                    counts.coverage_complete = False
+                    diagnostic.state = "REJECTED"
+                    diagnostic.reason = "POST_ROOT_IDENTITY_CHANGED"
+                    await emit_row(diagnostic)
+                    continue
+                root_handle = replacement_handle
+                candidate_dom_handles[row_index] = replacement_handle
+                candidate_prior_fingerprints[row_index] = None
+                carried_row = False
+                diagnostic.observation_id = secrets.token_hex(8)
+                diagnostic.identity_fingerprint = None
+                structure = await self._inspect_candidate_root(root, viewport)
+                diagnostic.root_kind = structure.root_kind
+                diagnostic.has_visible_time = structure.visible_times > 0
+                diagnostic.has_post_permalink = structure.visible_post_links > 0
+                diagnostic.has_profile_author = structure.profile_anchor_candidates > 0
+                diagnostic.has_readable_body = structure.readable_body_candidates > 0
+                if not await self._same_dom_element(root, root_handle):
+                    counts.skipped_rows += 1
+                    counts.uncertain_rows += 1
+                    counts.coverage_complete = False
+                    diagnostic.state = "REJECTED"
+                    diagnostic.reason = "POST_ROOT_IDENTITY_CHANGED"
+                    await emit_row(diagnostic)
+                    continue
             box = await root.bounding_box()
             if box is None:
                 counts.skipped_rows += 1
@@ -2091,6 +2197,7 @@ class ThreadsHomeReader:
                         root,
                         viewport_y=box["y"],
                         cached_body_fingerprints=prefer_new_fingerprints,
+                        expected_root_handle=root_handle,
                     )
                     self.last_scan_timings.stabilize_ms += round(
                         (time.perf_counter() - stabilize_started) * 1000
@@ -2099,6 +2206,13 @@ class ThreadsHomeReader:
                         diagnostic.state = "OBSERVED_UNVERIFIED"
                         diagnostic.reason = "ROW_CONTENT_CHANGED_DURING_READ"
                         diagnostic.identity_fingerprint = target.fingerprint
+                        if candidate_prior_fingerprints.get(row_index) not in {
+                            None,
+                            target.fingerprint,
+                        }:
+                            diagnostic.observation_id = secrets.token_hex(8)
+                            carried_row = False
+                        candidate_prior_fingerprints[row_index] = target.fingerprint
                         diagnostic.read_evidence = target.read_evidence
                         diagnostic.has_readable_body = bool(target.body and target.body.strip())
                         counts.uncertain_rows += 1
@@ -2148,6 +2262,19 @@ class ThreadsHomeReader:
                 await emit_row(diagnostic, fingerprint=deferred.fingerprint)
                 continue
             except _CardNotReady as pending:
+                if pending.reason_code == "POST_ROOT_DOM_IDENTITY_CHANGED":
+                    replacement_handle = await root.element_handle()
+                    previous_handle = candidate_dom_handles.get(row_index)
+                    if previous_handle is not None:
+                        await previous_handle.dispose()
+                    if replacement_handle is None:
+                        candidate_dom_handles.pop(row_index, None)
+                    else:
+                        candidate_dom_handles[row_index] = replacement_handle
+                    candidate_prior_fingerprints[row_index] = None
+                    diagnostic.observation_id = secrets.token_hex(8)
+                    diagnostic.identity_fingerprint = None
+                    carried_row = False
                 self.last_scan_timings.read_row_ms += round(
                     (time.perf_counter() - read_started) * 1000
                 )
@@ -2281,6 +2408,7 @@ class ThreadsHomeReader:
                                     root,
                                     viewport_y=box["y"],
                                     cached_body_fingerprints=(prefer_new_fingerprints),
+                                    expected_root_handle=candidate_dom_handles.get(row_index),
                                 )
                                 if not body_stable:
                                     self.last_scan_timings.wait_reason = "CARD_BODY_NOT_STABLE"
@@ -2313,6 +2441,13 @@ class ThreadsHomeReader:
                             if display_observations:
                                 display_observations.pop()
                             diagnostic.identity_fingerprint = target.fingerprint
+                            if candidate_prior_fingerprints.get(row_index) not in {
+                                None,
+                                target.fingerprint,
+                            }:
+                                diagnostic.observation_id = secrets.token_hex(8)
+                                carried_row = False
+                            candidate_prior_fingerprints[row_index] = target.fingerprint
                             diagnostic.read_evidence = target.read_evidence
                             diagnostic.has_readable_body = bool(target.body and target.body.strip())
                             if target.body_complete:
@@ -2426,6 +2561,10 @@ class ThreadsHomeReader:
                 continue
             self.last_scan_timings.read_row_ms += round((time.perf_counter() - read_started) * 1000)
             diagnostic.identity_fingerprint = target.fingerprint
+            if candidate_prior_fingerprints.get(row_index) not in {None, target.fingerprint}:
+                diagnostic.observation_id = secrets.token_hex(8)
+                carried_row = False
+            candidate_prior_fingerprints[row_index] = target.fingerprint
             diagnostic.read_evidence = target.read_evidence
             diagnostic.state = "VERIFIED" if target.body_complete else "PARTIAL_BODY"
             diagnostic.reason = (
@@ -2515,11 +2654,49 @@ class ThreadsHomeReader:
                 counts.visible_post_links,
             )
             counts.coverage_complete = not roots_truncated and counts.observed_rows <= max_posts
+        scanned_fingerprints.update(target.fingerprint for target in targets)
+        for identity in self._carried_viewport_candidate_identities:
+            if (
+                id(identity.dom_handle) in matched_previous_identity_handles
+                or identity.fingerprint in scanned_fingerprints
+            ):
+                continue
+            try:
+                still_connected = bool(
+                    await region.evaluate(
+                        "(region, node) => node.isConnected && region.contains(node)",
+                        identity.dom_handle,
+                    )
+                )
+            except PlaywrightError:
+                still_connected = False
+            if not still_connected:
+                continue
+            diagnostic = _CandidateDiagnostic(
+                row_index=len(diagnostics) + 1,
+                root_kind="CARRIED",
+                has_visible_time=False,
+                has_post_permalink=False,
+                has_profile_author=False,
+                has_readable_body=False,
+                state="DEFERRED_IDENTITY",
+                reason="POST_ROW_CUES_MISSING",
+                identity_fingerprint=identity.fingerprint,
+                observation_id=identity.observation_id,
+            )
+            diagnostics.append(diagnostic)
+            counts.observed_rows += 1
+            counts.skipped_rows += 1
+            counts.uncertain_rows += 1
+            counts.coverage_complete = False
+            await emit_row(diagnostic, fingerprint=identity.fingerprint)
+        self.last_candidate_diagnostics = tuple(diagnostics)
         if (
             counts.body_unknown
             or counts.uncertain_rows
             or counts.deferred_offscreen
             or counts.partial_body_rows
+            or counts.structural_reasons.get("POST_ROOT_UNRESOLVED", 0) > 0
             or any(
                 diagnostic.state != "VERIFIED"
                 for diagnostic in diagnostics
@@ -2550,6 +2727,24 @@ class ThreadsHomeReader:
             counts.coverage_complete,
             counts.uncertain_rows,
         )
+        candidate_roots: list[Locator] = []
+        candidate_observation_ids: list[str] = []
+        candidate_identities: list[_TrackedRowIdentity] = []
+        for index, root, _, _, diagnostic, observation_id in candidate_rows[:max_posts]:
+            handle = candidate_dom_handles.get(index)
+            if handle is None:
+                continue
+            stable_id = diagnostic.observation_id or observation_id
+            candidate_roots.append(root)
+            candidate_observation_ids.append(stable_id)
+            candidate_identities.append(
+                _TrackedRowIdentity(handle, stable_id, diagnostic.identity_fingerprint)
+            )
+        retained_handles = {id(identity.dom_handle) for identity in candidate_identities}
+        for handle in candidate_dom_handles.values():
+            if id(handle) not in retained_handles:
+                await handle.dispose()
+        self._pending_viewport_candidate_identities = tuple(candidate_identities)
         return _VisibleTargets(
             tuple(targets),
             scroll_anchor,
@@ -2557,9 +2752,10 @@ class ThreadsHomeReader:
             counts.observed_rows,
             counts.coverage_complete,
             signature,
-            tuple(root for _, root, _, _, _, _ in candidate_rows[:max_posts]),
+            tuple(candidate_roots),
             tuple(pending_signals),
-            tuple(observation_id for _, _, _, _, _, observation_id in candidate_rows[:max_posts]),
+            tuple(candidate_observation_ids),
+            tuple(candidate_identities),
         )
 
     @staticmethod
@@ -2663,11 +2859,8 @@ class ThreadsHomeReader:
     ) -> tuple[list[Locator], bool]:
         candidates: list[tuple[float, Locator]] = []
         candidate_keys: set[str] = set()
-        self._carried_viewport_candidate_roots = ()
-        self._carried_viewport_candidate_observation_ids = ()
-        self._carried_viewport_candidate_handles = ()
-        carried_roots: list[Locator] = []
-        carried_observation_ids: list[str] = []
+        self._carried_viewport_candidate_identities = ()
+        carried_identities: list[_TrackedRowIdentity] = []
         truncated = False
 
         async def add_candidate(
@@ -2757,21 +2950,21 @@ class ThreadsHomeReader:
         if region_handle is not None:
             try:
 
-                async def inspect_carried_root(
-                    root: Locator,
+                async def inspect_carried_identity(
+                    identity: _TrackedRowIdentity,
                 ) -> dict[str, object] | None:
-                    if not await self._is_in_visible_scrollports(root):
-                        return None
-                    return await root.evaluate(
-                        """(node, args) => {
+                    return await identity.dom_handle.evaluate(
+                        _with_scrollport_geometry("""(node, args) => {
+                            /*SCROLLPORT_GEOMETRY*/
                             const style = getComputedStyle(node);
                             const rect = node.getBoundingClientRect();
-                            if (style.display === "none" ||
+                            if (!node.isConnected || !args.region.contains(node) ||
+                                style.display === "none" ||
                                 style.visibility === "hidden" ||
                                 rect.width <= 0 || rect.height <= 0 ||
                                 node.closest(args.outside) ||
                                 node.closest(args.quote) ||
-                                !args.region.contains(node)) return null;
+                                !geometryFor(node).intersects) return null;
                             const path = [];
                             for (let current = node; current;
                                  current = current.parentElement) {
@@ -2784,7 +2977,7 @@ class ThreadsHomeReader:
                                 y: rect.top,
                                 key: path.reverse().join("/"),
                             };
-                        }""",
+                        }"""),
                         {
                             "viewport": viewport,
                             "region": region_handle,
@@ -2799,20 +2992,24 @@ class ThreadsHomeReader:
                         },
                     )
 
-                carried_boxes = await asyncio.gather(
-                    *(inspect_carried_root(root) for root in self._last_viewport_candidate_roots)
+                previous_identities = self._last_viewport_candidate_identities
+                identity_boxes = await asyncio.gather(
+                    *(inspect_carried_identity(identity) for identity in previous_identities)
                 )
-                for index, (root, box) in enumerate(
-                    zip(self._last_viewport_candidate_roots, carried_boxes, strict=True)
-                ):
+                carried_identities.extend(
+                    identity
+                    for identity, box in zip(previous_identities, identity_boxes, strict=True)
+                    if box is not None
+                )
+                for index, root in enumerate(self._last_viewport_candidate_roots):
+                    if index >= len(previous_identities):
+                        continue
+                    identity = previous_identities[index]
+                    if not await self._same_dom_element(root, identity.dom_handle):
+                        continue
+                    box = identity_boxes[index]
                     if box is None:
                         continue
-                    carried_roots.append(root)
-                    carried_observation_ids.append(
-                        self._last_viewport_candidate_observation_ids[index]
-                        if index < len(self._last_viewport_candidate_observation_ids)
-                        else secrets.token_hex(8)
-                    )
                     await add_candidate(
                         root,
                         {"y": float(box["y"])},
@@ -2820,22 +3017,7 @@ class ThreadsHomeReader:
                     )
             finally:
                 await region_handle.dispose()
-        self._carried_viewport_candidate_roots = tuple(carried_roots)
-        self._carried_viewport_candidate_observation_ids = tuple(carried_observation_ids)
-        carried_handles = await asyncio.gather(*(root.element_handle() for root in carried_roots))
-        retained_carried = [
-            (handle, observation_id)
-            for handle, observation_id in zip(
-                carried_handles,
-                carried_observation_ids,
-                strict=True,
-            )
-            if handle is not None
-        ]
-        self._carried_viewport_candidate_handles = tuple(handle for handle, _ in retained_carried)
-        self._carried_viewport_candidate_observation_ids = tuple(
-            observation_id for _, observation_id in retained_carried
-        )
+        self._carried_viewport_candidate_identities = tuple(carried_identities)
 
         # Some pages expose independent post rows only as ordinary containers.
         # Infer a root from the nearest visible ancestor that owns exactly one
@@ -3230,6 +3412,7 @@ class ThreadsHomeReader:
                 )
             post_authors: dict[str, str] = {}
             authors: set[str] = set()
+            rejected_post_links: list[tuple[str, bool, str]] = []
             for index in range(link_count):
                 link = links.nth(index)
                 if (
@@ -3246,11 +3429,12 @@ class ThreadsHomeReader:
                     post_authors[parsed_post[0]] = parsed_post[1]
                     continue
                 if _post_url_hint(href):
-                    raise _UnverifiedFeedCandidate(
-                        "POST_PROVENANCE_UNVERIFIED",
-                        "CANDIDATE_NONCANONICAL",
-                        (expected_url, href),
-                        diagnostic_reason=_post_url_rejection_reason(href),
+                    rejected_post_links.append(
+                        (
+                            href,
+                            await link.locator("time").count() > 0,
+                            _post_url_rejection_reason(href),
+                        )
                     )
                 author = _profile_author(href)
                 if author is not None:
@@ -3264,6 +3448,24 @@ class ThreadsHomeReader:
                 )
             if expected_url not in post_authors:
                 continue
+            blocking_invalid = next(
+                (
+                    item
+                    for item in rejected_post_links
+                    if _rejected_post_link_blocks_candidate(
+                        timestamp_link=item[1], reason=item[2]
+                    )
+                ),
+                None,
+            )
+            if blocking_invalid is not None:
+                href, _, reason = blocking_invalid
+                raise _UnverifiedFeedCandidate(
+                    "POST_PROVENANCE_UNVERIFIED",
+                    "CANDIDATE_NONCANONICAL",
+                    (expected_url, href),
+                    diagnostic_reason=reason,
+                )
             if post_authors[expected_url] != expected_author:
                 raise _UnverifiedFeedCandidate(
                     "POST_AUTHOR_UNVERIFIED",
@@ -3537,11 +3739,10 @@ class ThreadsHomeReader:
         return tuple(targets), scroll_anchor
 
     async def read_detail(self, target: PostTarget) -> PostTarget:
-        try:
-            return await self._read_detail(target)
-        except UiReadError as error:
-            print(f"STOP stage=DETAIL code={error.code}")
-            raise
+        return await self._read_detail(target)
+
+    async def actionable_now(self, target: PostTarget) -> PostTarget:
+        return await self._detail_navigator.actionable_now(target)
 
     async def _revalidate_action_target(self, target: PostTarget) -> PostTarget:
         region = await self._content_region()
@@ -3575,7 +3776,6 @@ class ThreadsHomeReader:
                 not body_stable
                 or not current.currently_visible
                 or current.fingerprint != target.fingerprint
-                or normalize_text(current.body or "") != normalize_text(target.body or "")
             ):
                 raise UiReadError("DETAIL_PROVENANCE_UNVERIFIED")
             matches.append(current)
@@ -3776,12 +3976,18 @@ class ThreadsHomeReader:
         require_body: bool = False,
         cached_body_fingerprints: set[str] | None = None,
         visible_text_progress: bool = False,
+        expected_root_handle: JSHandle | None = None,
     ) -> PostTarget:
         if not await root.is_visible():
             raise _CardNotReady(root)
         root_handle = await root.element_handle()
         if root_handle is None:
             raise _CardNotReady(root)
+        if expected_root_handle is not None and not await self._same_dom_element(
+            root, expected_root_handle
+        ):
+            await root_handle.dispose()
+            raise _CardNotReady(root, reason_code="POST_ROOT_DOM_IDENTITY_CHANGED")
         post_links: list[tuple[str, str, Locator, bool]] = []
         rejected_post_links: list[tuple[str, bool, str]] = []
         authors: set[str] = set()
@@ -3815,11 +4021,14 @@ class ThreadsHomeReader:
             if author is not None:
                 authors.add(author)
         blocking_invalid = next(
-            (item for item in rejected_post_links if item[1]),
-            next(
-                (item for item in rejected_post_links if item[2] == "POST_ORIGIN_INVALID"),
-                None,
+            (
+                item
+                for item in rejected_post_links
+                if _rejected_post_link_blocks_candidate(
+                    timestamp_link=item[1], reason=item[2]
+                )
             ),
+            None,
         )
         if blocking_invalid is not None:
             href, _, reason = blocking_invalid
@@ -3960,6 +4169,11 @@ class ThreadsHomeReader:
             body_segments = ()
         if body and body.rstrip().endswith(("…", "...")):
             body_truncated = True
+        if expected_root_handle is not None and not await self._same_dom_element(
+            root, expected_root_handle
+        ):
+            await root_handle.dispose()
+            raise _CardNotReady(root, reason_code="POST_ROOT_DOM_IDENTITY_CHANGED")
         return PostTarget(
             url,
             author,
@@ -3994,14 +4208,20 @@ class ThreadsHomeReader:
         *,
         viewport_y: float,
         cached_body_fingerprints: set[str] | None,
+        expected_root_handle: JSHandle | None = None,
     ) -> tuple[PostTarget, bool]:
         """Require the same row identity and body across a bounded dwell."""
+        if expected_root_handle is None:
+            expected_root_handle = await root.element_handle()
+        if expected_root_handle is None:
+            raise _CardNotReady(root)
         target = await self._read_card(
             root,
             currently_visible=True,
             viewport_y=viewport_y,
             cached_body_fingerprints=cached_body_fingerprints,
             visible_text_progress=True,
+            expected_root_handle=expected_root_handle,
         )
         # Measure stability between completed samples. DOM extraction can take
         # longer than the existing hydration wait on a busy feed; that work
@@ -4013,6 +4233,7 @@ class ThreadsHomeReader:
             viewport_y=viewport_y,
             cached_body_fingerprints=cached_body_fingerprints,
             visible_text_progress=True,
+            expected_root_handle=expected_root_handle,
         )
         body_same = (
             _canonicalize_body(target.body or "") == _canonicalize_body(settled.body or "")

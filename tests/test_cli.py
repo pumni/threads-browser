@@ -284,8 +284,8 @@ def test_detail_cli_supports_short_and_legacy_run_without_duplicate_opt_in_text(
     failed = capsys.readouterr()
 
     assert result == 1
-    assert "[CHECKPOINT] status=NOT_SAVED" in failed.err
-    assert "[STOP] code=RETURN_CONTEXT_CHANGED" in failed.err
+    assert failed.err.count("[CHECKPOINT] status=NOT_SAVED reason=RETURN_CONTEXT_CHANGED") == 1
+    assert failed.err.count("[STOP] code=RETURN_CONTEXT_CHANGED") == 1
     assert "STOP RETURN_CONTEXT_CHANGED" not in failed.err
 
 

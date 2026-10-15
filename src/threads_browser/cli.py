@@ -391,7 +391,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                 except UiReadError as error:
                     if args.detail:
-                        print("[CHECKPOINT] status=NOT_SAVED", file=sys.stderr)
+                        print(
+                            f"[CHECKPOINT] status=NOT_SAVED reason={error.code}",
+                            file=sys.stderr,
+                        )
                         print(f"[STOP] code={error.code}", file=sys.stderr)
                     else:
                         print(f"STOP {error.code}", file=sys.stderr)

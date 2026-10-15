@@ -1707,7 +1707,9 @@ window.addEventListener("wheel", event => {{
         assert detail_requests == 1
         assert readiness_prompts == []
         output = capsys.readouterr().out
-        assert "STOP stage=DETAIL code=POST_AUTHOR_UNVERIFIED" in output
+        assert "STOP stage=DETAIL" not in output
+        assert "[CHECKPOINT] status=NOT_SAVED" not in output
+        assert "[STOP] code=POST_AUTHOR_UNVERIFIED" not in output
         assert "@other" not in output
 
 
@@ -1804,6 +1806,200 @@ def test_virtualized_replacement_with_new_identity_is_never_clicked() -> None:
         assert detail_requests == 0
 
     _run_offline_page(feed_html, exercise)
+
+
+def test_replaced_home_row_gets_a_new_observation_id() -> None:
+    actor = "offline.operator"
+    original_url = "https://www.threads.com/@candidate/post/identity-old"
+    replacement_url = "https://www.threads.com/@candidate/post/identity-new"
+    original_body = "Synthetic fixture original row body."
+    replacement_body = "Synthetic fixture replacement row body."
+    html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main><article id="row">
+<a href="/@candidate/post/identity-old"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>{original_body}</p>
+</article></main></body></html>"""
+
+    async def exercise(page) -> None:
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        original_targets = await reader.scan_viewport(1)
+        assert len(original_targets) == 1
+        original = original_targets[0]
+        old_diagnostic = next(
+            row
+            for row in reader.last_candidate_diagnostics
+            if row.identity_fingerprint == original.fingerprint
+        )
+        original_observation_id = old_diagnostic.observation_id
+
+        await page.locator("#row").evaluate(
+            """node => {
+                const inserted = document.createElement('article');
+                inserted.innerHTML = `
+                    <a href="/@candidate/post/identity-inserted"><time>new</time></a>
+                    <a href="/@candidate">candidate</a>
+                    <p>Synthetic fixture inserted row body.</p>`;
+                node.before(inserted);
+            }"""
+        )
+        middle_targets = await reader.scan_viewport(2)
+        assert len(middle_targets) == 2
+        middle_original = next(target for target in middle_targets if target.url == original_url)
+        middle_diagnostic = next(
+            row
+            for row in reader.last_candidate_diagnostics
+            if row.identity_fingerprint == middle_original.fingerprint
+        )
+        assert middle_diagnostic.observation_id == original_observation_id
+
+        await page.locator("#row").evaluate(
+            """node => {
+                const replacement = node.cloneNode(true);
+                replacement.querySelector("a[href*='/post/']").href =
+                    '/@candidate/post/identity-new';
+                replacement.querySelector('p').textContent =
+                    'Synthetic fixture replacement row body.';
+                node.replaceWith(replacement);
+            }"""
+        )
+        identity_before_replacement = next(
+            identity
+            for identity in reader._last_viewport_candidate_identities
+            if identity.fingerprint == middle_original.fingerprint
+        )
+        assert not await identity_before_replacement.dom_handle.evaluate(
+            "node => node.isConnected"
+        )
+
+        replacement_targets = await reader.scan_viewport(2)
+        replacement = next(target for target in replacement_targets if target.url == replacement_url)
+        assert replacement.url == replacement_url
+        assert replacement.body == replacement_body
+        new_diagnostic = next(
+            row
+            for row in reader.last_candidate_diagnostics
+            if row.identity_fingerprint == replacement.fingerprint
+        )
+        assert new_diagnostic.observation_id != original_observation_id
+        assert original.url == original_url
+
+    _run_offline_page(html, exercise)
+
+
+def test_workflow_skips_detail_when_no_home_candidate_is_actionable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actor = "offline.operator"
+    target_url = "https://www.threads.com/@candidate/post/not-actionable"
+    body = "Hiring a frontend engineer in Vietnam"
+    html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main><article>
+<a href="/@candidate/post/not-actionable"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>{body}</p>
+</article></main></body></html>"""
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(tmp_path / "data").add("offline", actor, profile)
+    store = CheckpointStore(tmp_path / "data")
+    detail_reads = 0
+    detail_requests = 0
+
+    class NonActionableReader(ThreadsHomeReader):
+        async def actionable_now(self, target):
+            raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED")
+
+        async def read_detail(self, target):
+            nonlocal detail_reads
+            detail_reads += 1
+            raise AssertionError("Detail must not be entered")
+
+    monkeypatch.setattr(workflow, "ThreadsHomeReader", NonActionableReader)
+
+    async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            nonlocal detail_requests
+            detail_requests += 1
+            await route.abort()
+
+        await page.route(target_url, serve_detail)
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=1,
+            max_scrolls=0,
+            terms=("hiring",),
+            detail=False,
+        )
+        assert result.status == "NO_ACTIONABLE_TARGET"
+        assert result.stop_reason == "NO_ACTIONABLE_TARGET"
+        assert result.detail_reads == 0
+        assert result.checkpoint_runs == 0
+
+    _run_offline_page(html, exercise)
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert checkpoint.completed_runs == 0
+    assert detail_reads == detail_requests == 0
+
+
+def test_unresolved_post_root_keeps_coverage_incomplete_and_blocks_checkpoint(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    clean_body = "Hiring a frontend engineer in Vietnam"
+    html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main>
+<article id="unresolved-root">
+  <a href="/@candidate/post/unresolved"><span>Permalink</span></a>
+</article>
+<article id="clean-root">
+  <a href="/@candidate/post/clean-unresolved-peer"><time>now</time></a>
+  <a href="/@candidate">candidate</a><p>{clean_body}</p>
+</article>
+</main></body></html>"""
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(tmp_path / "data").add("offline", actor, profile)
+    store = CheckpointStore(tmp_path / "data")
+
+    async def exercise(page) -> None:
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=2,
+            max_scrolls=0,
+            terms=("hiring",),
+        )
+        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
+        assert not result.viewport_coverage_complete
+        assert result.detail_reads == 0
+        assert result.checkpoint_runs == 0
+
+    _run_offline_page(html, exercise)
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert checkpoint.completed_runs == 0
+    assert checkpoint.detail_reads == 0
+    output = capsys.readouterr().out
+    assert "POST_ROOT_UNRESOLVED:1" in output
 
 
 def test_detail_does_not_auto_scroll_an_offscreen_target() -> None:
@@ -2501,15 +2697,15 @@ def test_timestamp_permalink_accepts_safe_trailing_slash_and_ignores_bad_seconda
 <nav aria-label="Main" role="navigation">
   <a aria-current="page" aria-label="For you" href="/">For you</a>
   <a aria-label="Profile" href="/@{actor}">Profile</a>
-</nav><main><article>
+</nav><main><div class="post-card">
   <a href="/@candidate/post/trailing-safe/"><time>1h</time></a>
   <a href="{invalid_secondary}">Secondary</a>
   <a href="/@candidate">@candidate</a><span>{body}</span>
-</article></main></body></html>"""
-    detail_html = f"""<!doctype html><html><body><article>
+</div></main></body></html>"""
+    detail_html = f"""<!doctype html><html><body><main><div class="post-card">
   <a href="/@candidate/post/trailing-safe/"><time>1h</time></a>
   <a href="/@candidate">@candidate</a><p>{body}</p>
-</article></body></html>"""
+</div></main></body></html>"""
     data_root = tmp_path / "data"
     profile = tmp_path / "profile"
     profile.mkdir()
@@ -2545,8 +2741,7 @@ def test_timestamp_permalink_accepts_safe_trailing_slash_and_ignores_bad_seconda
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
     assert detail_requests == 1
-    assert "[URL_STRUCTURE] timestamp_primary=1 secondary_post_links=1" in output
-    assert "valid_canonical_count=1 rejected_count=1" in output
+    assert "[ACTIONABILITY] status=CONFIRMED" in output
     assert invalid_secondary not in output
     checkpoint = store.load(
         account.account_id,
@@ -4170,10 +4365,17 @@ def test_carried_candidate_status_is_kept_per_row() -> None:
         reader = ThreadsHomeReader(page, actor)
         await reader.open_home()
 
-        async def carried_candidate(root) -> bool:
-            return await root.get_attribute("id") == "carried"
-
-        reader._is_carried_viewport_candidate = carried_candidate
+        carried_root = page.locator("#carried")
+        carried_handle = await carried_root.element_handle()
+        assert carried_handle is not None
+        carried_identity = reader_module._TrackedRowIdentity(
+            carried_handle,
+            "synthetic-carried-observation",
+        )
+        await reader._remember_viewport_candidates(
+            (carried_root,),
+            (carried_identity,),
+        )
         targets = await reader.scan_viewport(5)
         assert len(targets) == 1
         assert not reader.last_viewport_coverage_complete

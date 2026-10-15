@@ -88,6 +88,13 @@ def _post_url_rejection_reason(value: str) -> _CandidateDiagnosticReason:
     return "POST_PATH_SHAPE_INVALID"
 
 
+def _rejected_post_link_blocks_candidate(
+    *, timestamp_link: bool, reason: _CandidateDiagnosticReason
+) -> bool:
+    """Apply the same ambiguity rule to primary and secondary post-like links."""
+    return timestamp_link or reason == "POST_ORIGIN_INVALID"
+
+
 def _profile_author(value: str) -> str | None:
     try:
         parsed = urlsplit(urljoin(HOME_URL, value))

@@ -113,9 +113,15 @@ class DetailNavigator:
             raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED")
         return point
 
-    async def _read_detail(self, target: PostTarget) -> PostTarget:
+    async def actionable_now(self, target: PostTarget) -> PostTarget:
+        """Return a freshly verified Home target whose permalink can be clicked now."""
         if not target.currently_visible:
             raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED")
+        current = await self._host._revalidate_action_target(target)
+        await self._detail_click_point(current.permalink)
+        return current
+
+    async def _read_detail(self, target: PostTarget) -> PostTarget:
         deadline = self._host._readiness_deadline(self._timeout_ms)
         try:
 
@@ -127,7 +133,7 @@ class DetailNavigator:
                 deadline,
                 timeout_code="DETAIL_NAVIGATION_UNVERIFIED",
             )
-            current = await self._host._revalidate_action_target(target)
+            current = await self.actionable_now(target)
             click_point = await self._detail_click_point(current.permalink)
             self._host._remaining_readiness_ms(
                 deadline,

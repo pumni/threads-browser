@@ -109,7 +109,6 @@ async def run_page_workflow(
         state.stop(error.code)
         if detail:
             print(f"[HOME] status=FAILED code={error.code}")
-            _detail_stop(error.code)
         raise
     state.transition(WorkflowPhase.OBSERVING)
     if detail:
@@ -121,6 +120,7 @@ async def run_page_workflow(
     exhaustion_reason = "MAX_SCROLLS"
     pending_scroll_baseline: dict[str, object] | None = None
     unverified_observation_cap_exceeded = False
+    actionability_rejected_codes: set[str] = set()
 
     def reliability_metrics() -> dict[str, int]:
         return coverage.reliability_metrics(
@@ -151,7 +151,6 @@ async def run_page_workflow(
             state.stop(error.code)
             if detail:
                 print(f"[SCROLL] attempt={attempt} status=FAILED code={error.code}")
-                _detail_stop(error.code)
             raise
         if detail:
             gesture = reader.last_scroll_gesture
@@ -177,14 +176,38 @@ async def run_page_workflow(
             state.transition(WorkflowPhase.OBSERVING)
         return advanced
 
-    def select_verified_fallback(targets: list[PostTarget]) -> None:
+    async def first_actionable(targets: list[PostTarget]) -> PostTarget | None:
+        for target in targets:
+            try:
+                current = await reader.actionable_now(target)
+            except UiReadError as error:
+                if error.code not in {
+                    "DETAIL_NAVIGATION_UNVERIFIED",
+                    "DETAIL_PROVENANCE_UNVERIFIED",
+                    "POST_AUTHOR_UNVERIFIED",
+                    "POST_PROVENANCE_UNVERIFIED",
+                }:
+                    raise
+                actionability_rejected_codes.add(error.code)
+                if detail:
+                    print(f"[ACTIONABILITY] status=REJECTED code={error.code}")
+                continue
+            if detail:
+                print("[ACTIONABILITY] status=CONFIRMED")
+            return current
+        return None
+
+    async def select_verified_fallback(targets: list[PostTarget]) -> None:
         nonlocal selected
         if stats.found_relevant or stats.unverified_relevant or dedupe.pending_set or not targets:
             return
-        selected = min(
+        ordered = sorted(
             targets,
             key=lambda target: target.fingerprint in dedupe.previously_seen,
         )
+        selected = await first_actionable(ordered)
+        if selected is None:
+            return
         if selected.fingerprint not in dedupe.pending_set:
             dedupe.pending.append(selected.fingerprint)
             dedupe.pending_set.add(selected.fingerprint)
@@ -672,7 +695,7 @@ async def run_page_workflow(
                     **reliability_metrics(),
                 )
             if detail:
-                _detail_stop(error.code)
+                print(f"[VIEWPORT] status=FAILED code={error.code}")
             raise
         state.transition(WorkflowPhase.OBSERVING)
         scan_counts = reader.last_scan_counts
@@ -1027,8 +1050,8 @@ async def run_page_workflow(
                             still_visible.sort(
                                 key=lambda target: target.fingerprint in dedupe.previously_seen
                             )
-                            if still_visible:
-                                selected = still_visible[0]
+                            selected = await first_actionable(still_visible)
+                            if selected is not None:
                                 break
                         exhaustion_reason = "MAX_TOTAL_POSTS"
                         break
@@ -1037,14 +1060,14 @@ async def run_page_workflow(
                     exhaustion_reason = "FEED_END_REACHED"
                     # The current viewport was fully verified and remains in
                     # view; use its eligible post when there is no next page.
-            viewport_selected = viewport_relevant_targets[0]
+            viewport_selected = await first_actionable(viewport_relevant_targets)
         if viewport_selected is not None:
             selected = viewport_selected
             break
         if len(dedupe.seen_this_run) >= max_total_posts:
             exhaustion_reason = "MAX_TOTAL_POSTS"
             if max_scrolls == 0 or reader.scroll_attempts > 0:
-                select_verified_fallback(viewport_fallback_targets)
+                await select_verified_fallback(viewport_fallback_targets)
             break
         if reader.scroll_attempts >= max_scrolls:
             exhaustion_reason = (
@@ -1052,12 +1075,12 @@ async def run_page_workflow(
                 if coverage.has_unresolved_gaps
                 else "MAX_SCROLLS"
             )
-            select_verified_fallback(viewport_fallback_targets)
+            await select_verified_fallback(viewport_fallback_targets)
             break
         if not await advance_feed():
             exhaustion_reason = reader.last_scroll_stop_reason or "FEED_NOT_ADVANCED"
             if exhaustion_reason in {"FEED_END_REACHED", "FEED_NOT_SCROLLABLE"}:
-                select_verified_fallback(viewport_fallback_targets)
+                await select_verified_fallback(viewport_fallback_targets)
             break
 
     if exhaustion_reason == "SCROLL_BUDGET_EXHAUSTED_WITH_GAP":
@@ -1140,7 +1163,6 @@ async def run_page_workflow(
             state.stop(error.code)
             if detail:
                 print(f"[DETAIL] post={selected_number} status=FAILED")
-                _detail_stop(error.code)
             raise
         if detail:
             home_body = " ".join((selected.body or "").split())
@@ -1180,7 +1202,6 @@ async def run_page_workflow(
                     f"[BACK] post={selected_number} status=FAILED "
                     f"anchor={anchor_status} code={error.code}"
                 )
-                _detail_stop(error.code)
             raise
         if detail:
             print(f"[BACK] post={selected_number} status=RESTORED anchor=MATCHED")
@@ -1195,6 +1216,38 @@ async def run_page_workflow(
         return NurtureResult(
             status="UNVERIFIED_RELEVANCE_REQUIRES_VERIFICATION",
             stop_reason="UNVERIFIED_RELEVANCE_REQUIRES_VERIFICATION",
+            home_sampled=len(dedupe.seen_this_run),
+            home_new=len(dedupe.new_fingerprints),
+            home_relevant=stats.relevant,
+            home_irrelevant=stats.irrelevant,
+            home_unknown=stats.unknown,
+            duplicates=stats.duplicates,
+            detail_reads=0,
+            scroll_attempts=reader.scroll_attempts,
+            scrolls=reader.scrolls,
+            checkpoint_runs=checkpoint.completed_runs,
+            home_relevant_ratio=(
+                None if not dedupe.seen_this_run else stats.relevant / len(dedupe.seen_this_run)
+            ),
+            skipped_unverified=reader.skipped_unverified,
+            observed_rows=stats.observed_rows,
+            body_extracted=stats.body_extracted,
+            provenance_verified=stats.provenance_verified,
+            classified=stats.classified,
+            observation_unknown=stats.observation_unknown,
+            unverified_relevant=stats.unverified_relevant,
+            skipped_rows=stats.skipped_rows,
+            viewport_coverage_complete=stats.viewport_coverage_complete,
+            **reliability_metrics(),
+        )
+    elif selected is None and actionability_rejected_codes:
+        print("SEARCH_INCOMPLETE reason=NO_ACTIONABLE_TARGET")
+        if detail:
+            _detail_stop("NO_ACTIONABLE_TARGET")
+        state.stop("NO_ACTIONABLE_TARGET")
+        return NurtureResult(
+            status="NO_ACTIONABLE_TARGET",
+            stop_reason="NO_ACTIONABLE_TARGET",
             home_sampled=len(dedupe.seen_this_run),
             home_new=len(dedupe.new_fingerprints),
             home_relevant=stats.relevant,
