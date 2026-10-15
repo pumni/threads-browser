@@ -215,24 +215,32 @@ def test_offline_chromium_cli_reads_once_and_resumes_without_double_counting(
 
     first_code = main(command)
     first = capsys.readouterr()
+    first_summary = next(
+        (line for line in first.out.splitlines() if line.startswith("NURTURE ")), ""
+    )
     feed_version["value"] = 2
     second_code = main(command)
     second = capsys.readouterr()
+    second_summary = next(
+        (line for line in second.out.splitlines() if line.startswith("NURTURE ")), ""
+    )
 
     assert first_code == 0, first.out + first.err
-    assert "NURTURE status=COMPLETE source=HOME_FOR_YOU" in first.out
-    assert "ui=UNVERIFIED_LIVE_UI" in first.out
-    assert "home_sampled=2 home_new=2" in first.out
-    assert "home_relevant=1 home_irrelevant=1" in first.out
-    assert "home_relevant_ratio=0.50" in first.out
-    assert "detail_reads=1 scroll_attempts=1 scrolls=1 skipped_unverified=0" in first.out
+    assert first_summary.startswith("NURTURE status=COMPLETE source=HOME_FOR_YOU")
+    assert "ui=UNVERIFIED_LIVE_UI" in first_summary
+    assert "home_sampled=2 home_new=2" in first_summary
+    assert "home_relevant=1 home_irrelevant=1" in first_summary
+    assert "home_relevant_ratio=0.50" in first_summary
+    assert "detail_reads=1 scroll_attempts=1 scrolls=1 skipped_unverified=0" in first_summary
     assert second_code == 0, second.out + second.err
-    assert "NURTURE status=COMPLETE source=HOME_FOR_YOU" in second.out
-    assert "home_sampled=3 home_new=1" in second.out
-    assert "home_relevant=2 home_irrelevant=1" in second.out
-    assert "home_relevant_ratio=0.67" in second.out
-    assert "duplicates=4 detail_reads=1" in second.out
-    assert "scroll_attempts=4 scrolls=4" in second.out
+    assert second_summary.startswith(
+        "NURTURE status=COMPLETE source=HOME_FOR_YOU"
+    ), second_summary
+    assert "home_sampled=3 home_new=1" in second_summary
+    assert "home_relevant=2 home_irrelevant=1" in second_summary
+    assert "home_relevant_ratio=0.67" in second_summary
+    assert "duplicates=4 detail_reads=1" in second_summary
+    assert "scroll_attempts=4 scrolls=4" in second_summary
     assert all(
         value not in first.out + first.err + second.out + second.err
         for value in (
