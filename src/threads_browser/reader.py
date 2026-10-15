@@ -26,10 +26,14 @@ from playwright.async_api import (
 
 from .errors import UiReadError
 from .feed.models import DisplayObservation, HomeSample, PostTarget
-from .feed.relevance import canonical_terms, classify_body, normalize_text
+from .feed.relevance import (
+    canonical_terms as canonical_terms,
+    classify_body as classify_body,
+    normalize_text,
+)
 from .feed.urls import (
     HOME_URL,
-    THREADS_ORIGIN,
+    THREADS_ORIGIN as THREADS_ORIGIN,
     _CandidateDiagnosticReason,
     _USERNAME,
     _post_url,
