@@ -26,6 +26,7 @@ from playwright.async_api import (
 )
 
 from .browser_ui.geometry import with_scrollport_geometry as _with_scrollport_geometry
+from .browser_ui.scrolling import NativeWheelScrollEngine, ScrollGestureResult
 from .errors import UiReadError
 from .feed.models import (
     BodyReadEvidence,
@@ -401,6 +402,7 @@ class ThreadsHomeReader:
         if expected_actor is not None and _USERNAME.fullmatch(expected_actor) is None:
             raise UiReadError("ACTOR_INVALID")
         self._page = page
+        self._scroll_engine = NativeWheelScrollEngine(page)
         self._expected_actor = None if expected_actor is None else expected_actor.casefold()
         self._readiness_prompt = readiness_prompt
         self._detail_mode = detail_mode
@@ -422,6 +424,7 @@ class ThreadsHomeReader:
         self.last_deferred_fingerprints: frozenset[str] = frozenset()
         self._last_viewport_limit = 20
         self.last_scroll_delta = 0.0
+        self.last_scroll_gesture: ScrollGestureResult | None = None
         self.last_scroll_band = "UNKNOWN"
         self.last_scroll_end_distance: float | None = None
         self.last_scroll_near_end = False
@@ -1046,7 +1049,7 @@ class ThreadsHomeReader:
         return targets
 
     async def advance_feed(self, *, scan_after_scroll: bool = True) -> bool:
-        """Issue one read-only wheel event and require observed scroll displacement."""
+        """Issue a bounded native wheel gesture and measure its displacement."""
         self.last_scroll_stop_reason = None
         self.last_scroll_targets = ()
         await self._wait_for_verified_feed(
@@ -1057,7 +1060,6 @@ class ThreadsHomeReader:
         if surface is None:
             self.last_scroll_stop_reason = "FEED_NOT_SCROLLABLE"
             return False
-        witness: JSHandle | None = None
         try:
             try:
                 point, wheel_delta, viewport_height, hit_test_tag = (
@@ -1068,34 +1070,32 @@ class ThreadsHomeReader:
                 if float(scroll_state["max"]) - initial_position <= 1:
                     self.last_scroll_stop_reason = "FEED_END_REACHED"
                     return False
-                witness = await self._watch_scroll_completion(
-                    surface,
-                    initial_position,
-                )
-                await self._page.mouse.move(*point)
                 self.scroll_attempts += 1
-                await self._page.mouse.wheel(0, wheel_delta)
+                gesture = await self._scroll_engine.advance(
+                    surface,
+                    point,
+                    wheel_delta,
+                    viewport_height,
+                )
+                self.last_scroll_gesture = gesture
                 self._mark_ui_transition()
             except PlaywrightError:
                 if not self._detail_mode:
                     print(f"SCROLL attempt={self.scroll_attempts} observed=0")
                 raise UiReadError("HOME_SCROLL_FAILED") from None
+            observed_delta = gesture.observed_delta
+            if observed_delta <= 1:
+                if not self._detail_mode:
+                    print(f"SCROLL attempt={self.scroll_attempts} observed=0")
+                raise UiReadError("HOME_SCROLL_UNVERIFIED")
+            if observed_delta > viewport_height * 0.5 + 1:
+                raise UiReadError("HOME_SCROLL_ADVANCE_OVERSIZED")
 
             async def observe_scroll(window_deadline: float) -> float:
-                if witness is None:
-                    raise UiReadError("HOME_SCROLL_UNVERIFIED")
-                observed_delta = await self._wait_for_scroll_movement(
-                    witness,
-                    window_deadline,
-                )
-                if observed_delta is None:
-                    raise UiReadError("HOME_SCROLL_UNVERIFIED")
                 await self._wait_for_verified_feed(
                     window_deadline,
                     timeout_code="HOME_SCROLL_UNVERIFIED",
                 )
-                if observed_delta > viewport_height * 0.5 + 1:
-                    raise UiReadError("HOME_SCROLL_ADVANCE_OVERSIZED")
 
                 if not scan_after_scroll:
                     return observed_delta
@@ -1203,12 +1203,6 @@ class ThreadsHomeReader:
                 )
             return True
         finally:
-            if witness is not None:
-                try:
-                    await witness.evaluate("state => state.cancel()")
-                except PlaywrightError:
-                    pass
-                await witness.dispose()
             await surface.dispose()
 
     async def _scroll_surface_snapshot(
@@ -2168,58 +2162,6 @@ class ThreadsHomeReader:
         await surface_state.dispose()
         self.last_scan_counts.scroll_surface_status = "VALIDATED"
         return surface
-
-    async def _watch_scroll_completion(
-        self,
-        surface: JSHandle,
-        initial_position: float,
-    ) -> JSHandle:
-        return await self._page.evaluate_handle(
-            """([element, initialPosition]) => {
-                const eventTarget = element === document.scrollingElement
-                    ? document : element;
-                let resolveMovement;
-                const state = {
-                    delta: 0,
-                    wait: new Promise(resolve => { resolveMovement = resolve; }),
-                    cancel: () => {},
-                };
-                const cleanup = () => eventTarget.removeEventListener("scroll", onScroll);
-                const onScroll = () => {
-                    const delta = Math.abs(element.scrollTop - initialPosition);
-                    if (delta <= 1) return;
-                    state.delta = delta;
-                    cleanup();
-                    resolveMovement(delta);
-                };
-                state.cancel = () => {
-                    cleanup();
-                    resolveMovement(false);
-                };
-                eventTarget.addEventListener("scroll", onScroll, {passive: true});
-                return state;
-            }""",
-            arg=[surface, initial_position],
-        )
-
-    async def _wait_for_scroll_movement(
-        self,
-        witness: JSHandle,
-        deadline: float,
-    ) -> float | None:
-        try:
-            delta = await asyncio.wait_for(
-                witness.evaluate("state => state.wait"),
-                timeout=self._remaining_readiness_ms(
-                    deadline,
-                    "HOME_SCROLL_UNVERIFIED",
-                ) / 1000,
-            )
-            return None if delta is False or delta is None else float(delta)
-        except TimeoutError:
-            return None
-        except PlaywrightError:
-            raise UiReadError("HOME_SCROLL_UNVERIFIED") from None
 
     async def _is_carried_viewport_candidate(self, root: Locator) -> str | None:
         handles = self._carried_viewport_candidate_handles

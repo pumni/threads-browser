@@ -366,10 +366,14 @@ async def run_page_workflow(
                 _detail_stop(error.code)
             raise
         if detail:
+            gesture = reader.last_scroll_gesture
+            wheel_steps = 0 if gesture is None else len(gesture.wheel_deltas)
+            gesture_ms = 0 if gesture is None else gesture.duration_ms
             if advanced:
                 print(
                     f"[SCROLL] attempt={reader.scroll_attempts} status=ADVANCED "
-                    f"observed=1 delta_px={reader.last_scroll_delta:g}"
+                    f"observed=1 delta_px={reader.last_scroll_delta:g} "
+                    f"wheel_steps={wheel_steps} gesture_ms={gesture_ms}"
                 )
             else:
                 print(

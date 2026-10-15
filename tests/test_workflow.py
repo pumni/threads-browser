@@ -17,6 +17,10 @@ from playwright.async_api import async_playwright as real_async_playwright
 from threads_browser import reader as reader_module
 from threads_browser import workflow
 from threads_browser.browser_ui.geometry import with_scrollport_geometry
+from threads_browser.browser_ui.scrolling import (
+    MAX_WHEEL_STEP_PX,
+    NativeWheelScrollEngine,
+)
 from threads_browser.cli import main
 from threads_browser.reader import (
     HOME_URL,
@@ -3618,7 +3622,11 @@ article {{ position: relative; height: 980px; }}
 <a href="/@candidate">@candidate</a><div class="body">{paragraphs}</div>
 </article></main><script>
 window.wheelCount = 0;
-window.addEventListener("wheel", () => window.wheelCount++);
+window.wheelDeltas = [];
+window.addEventListener("wheel", event => {{
+  window.wheelCount++;
+  window.wheelDeltas.push(event.deltaY);
+}});
 </script></body></html>"""
     data_root = tmp_path / "data"
     profile = tmp_path / "profile"
@@ -3642,7 +3650,8 @@ window.addEventListener("wheel", () => window.wheelCount++);
         assert result.detail_reads == 0
         assert result.scroll_attempts >= 2
         assert result.viewport_coverage_complete
-        assert await page.evaluate("window.wheelCount") == result.scroll_attempts
+        assert await page.evaluate("window.wheelCount") > result.scroll_attempts
+        assert await page.evaluate("Math.max(...window.wheelDeltas)") <= MAX_WHEEL_STEP_PX
 
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
@@ -3714,8 +3723,10 @@ window.headerOffscreenAfterFirstWheel =
   sessionStorage.getItem('synthetic-header-offscreen') === 'true';
 window.headerAttachedAfterFirstWheel =
   sessionStorage.getItem('synthetic-header-attached') === 'true';
-window.addEventListener('wheel', () => {{
+window.nativeWheelDeltas = [];
+window.addEventListener('wheel', event => {{
   window.nativeWheelCount += 1;
+  window.nativeWheelDeltas.push(event.deltaY);
   sessionStorage.setItem('synthetic-wheel-count', String(window.nativeWheelCount));
 }});
 window.addEventListener('scroll', () => {{
@@ -3769,8 +3780,8 @@ window.addEventListener('scroll', () => {{
         assert result.detail_reads == detail_visits == 1
         assert result.scroll_attempts == result.scrolls
         assert result.visible_text_segments >= len(fragments)
-        assert await page.evaluate("window.nativeWheelCount") == result.scroll_attempts
-        assert await page.evaluate("window.headerOffscreenAfterFirstWheel")
+        assert await page.evaluate("window.nativeWheelCount") > result.scroll_attempts
+        assert not await page.evaluate("window.headerOffscreenAfterFirstWheel")
         assert await page.evaluate("window.headerAttachedAfterFirstWheel")
 
     _run_offline_page(feed_html, exercise)
@@ -4034,7 +4045,7 @@ window.addEventListener("wheel", () => window.nativeWheelCount++);
         assert result.unverified_relevant == 1
         assert result.detail_reads == 0
         assert not result.viewport_coverage_complete
-        assert await page.evaluate("window.nativeWheelCount") == 1
+        assert await page.evaluate("window.nativeWheelCount") >= 2
 
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
@@ -4110,7 +4121,7 @@ window.addEventListener("wheel", () => {{
         assert result.detail_reads == 0
         assert result.checkpoint_runs == 0
         assert not result.viewport_coverage_complete
-        assert await page.evaluate("window.nativeWheelCount") == 1
+        assert await page.evaluate("window.nativeWheelCount") >= 2
 
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
@@ -4424,7 +4435,10 @@ def test_unmarked_row_body_hydration_is_rescanned_without_early_ready(
             max_scrolls=0,
             terms=("hiring",),
         )
-        assert result.status == "OBSERVED_UNVERIFIED_ONLY"
+        assert result.status == "OBSERVED_UNVERIFIED_ONLY", (
+            f"status={result.status} unresolved_gaps={result.unresolved_gaps} "
+            f"scroll_attempts={result.scroll_attempts} scrolls={result.scrolls}"
+        )
         assert result.body_extracted == 1
         assert result.provenance_verified == 0
         assert result.detail_reads == 0
@@ -4581,7 +4595,7 @@ window.addEventListener("click", event => {{
         assert result.provenance_verified == result.detail_reads == 0
         assert result.scroll_attempts == result.scrolls == 1
         assert result.checkpoint_runs == 0
-        assert await page.evaluate("window.wheelCount") == 1
+        assert await page.evaluate("window.wheelCount") > result.scroll_attempts
         assert await page.evaluate("window.rowClickCount") == 0
 
     _run_offline_page(feed_html, exercise)
@@ -4840,6 +4854,41 @@ article {{ box-sizing: border-box; height: 720px; padding: 8px; }}
     _run_offline_page(feed_html, exercise)
 
 
+def test_scroll_engine_sends_small_native_wheels_and_measures_the_gesture() -> None:
+    feed_html = """<!doctype html><html><body>
+<div style="height: 2400px"></div>
+<script>
+window.wheelDeltas = [];
+window.addEventListener("wheel", event => window.wheelDeltas.push(event.deltaY));
+</script></body></html>"""
+
+    async def exercise(page) -> None:
+        surface = await page.evaluate_handle("() => document.scrollingElement")
+        try:
+            result = await NativeWheelScrollEngine(page).advance(
+                surface,
+                (640, 360),
+                288,
+                720,
+            )
+        finally:
+            await surface.dispose()
+
+        assert result.requested_delta == 288
+        assert len(result.wheel_deltas) == 6
+        assert sum(result.wheel_deltas) == 288
+        assert max(abs(delta) for delta in result.wheel_deltas) <= MAX_WHEEL_STEP_PX
+        assert result.observed_delta > 1
+        assert result.observed_delta <= 360
+        assert result.duration_ms <= 1_800
+        assert await page.evaluate("window.wheelDeltas") == list(result.wheel_deltas)
+        assert await page.evaluate("window.scrollY") == pytest.approx(
+            result.observed_delta
+        )
+
+    _run_offline_page(feed_html, exercise)
+
+
 def test_sticky_row_with_scrolltop_change_is_not_reading_progress(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -4984,7 +5033,7 @@ feed.addEventListener('scroll', () => sessionStorage.setItem(
         assert result.home_sampled == result.unique_verified_posts == 2
         assert result.scroll_attempts == result.scrolls == 1
         assert result.detail_reads == 1
-        assert await page.evaluate("window.nativeWheelCount") == 1
+        assert await page.evaluate("window.nativeWheelCount") >= 2
         assert await page.evaluate("window.loadedMore")
         assert await page.evaluate("window.feedHeightAfter - window.feedHeightBefore") >= 120
 
