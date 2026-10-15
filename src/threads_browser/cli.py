@@ -8,6 +8,8 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from .account_service import add_local_account, open_account_login
+from .login import LoginStatus
 from .storage import (
     AccountStore,
     BrowserDataError,
@@ -18,7 +20,7 @@ from .storage import (
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="threads-browser")
+    parser = argparse.ArgumentParser(prog="python -m threads_browser.cli")
     commands = parser.add_subparsers(dest="command", required=True)
     account = commands.add_parser("account", help="register and maintain local accounts")
     account_commands = account.add_subparsers(dest="account_command", required=True)
@@ -121,6 +123,21 @@ def _has_interactive_terminal() -> bool:
         return False
 
 
+def _print_login_status(status: LoginStatus) -> None:
+    if status == "WAITING_FOR_AUTHENTICATION":
+        print("LOGIN status=WAITING_FOR_AUTHENTICATION")
+        print(
+            "Log in or complete verification in Chromium. "
+            "Close the browser or press Ctrl+C to cancel."
+        )
+    elif status == "SESSION_REUSED":
+        print("LOGIN status=SESSION_REUSED")
+    elif status == "VERIFIED":
+        print("LOGIN status=VERIFIED")
+    elif status == "BROWSER_OPEN":
+        print("BROWSER status=OPEN")
+
+
 async def _prompt_readiness_extension(stage: str, retry: int) -> bool:
     while True:
         try:
@@ -170,29 +187,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         data_root = resolve_data_root()
         accounts = AccountStore(data_root)
         if args.command == "account" and args.account_command == "add":
-            accounts.add(
-                args.alias,
-                args.actor,
-                args.profile_dir,
-                create_profile=args.create_profile,
-            )
+            if args.actor is None and args.profile_dir is None:
+                add_local_account(args.alias, data_root=data_root)
+            else:
+                accounts.add(
+                    args.alias,
+                    args.actor,
+                    args.profile_dir,
+                    create_profile=args.create_profile,
+                )
             print("ACCOUNT status=REGISTERED")
             return 0
         if args.command == "account" and args.account_command == "login":
-            account = accounts.get(args.alias)
-            with profile_lock(data_root, account):
-                from .login import run_manual_login
-                from .reader import UiReadError
+            from .reader import UiReadError
 
-                try:
-                    result = asyncio.run(run_manual_login(account, accounts))
-                except UiReadError as error:
-                    print(f"STOP {error.code}", file=sys.stderr)
-                    return 1
-                if result.status == "CANCELLED":
-                    print("LOGIN status=CANCELLED")
-                    return 1
-                return 0
+            try:
+                result = asyncio.run(
+                    open_account_login(
+                        args.alias,
+                        data_root=data_root,
+                        status_callback=_print_login_status,
+                    )
+                )
+            except UiReadError as error:
+                print(f"STOP {error.code}", file=sys.stderr)
+                return 1
+            if result.status == "CANCELLED":
+                print("LOGIN status=CANCELLED")
+                return 1
+            return 0
         if args.command == "nurture" and args.nurture_command == "run":
             if not args.headed:
                 print("ERROR HEADED_REQUIRED", file=sys.stderr)

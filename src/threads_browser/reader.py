@@ -28,7 +28,6 @@ from playwright.async_api import (
 THREADS_ORIGIN = "https://www.threads.com"
 HOME_URL = f"{THREADS_ORIGIN}/"
 _NAVIGATION_TIMEOUT_MS = 20_000
-_AUTHENTICATION_TIMEOUT_MS = 60 * 60 * 1000
 _DETAIL_TIMEOUT_MS = 15_000
 _READINESS_TIMEOUT_MS = 8_000
 _AUTOMATIC_READINESS_WINDOWS = 2
@@ -618,6 +617,20 @@ class ThreadsHomeReader:
 
     async def verify_login_actor(self) -> str:
         """Verify the signed-in actor through Threads navigation and return Home."""
+        if _same_home_origin(self._page.url):
+            try:
+                path = urlsplit(self._page.url).path.casefold()
+            except ValueError:
+                raise UiReadError("PROFILE_ROUTE_UNVERIFIED") from None
+            if "challenge" in path or "checkpoint" in path:
+                raise UiReadError("CHALLENGE_REQUIRED")
+            if path in {"/login", "/accounts/login"}:
+                raise UiReadError("LOGIN_REQUIRED")
+            if any(marker in path for marker in ("rate_limit", "too_many_requests")):
+                raise UiReadError("RATE_LIMITED")
+        elif self._page.url != "about:blank":
+            raise UiReadError("LOGIN_LOADING")
+
         if not self._is_home_navigation_url(self._page.url):
             try:
                 await self._page.goto(
@@ -658,10 +671,8 @@ class ThreadsHomeReader:
         return actor
 
     async def wait_for_login_control(self) -> None:
-        """Wait for a visible Home navigation control without navigating or submitting."""
-        try:
-            await self._page.wait_for_function(
-                """() => {
+        """Wait indefinitely for Threads navigation, surviving document replacement."""
+        predicate = """() => {
                     if (location.origin !== "https://www.threads.com") return false;
                     const labels = new Set(["profile", "your profile", "account"]);
                     const navs = document.querySelectorAll('nav, [role="navigation"]');
@@ -695,12 +706,50 @@ class ThreadsHomeReader:
                         }
                     }
                     return false;
-                }""",
-                polling=1000,
-                timeout=_AUTHENTICATION_TIMEOUT_MS,
-            )
-        except PlaywrightTimeoutError:
-            raise UiReadError("AUTHENTICATION_TIMEOUT") from None
+                }"""
+        while True:
+            if self._page.is_closed():
+                raise UiReadError("BROWSER_SESSION_UNAVAILABLE")
+            try:
+                await self._page.wait_for_function(
+                    predicate,
+                    polling=1000,
+                    timeout=0,
+                )
+                return
+            except PlaywrightTimeoutError:
+                if self._page.is_closed():
+                    raise UiReadError("BROWSER_SESSION_UNAVAILABLE") from None
+                try:
+                    await self._page.wait_for_load_state(
+                        "domcontentloaded",
+                        timeout=_NAVIGATION_TIMEOUT_MS,
+                    )
+                except PlaywrightTimeoutError:
+                    continue
+                await asyncio.sleep(0.25)
+            except PlaywrightError as error:
+                if self._page.is_closed():
+                    raise UiReadError("BROWSER_SESSION_UNAVAILABLE") from None
+                message = str(error).casefold()
+                if not any(
+                    marker in message
+                    for marker in (
+                        "execution context was destroyed",
+                        "cannot find context with specified id",
+                        "frame was detached",
+                        "navigating frame was detached",
+                    )
+                ):
+                    raise UiReadError("LOGIN_UI_UNSUPPORTED") from None
+                try:
+                    await self._page.wait_for_load_state(
+                        "domcontentloaded",
+                        timeout=_NAVIGATION_TIMEOUT_MS,
+                    )
+                except PlaywrightTimeoutError:
+                    continue
+                await asyncio.sleep(0.25)
 
     async def _visible_profile_controls(self) -> list[Locator]:
         controls = await self._visible_navigation_controls("link")
@@ -881,14 +930,19 @@ class ThreadsHomeReader:
         )
 
     async def _return_to_threads_home(self) -> None:
-        try:
-            await self._page.goto(
-                HOME_URL,
-                wait_until="domcontentloaded",
-                timeout=_NAVIGATION_TIMEOUT_MS,
-            )
-        except PlaywrightTimeoutError:
-            raise UiReadError("HOME_NAVIGATION_TIMEOUT") from None
+        for attempt in range(2):
+            try:
+                await self._page.goto(
+                    HOME_URL,
+                    wait_until="domcontentloaded",
+                    timeout=_NAVIGATION_TIMEOUT_MS,
+                )
+                break
+            except PlaywrightTimeoutError:
+                if self._is_home_navigation_url(self._page.url):
+                    break
+                if attempt == 1:
+                    raise UiReadError("HOME_NAVIGATION_TIMEOUT") from None
         if not _same_home_origin(self._page.url):
             raise UiReadError("OFF_ORIGIN_REDIRECT")
         if not self._is_home_navigation_url(self._page.url):

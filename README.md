@@ -1,6 +1,6 @@
 # Threads Browser
 
-A small, independent, read-only Playwright CLI for bounded Home / For You exploration.
+A small Python package for local Threads account sessions and bounded, read-only Home / For You exploration.
 
 ## Setup
 
@@ -11,20 +11,26 @@ From this repository, install the package and its development tools, then instal
 
 ### Windows PowerShell onboarding
 
-Create a local account and open its dedicated Chromium profile:
+Create accounts and open Chromium through the Python service API:
 
 ```powershell
 uv sync
 uv run playwright install chromium
 
-uv run threads-browser account add local1
-uv run threads-browser account login local1
+@'
+from threads_browser import add_local_account
 
-# Later, reopen the same account and persistent browser session
-uv run threads-browser account login local1
+add_local_account("local1")
+'@ | uv run python -
 
-# Use the same profile for bounded, read-only nurture
-uv run threads-browser nurture run local1 --headed --max-posts 2 --max-scrolls 1 --max-total-posts 5 --term "hiring"
+@'
+import asyncio
+from threads_browser import open_account_login
+
+asyncio.run(open_account_login("local1"))
+'@ | uv run python -
+
+# Later, run the same open_account_login("local1") snippet again.
 ```
 
 `account add local1` creates a unique account ID, account metadata, and a separate Chromium profile under `%LOCALAPPDATA%\ThreadsBrowser\profiles\local1`. The account begins unverified with no expected actor. Each alias gets its own account file and profile. Registration rejects duplicate aliases and does not replace an existing profile. The application rejects unsafe symlinks, junctions, path traversal, and default Chrome or Edge desktop profile roots. Never copy another browser profile or import its cookies or authentication data.
@@ -33,34 +39,48 @@ On the first `account login`, Chromium opens visibly at Threads. Sign in and com
 
 Later logins open the same persistent profile and check the live session. If it is still signed in as the bound actor, the CLI reports `SESSION_REUSED` and `VERIFIED`, navigates to Threads Home, and keeps the browser open. Chromium stores its session only in its own profile. The account JSON contains the account ID, alias, expected actor, and profile path; it never stores a password, cookies, or exported browser state. The CLI does not automate credential entry or bypass verification.
 
-If a session expires, `nurture run` stops with `LOGIN_REQUIRED`. Run `uv run threads-browser account login local1` to authenticate manually again in the same profile. This preserves the account ID, actor binding, and checkpoints. A different signed-in actor stops with `ACTOR_MISMATCH`; normal login never relinks an account. If the account has not completed its first verified login, `nurture run` stops with `ACCOUNT_NOT_VERIFIED`.
+If a session expires, `nurture run` stops with `LOGIN_REQUIRED`. Call `asyncio.run(open_account_login("local1"))` to authenticate manually again in the same profile. This preserves the account ID, actor binding, and checkpoints. A different signed-in actor stops with `ACTOR_MISMATCH`; normal login never relinks an account. If the account has not completed its first verified login, `nurture run` stops with `ACCOUNT_NOT_VERIFIED`.
 
-The browser profile lock is held for the full time Chromium is open. Do not run `nurture run` or another login for the same account until that browser closes. Login always opens headed Chromium; the legacy `--headed` flag remains accepted. It does not require terminal input while the browser is open.
+`add_local_account(alias)` and the async `open_account_login(alias)` are exported from `threads_browser`. They do not parse command-line arguments, call `input()`, or require a TTY. `open_account_login` accepts an optional `data_root` for application integration and an optional status callback for `WAITING_FOR_AUTHENTICATION`, `SESSION_REUSED`, `VERIFIED`, and `BROWSER_OPEN`. It holds the profile lock for the full time Chromium is open. Do not run nurture or another login for the same account until that browser closes. Login always opens headed Chromium.
+
+The `threads-browser` console command is no longer installed. For development and debugging, the retained module runner can start the bounded read-only workflow:
+
+```powershell
+uv run python -m threads_browser.cli nurture run local1 --headed --max-posts 2 --max-scrolls 1 --max-total-posts 5 --term "hiring"
+```
+
+Applications can call `threads_browser.workflow.run_browser_nurture(...)` directly when they need to integrate the nurture workflow without this development runner.
 
 ### Existing accounts
 
-Existing schema version 1 accounts remain readable and keep their registered actor, account ID, and profile path. Continue registering a pre-existing dedicated automation profile with the explicit form:
+Existing schema version 1 accounts remain readable and keep their registered actor, account ID, and profile path. Continue registering a pre-existing dedicated automation profile through `AccountStore`:
 
-```powershell
-uv run threads-browser account add legacy1 --actor "@example" --profile-dir "C:\path\to\dedicated-profile"
+```python
+from pathlib import Path
+
+from threads_browser.storage import AccountStore, resolve_data_root
+
+account = AccountStore(resolve_data_root()).add(
+    "legacy1", "@example", Path(r"C:\path\to\dedicated-profile")
+)
 ```
 
-For compatibility, `--create-profile` remains available with explicit `--actor` and `--profile-dir` when creating a new dedicated directory. Without that flag, explicit registration still requires the directory to exist. Omitting both options selects the local-first flow. Existing accounts are not silently migrated or rebound.
+For compatibility, `AccountStore.add(alias, actor, profile_directory, create_profile=True)` can create an absent dedicated directory; without `create_profile`, explicit registration still requires the directory to exist. `add_local_account(alias)` creates a new unverified local account. Existing accounts are not silently migrated or rebound.
 
 ### Owner-run live UI UAT
 
 Automated tests use local Chromium fixtures and do not sign in to Threads. Before relying on the current live UI, an authorized operator should run this Windows PowerShell check with a test account:
 
-1. Run `uv run threads-browser account add local1`, then `uv run threads-browser account login local1` and sign in manually.
-2. Confirm `LOGIN status=VERIFIED` and that the saved account actor matches the profile reached from the visible Profile control.
-3. Close Chromium, then run `uv run threads-browser account login local1` again. Confirm it reports `SESSION_REUSED`, returns to Threads Home, and leaves Chromium open.
-4. Close Chromium and run `uv run threads-browser nurture run local1 --headed --max-posts 2 --max-scrolls 1 --max-total-posts 5 --term "hiring"`. Confirm the same profile is used and the bounded, read-only workflow completes safely.
+1. Call `add_local_account("local1")`, then `asyncio.run(open_account_login("local1"))` and sign in manually.
+2. Confirm the status callback reports `VERIFIED` and that the saved account actor matches the profile reached from the visible Profile control.
+3. Close Chromium, then call `asyncio.run(open_account_login("local1"))` again. Confirm the status callback reports `SESSION_REUSED`, returns to Threads Home, and leaves Chromium open.
+4. Close Chromium and call `run_browser_nurture(...)` or use `uv run python -m threads_browser.cli nurture run local1 --headed --max-posts 2 --max-scrolls 1 --max-total-posts 5 --term "hiring"`. Confirm the same profile is used and the bounded, read-only workflow completes safely.
 
 Live Threads UI compatibility is **UNVERIFIED_LIVE_UI** until this owner-run UAT has been completed. Unsupported UI, rate limits, challenges, navigation failures, and actor mismatches stop with a fixed status instead of being bypassed.
 
 Run a headed, read-only Home / For You search. `--max-posts` caps visible post rows accounted for in each viewport (1-20); if more candidate rows are visible than the cap, the run reports `VIEWPORT_COVERAGE_INCOMPLETE` and stops before scrolling, opening Detail, or saving a checkpoint. The defaults allow up to eight observed wheel advances and forty distinct provenance-verified posts per run. Terms are local relevance hints; they are not search queries and do not navigate to Search. Each `--term` is normalized and matched as a literal substring of extracted text. Configure job-seeking and hiring phrases separately when both matter, for example `--term "đang tìm việc" --term "đang tuyển"`.
 
-    uv run threads-browser nurture run my-account --headed --max-posts 20 --max-scrolls 8 --max-total-posts 40 --term hiring --term tuyển-dụng
+    uv run python -m threads_browser.cli nurture run my-account --headed --max-posts 20 --max-scrolls 8 --max-total-posts 40 --term hiring --term tuyển-dụng
 
 The data root defaults to %LOCALAPPDATA%\ThreadsBrowser on Windows and ~/.local/share/threads-browser elsewhere. Set THREADS_BROWSER_DATA_ROOT to choose another private root. Account metadata and versioned checkpoints stay there; post text and raw post URLs are never persisted. Text is not printed by default. `--show-post-text` previews only provenance-verified text on a TTY. `--show-observed-text` is a separate TTY-only opt-in for `OBSERVED_UNVERIFIED` text; its warning identifies the lower trust level and terminal scrollback risk.
 

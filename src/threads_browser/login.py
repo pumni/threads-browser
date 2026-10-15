@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -18,7 +19,18 @@ from .storage import (
     ensure_safe_browser_profile,
 )
 
-_WAITABLE_LOGIN_CODES = {"LOGIN_REQUIRED", "LOGIN_LOADING", "CHALLENGE_REQUIRED"}
+_WAITABLE_LOGIN_CODES = {
+    "LOGIN_REQUIRED",
+    "LOGIN_LOADING",
+    "CHALLENGE_REQUIRED",
+    "HOME_NAVIGATION_TIMEOUT",
+}
+LoginStatus = Literal[
+    "WAITING_FOR_AUTHENTICATION",
+    "SESSION_REUSED",
+    "VERIFIED",
+    "BROWSER_OPEN",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,9 +68,35 @@ async def _wait_for_authentication(
         await asyncio.gather(readiness, closed, return_exceptions=True)
 
 
+async def _verify_actor(page: Page, expected_actor: str | None, context: BrowserContext) -> str:
+    try:
+        return await ThreadsHomeReader(page, expected_actor).verify_login_actor()
+    except PlaywrightTimeoutError:
+        if context.is_closed():
+            raise
+        raise UiReadError("LOGIN_LOADING") from None
+    except PlaywrightError as error:
+        if context.is_closed():
+            raise
+        message = str(error).casefold()
+        if any(
+            marker in message
+            for marker in (
+                "execution context was destroyed",
+                "cannot find context with specified id",
+                "frame was detached",
+                "navigating frame was detached",
+            )
+        ):
+            raise UiReadError("LOGIN_LOADING") from None
+        raise
+
+
 async def run_manual_login(
     account: BrowserAccount,
     accounts: AccountStore,
+    *,
+    status_callback: Callable[[LoginStatus], None] | None = None,
 ) -> ManualLoginResult:
     """Open Chromium, verify or establish the actor binding, and wait for window close."""
     ensure_safe_browser_profile(account.profile_directory)
@@ -71,28 +109,28 @@ async def run_manual_login(
                     headless=False,
                 )
                 page = context.pages[0] if context.pages else await context.new_page()
-                print(f"ACCOUNT {account.alias}")
-                await page.goto(
-                    HOME_URL,
-                    wait_until="domcontentloaded",
-                    timeout=20_000,
-                )
-
                 session_reused = False
                 try:
-                    actor = await ThreadsHomeReader(
+                    await page.goto(
+                        HOME_URL,
+                        wait_until="domcontentloaded",
+                        timeout=20_000,
+                    )
+                except PlaywrightTimeoutError:
+                    pass
+
+                try:
+                    actor = await _verify_actor(
                         page,
                         account.expected_actor,
-                    ).verify_login_actor()
+                        context,
+                    )
                     session_reused = account.expected_actor is not None
                 except UiReadError as error:
                     if error.code not in _WAITABLE_LOGIN_CODES:
                         raise
-                    print("LOGIN status=WAITING_FOR_AUTHENTICATION")
-                    print(
-                        "Log in or complete verification in Chromium. "
-                        "Close the browser or press Ctrl+C to cancel."
-                    )
+                    if status_callback is not None:
+                        status_callback("WAITING_FOR_AUTHENTICATION")
                     while True:
                         if not await _wait_for_authentication(
                             page,
@@ -101,10 +139,11 @@ async def run_manual_login(
                         ):
                             return ManualLoginResult("CANCELLED")
                         try:
-                            actor = await ThreadsHomeReader(
+                            actor = await _verify_actor(
                                 page,
                                 account.expected_actor,
-                            ).verify_login_actor()
+                                context,
+                            )
                         except UiReadError as retry_error:
                             if retry_error.code in _WAITABLE_LOGIN_CODES:
                                 continue
@@ -118,10 +157,11 @@ async def run_manual_login(
                         raise UiReadError("ACTOR_MISMATCH") from None
                     raise
 
-                if session_reused:
-                    print("LOGIN status=SESSION_REUSED")
-                print("LOGIN status=VERIFIED")
-                print("BROWSER status=OPEN")
+                if session_reused and status_callback is not None:
+                    status_callback("SESSION_REUSED")
+                if status_callback is not None:
+                    status_callback("VERIFIED")
+                    status_callback("BROWSER_OPEN")
                 await context.wait_for_event("close")
                 return ManualLoginResult("CLOSED")
             except PlaywrightTimeoutError:

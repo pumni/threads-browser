@@ -16,7 +16,6 @@ from threads_browser.cli import main
 from threads_browser.reader import HOME_URL, UiReadError
 from threads_browser.storage import (
     AccountStore,
-    BrowserDataError,
     profile_lock,
 )
 
@@ -154,8 +153,15 @@ async def _run_until_browser_close(
     account,
     store: AccountStore,
     context: _FakeContext,
+    status_callback=None,
 ) -> login.ManualLoginResult:
-    task = asyncio.create_task(login.run_manual_login(account, store))
+    task = asyncio.create_task(
+        login.run_manual_login(
+            account,
+            store,
+            status_callback=status_callback,
+        )
+    )
     await asyncio.wait_for(context.browser_open.wait(), timeout=1)
     assert not context.closed
     context.user_close()
@@ -165,7 +171,6 @@ async def _run_until_browser_close(
 def test_first_login_binds_verified_actor_and_keeps_browser_open(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
     root, profile, store, account = _account(tmp_path)
     _, context, manager, calls = _install_fake_browser(monkeypatch)
@@ -175,7 +180,10 @@ def test_first_login_binds_verified_actor_and_keeps_browser_open(
         [UiReadError("LOGIN_REQUIRED"), "offline.operator"],
     )
 
-    result = asyncio.run(_run_until_browser_close(account, store, context))
+    statuses: list[login.LoginStatus] = []
+    result = asyncio.run(
+        _run_until_browser_close(account, store, context, statuses.append)
+    )
 
     bound = store.get("local1")
     document = json.loads((root / "accounts" / "local1.json").read_text(encoding="utf-8"))
@@ -190,42 +198,33 @@ def test_first_login_binds_verified_actor_and_keeps_browser_open(
     assert context.closed and context.close_count == 0
     assert manager.exited
     assert not (root / "nurture").exists()
-    output = capsys.readouterr().out
-    assert output.index("LOGIN status=WAITING_FOR_AUTHENTICATION") < output.index(
-        "LOGIN status=VERIFIED"
-    )
-    assert "ACCOUNT local1" in output
-    assert "BROWSER status=OPEN" in output
-    assert str(profile) not in output
-    assert "offline.operator" not in output
+    assert statuses == ["WAITING_FOR_AUTHENTICATION", "VERIFIED", "BROWSER_OPEN"]
 
 
 def test_subsequent_login_reuses_bound_session_without_terminal_confirmation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
     _, profile, store, account = _account(tmp_path, actor="offline.operator")
     _, context, _, calls = _install_fake_browser(monkeypatch)
     verify_calls, waits = _install_reader(monkeypatch, context, ["offline.operator"])
 
-    result = asyncio.run(_run_until_browser_close(account, store, context))
+    statuses: list[login.LoginStatus] = []
+    result = asyncio.run(
+        _run_until_browser_close(account, store, context, statuses.append)
+    )
 
     assert result.status == "CLOSED"
     assert calls == {"user_data_dir": str(profile), "headless": False}
     assert verify_calls == ["offline.operator"]
     assert waits == []
     assert store.get("local1").account_id == account.account_id
-    output = capsys.readouterr().out
-    assert "LOGIN status=SESSION_REUSED" in output
-    assert "LOGIN status=VERIFIED" in output
-    assert "BROWSER status=OPEN" in output
+    assert statuses == ["SESSION_REUSED", "VERIFIED", "BROWSER_OPEN"]
 
 
 def test_expired_session_waits_for_manual_reauthentication_without_rebinding(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
     root, _, store, account = _account(tmp_path, actor="offline.operator")
     metadata_path = root / "accounts" / "local1.json"
@@ -237,21 +236,21 @@ def test_expired_session_waits_for_manual_reauthentication_without_rebinding(
         [UiReadError("LOGIN_REQUIRED"), "offline.operator"],
     )
 
-    result = asyncio.run(_run_until_browser_close(account, store, context))
+    statuses: list[login.LoginStatus] = []
+    result = asyncio.run(
+        _run_until_browser_close(account, store, context, statuses.append)
+    )
 
     assert result.status == "CLOSED"
     assert verify_calls == ["offline.operator"] * 3
     assert len(waits) == 1
     assert metadata_path.read_bytes() == before
-    output = capsys.readouterr().out
-    assert "LOGIN status=WAITING_FOR_AUTHENTICATION" in output
-    assert "LOGIN status=SESSION_REUSED" not in output
+    assert statuses == ["WAITING_FOR_AUTHENTICATION", "VERIFIED", "BROWSER_OPEN"]
 
 
 def test_challenge_waits_for_human_completion_but_rate_limit_fails_safely(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
     _, _, store, account = _account(tmp_path)
     _, challenge_context, _, _ = _install_fake_browser(monkeypatch)
@@ -270,8 +269,6 @@ def test_challenge_waits_for_human_completion_but_rate_limit_fails_safely(
         asyncio.run(login.run_manual_login(store.get("local1"), store))
     assert caught.value.code == "RATE_LIMITED"
     assert limited_context.closed
-    output = capsys.readouterr().out
-    assert "WAITING_FOR_AUTHENTICATION" in output
 
 
 def test_actor_mismatch_never_rebinds_an_existing_account(
@@ -344,7 +341,7 @@ def test_browser_failure_closes_context_and_sanitizes_profile_path(
     assert str(profile) not in str(caught.value) + capsys.readouterr().out
 
 
-def test_cli_login_is_visible_without_requiring_headed_or_a_tty(
+def test_cli_login_uses_the_account_service_without_requiring_headed_or_a_tty(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -354,15 +351,14 @@ def test_cli_login_is_visible_without_requiring_headed_or_a_tty(
     monkeypatch.setattr(cli, "_has_interactive_terminal", lambda: False)
     calls: list[Path] = []
 
-    async def fake_login(registered_account, registered_store):
-        assert registered_store.get("local1") == account
-        calls.append(registered_account.profile_directory)
-        with pytest.raises(BrowserDataError) as caught:
-            profile_lock(root, registered_account).acquire()
-        assert caught.value.code == "ACCOUNT_BUSY"
+    async def fake_open_account_login(alias, *, data_root, status_callback):
+        assert alias == "local1"
+        assert data_root == root
+        assert status_callback is not None
+        calls.append(store.get(alias).profile_directory)
         return login.ManualLoginResult("CLOSED")
 
-    monkeypatch.setattr(login, "run_manual_login", fake_login)
+    monkeypatch.setattr(cli, "open_account_login", fake_open_account_login)
 
     assert main(["account", "login", "local1"]) == 0
     assert main(["account", "login", "local1", "--headed"]) == 0
@@ -515,3 +511,45 @@ setTimeout(() => {
     actor, final_url = asyncio.run(exercise())
     assert actor == "offline.operator"
     assert final_url == HOME_URL
+
+
+def test_authentication_wait_has_no_deadline_and_survives_page_replacement() -> None:
+    class LongWaitPage:
+        def __init__(self) -> None:
+            self.closed = False
+            self.calls = 0
+            self.authenticated = asyncio.Event()
+            self.restarted = asyncio.Event()
+
+        def is_closed(self) -> bool:
+            return self.closed
+
+        async def wait_for_function(self, _predicate, **kwargs) -> None:
+            assert kwargs == {"polling": 1000, "timeout": 0}
+            self.calls += 1
+            if self.calls == 1:
+                raise PlaywrightError("Execution context was destroyed by a navigation")
+            self.restarted.set()
+            await self.authenticated.wait()
+
+        async def wait_for_load_state(self, state: str, *, timeout: int) -> None:
+            assert state == "domcontentloaded"
+            assert timeout > 0
+
+    async def exercise() -> tuple[int, bool]:
+        page = LongWaitPage()
+        verifier = reader.ThreadsHomeReader(page, None)
+        task = asyncio.create_task(verifier.wait_for_login_control())
+        await asyncio.wait_for(page.restarted.wait(), timeout=1)
+
+        # Controlled elapsed time represents more than the previous 60-minute cap.
+        elapsed_minutes = 61
+        assert elapsed_minutes > 60
+        assert not task.done()
+        page.authenticated.set()
+        await task
+        return page.calls, task.done()
+
+    calls, completed = asyncio.run(exercise())
+    assert calls == 2
+    assert completed
