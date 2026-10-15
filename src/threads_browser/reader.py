@@ -45,6 +45,14 @@ _PROFILE_PATH = re.compile(r"/@(?P<author>[A-Za-z0-9._]{1,30})/?")
 _FOR_YOU_NAME = re.compile(r"^for you$", re.IGNORECASE)
 _PROFILE_NAME = re.compile(r"^(?:profile|your profile|account)$", re.IGNORECASE)
 _MORE_NAME = re.compile(r"^(?:more|see more|read more)$", re.IGNORECASE)
+_CandidateDiagnosticReason = Literal[
+    "POST_LINK_HAS_QUERY_OR_FRAGMENT",
+    "POST_PATH_SHAPE_INVALID",
+    "POST_ORIGIN_INVALID",
+    "POST_AUTHOR_OR_ID_INVALID",
+    "CANDIDATE_WRAPPER_AMBIGUOUS",
+    "CANDIDATE_AUTHOR_MISMATCH",
+]
 _ReadinessResult = TypeVar("_ReadinessResult")
 
 
@@ -66,8 +74,11 @@ class _UnverifiedFeedCandidate(UiReadError):
             "CANDIDATE_AUTHOR_CONFLICT",
         ],
         identities: tuple[str, ...],
+        *,
+        diagnostic_reason: _CandidateDiagnosticReason | None = None,
     ) -> None:
         self.reason = reason
+        self.diagnostic_reason = diagnostic_reason
         self.identities = frozenset(
             sha256(identity.encode("utf-8")).hexdigest()
             for identity in identities
@@ -139,10 +150,15 @@ class HomeSample:
 class _FeedScanCounts:
     visible_links: int = 0
     inspected: int = 0
+    url_parsed: int = 0
+    author_unverified: int = 0
+    wrapper_ambiguous: int = 0
+    card_not_ready: int = 0
     verified: int = 0
     body_read: int = 0
     body_unknown: int = 0
     skipped: int = 0
+    rejection_reasons: dict[str, int] = field(default_factory=dict)
 
 
 def normalize_text(value: str) -> str:
@@ -179,6 +195,27 @@ def _post_url(value: str) -> tuple[str, str] | None:
         return None
     canonical = urlunsplit(("https", "www.threads.com", parsed.path, "", ""))
     return canonical, match.group("author").casefold()
+
+
+def _post_url_rejection_reason(value: str) -> _CandidateDiagnosticReason:
+    try:
+        parsed = urlsplit(urljoin(HOME_URL, value))
+    except ValueError:
+        return "POST_ORIGIN_INVALID"
+    if parsed.query or parsed.fragment:
+        return "POST_LINK_HAS_QUERY_OR_FRAGMENT"
+    if parsed.scheme != "https" or parsed.netloc.casefold() != "www.threads.com":
+        return "POST_ORIGIN_INVALID"
+    segments = parsed.path.split("/")
+    if len(segments) != 4 or segments[0] != "" or segments[2] != "post":
+        return "POST_PATH_SHAPE_INVALID"
+    author = segments[1][1:] if segments[1].startswith("@") else ""
+    post_id = segments[3]
+    if _USERNAME.fullmatch(author) is None or re.fullmatch(
+        r"[A-Za-z0-9_-]{1,120}", post_id
+    ) is None:
+        return "POST_AUTHOR_OR_ID_INVALID"
+    return "POST_PATH_SHAPE_INVALID"
 
 
 def _profile_author(value: str) -> str | None:
@@ -239,14 +276,42 @@ class ThreadsHomeReader:
         error: _UnverifiedFeedCandidate,
     ) -> None:
         self._skipped_candidate_identities.update(error.identities)
-        key = (stage, error.reason)
+        key = (stage, error.diagnostic_reason or error.reason)
         identities = self._reported_candidate_skips.setdefault(key, set())
         previous_count = len(identities)
         identities.update(error.identities)
         if len(identities) != previous_count:
-            print(
-                f"SKIPPED stage={stage} reason={error.reason} count={len(identities)}"
+            cause = (
+                ""
+                if error.diagnostic_reason is None
+                else f" cause={error.diagnostic_reason}"
             )
+            print(
+                f"SKIPPED stage={stage} reason={error.reason} "
+                f"count={len(identities)}{cause}"
+            )
+
+    def _record_scan_skip(
+        self,
+        stage: str,
+        error: _UnverifiedFeedCandidate,
+    ) -> None:
+        counts = self.last_scan_counts
+        counts.skipped += 1
+        diagnostic_reason = error.diagnostic_reason
+        if diagnostic_reason is not None:
+            counts.rejection_reasons[diagnostic_reason] = (
+                counts.rejection_reasons.get(diagnostic_reason, 0) + 1
+            )
+        if diagnostic_reason == "CANDIDATE_WRAPPER_AMBIGUOUS":
+            counts.wrapper_ambiguous += 1
+        elif diagnostic_reason == "CANDIDATE_AUTHOR_MISMATCH":
+            counts.author_unverified += 1
+        elif diagnostic_reason is None and error.reason == "CANDIDATE_AMBIGUOUS":
+            counts.wrapper_ambiguous += 1
+        elif diagnostic_reason is None and error.reason == "CANDIDATE_AUTHOR_CONFLICT":
+            counts.author_unverified += 1
+        self._record_skipped_candidate(stage, error)
 
     async def open_home(self) -> None:
         try:
@@ -766,13 +831,13 @@ class ThreadsHomeReader:
         }.get(timeout_code, "FEED")
 
         async def attempt(window_deadline: float) -> tuple[tuple[PostTarget, ...], dict[str, float]]:
+            self.last_scan_counts = _FeedScanCounts()
             while True:
                 self._remaining_readiness_ms(window_deadline, timeout_code)
                 await self._wait_for_verified_feed(
                     window_deadline,
                     timeout_code=timeout_code,
                 )
-                self.last_scan_counts = _FeedScanCounts()
                 try:
                     targets, scroll_anchor = await self._visible_targets(
                         max_posts,
@@ -1226,11 +1291,11 @@ class ThreadsHomeReader:
                     viewport_y=box["y"],
                 )
             except _CardNotReady as pending:
+                self.last_scan_counts.card_not_ready += 1
                 pending_cards.append(pending)
                 continue
             except _UnverifiedFeedCandidate as error:
-                self.last_scan_counts.skipped += 1
-                self._record_skipped_candidate(stage, error)
+                self._record_scan_skip(stage, error)
                 continue
             if currently_visible:
                 permalink_box = await target.permalink.bounding_box()
@@ -1337,6 +1402,7 @@ class ThreadsHomeReader:
                     "POST_PROVENANCE_UNVERIFIED",
                     "CANDIDATE_AMBIGUOUS",
                     (expected_url,),
+                    diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
                 )
             post_authors: dict[str, str] = {}
             authors: set[str] = set()
@@ -1356,6 +1422,7 @@ class ThreadsHomeReader:
                         "POST_PROVENANCE_UNVERIFIED",
                         "CANDIDATE_NONCANONICAL",
                         (expected_url, href),
+                        diagnostic_reason=_post_url_rejection_reason(href),
                     )
                 author = _profile_author(href)
                 if author is not None:
@@ -1365,6 +1432,7 @@ class ThreadsHomeReader:
                     "POST_PROVENANCE_UNVERIFIED",
                     "CANDIDATE_AMBIGUOUS",
                     tuple(post_authors),
+                    diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
                 )
             if expected_url not in post_authors:
                 continue
@@ -1373,18 +1441,21 @@ class ThreadsHomeReader:
                     "POST_AUTHOR_UNVERIFIED",
                     "CANDIDATE_AUTHOR_CONFLICT",
                     (expected_url,),
+                    diagnostic_reason="CANDIDATE_AUTHOR_MISMATCH",
                 )
             if len(authors) > 1:
                 raise _UnverifiedFeedCandidate(
                     "POST_PROVENANCE_UNVERIFIED",
                     "CANDIDATE_AMBIGUOUS",
                     (expected_url,),
+                    diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
                 )
             if authors and expected_author not in authors:
                 raise _UnverifiedFeedCandidate(
                     "POST_AUTHOR_UNVERIFIED",
                     "CANDIDATE_AUTHOR_CONFLICT",
                     (expected_url,),
+                    diagnostic_reason="CANDIDATE_AUTHOR_MISMATCH",
                 )
 
             box = await ancestor.bounding_box()
@@ -1415,6 +1486,7 @@ class ThreadsHomeReader:
             "POST_PROVENANCE_UNVERIFIED",
             "CANDIDATE_AMBIGUOUS",
             (expected_url,),
+            diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
         )
 
     @staticmethod
@@ -1458,16 +1530,17 @@ class ThreadsHomeReader:
             parsed_post = None if href is None else _post_url(href)
             if parsed_post is None:
                 if href is not None and "/post/" in href:
-                    self.last_scan_counts.skipped += 1
-                    self._record_skipped_candidate(
+                    self._record_scan_skip(
                         stage,
                         _UnverifiedFeedCandidate(
                             "POST_PROVENANCE_UNVERIFIED",
                             "CANDIDATE_NONCANONICAL",
                             (href,),
+                            diagnostic_reason=_post_url_rejection_reason(href),
                         ),
                     )
                 continue
+            self.last_scan_counts.url_parsed += 1
             if parsed_post[0] in targets_by_url:
                 self.feed_duplicates += 1
                 continue
@@ -1484,22 +1557,23 @@ class ThreadsHomeReader:
                     root,
                     currently_visible=currently_visible,
                     viewport_y=box["y"],
+                    count_url_parses=False,
                 )
             except _CardNotReady as pending:
+                self.last_scan_counts.card_not_ready += 1
                 pending_cards.append(pending)
                 continue
             except _UnverifiedFeedCandidate as error:
-                self.last_scan_counts.skipped += 1
-                self._record_skipped_candidate(stage, error)
+                self._record_scan_skip(stage, error)
                 continue
             if target.url != parsed_post[0] or target.author != parsed_post[1]:
-                self.last_scan_counts.skipped += 1
-                self._record_skipped_candidate(
+                self._record_scan_skip(
                     stage,
                     _UnverifiedFeedCandidate(
                         "POST_PROVENANCE_UNVERIFIED",
                         "CANDIDATE_AMBIGUOUS",
                         (parsed_post[0], target.url),
+                        diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
                     ),
                 )
                 continue
@@ -1857,6 +1931,7 @@ class ThreadsHomeReader:
         currently_visible: bool = False,
         viewport_y: float = 0.0,
         require_body: bool = False,
+        count_url_parses: bool = True,
     ) -> PostTarget:
         if not await article.is_visible():
             raise _CardNotReady(article)
@@ -1868,6 +1943,8 @@ class ThreadsHomeReader:
                 continue
             parsed_post = _post_url(href)
             if parsed_post is not None:
+                if count_url_parses:
+                    self.last_scan_counts.url_parsed += 1
                 post_links.append((parsed_post[0], parsed_post[1], link))
                 continue
             if "/post/" in href:
@@ -1875,6 +1952,7 @@ class ThreadsHomeReader:
                     "POST_PROVENANCE_UNVERIFIED",
                     "CANDIDATE_NONCANONICAL",
                     (href,),
+                    diagnostic_reason=_post_url_rejection_reason(href),
                 )
             author = _profile_author(href)
             if author is not None:
@@ -1888,6 +1966,7 @@ class ThreadsHomeReader:
                 "POST_PROVENANCE_UNVERIFIED",
                 "CANDIDATE_AMBIGUOUS",
                 tuple(unique_urls or authors),
+                diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
             )
         if not post_links:
             raise _CardNotReady(article, condition="mutation")
@@ -1900,6 +1979,7 @@ class ThreadsHomeReader:
                 "POST_PROVENANCE_UNVERIFIED",
                 "CANDIDATE_AMBIGUOUS",
                 tuple(unique_urls),
+                diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
             )
         url, permalink_author, link = post_links[0]
         author = next(iter(authors))
@@ -1908,6 +1988,7 @@ class ThreadsHomeReader:
                 "POST_AUTHOR_UNVERIFIED",
                 "CANDIDATE_AUTHOR_CONFLICT",
                 (url,),
+                diagnostic_reason="CANDIDATE_AUTHOR_MISMATCH",
             )
 
         body: str | None = None

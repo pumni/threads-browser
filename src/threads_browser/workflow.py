@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from hashlib import sha256
@@ -25,6 +26,49 @@ from .storage import (
 )
 
 _MAX_SEEN = 5_000
+_BIDI_CONTROL_CODEPOINTS = frozenset(
+    {0x061C, 0x200E, 0x200F, *range(0x202A, 0x202F), *range(0x2066, 0x206A)}
+)
+
+
+def _terminal_safe_post_text(body: str) -> str:
+    safe: list[str] = []
+    for character in body:
+        codepoint = ord(character)
+        if character == "\n":
+            safe.append(character)
+        elif character == "\t":
+            safe.append("\\t")
+        elif (
+            unicodedata.category(character) in {"Cc", "Cs", "Zl", "Zp"}
+            or codepoint in _BIDI_CONTROL_CODEPOINTS
+        ):
+            safe.append(
+                f"\\u{codepoint:04X}"
+                if codepoint <= 0xFFFF
+                else f"\\U{codepoint:08X}"
+            )
+        else:
+            safe.append(character)
+    return "".join(safe)
+
+
+def _print_post_text(viewport: int, decision: str, body: str | None) -> bool:
+    if body is None or not body.strip():
+        print(
+            f"POST_TEXT viewport={viewport} status=UNKNOWN "
+            "decision=UNKNOWN availability=UNKNOWN"
+        )
+        return False
+    print(
+        f"POST_TEXT viewport={viewport} status=EXTRACTED decision={decision} "
+        f"availability=EXTRACTED chars={len(body)}"
+    )
+    print("<<< POST TEXT BEGIN >>>")
+    for line in _terminal_safe_post_text(body).split("\n"):
+        print(f"| {line}")
+    print("<<< POST TEXT END >>>")
+    return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +104,7 @@ async def run_page_workflow(
     max_scrolls: int = 8,
     max_total_posts: int = 40,
     readiness_prompt: Callable[[str, int], Awaitable[bool]] | None = None,
+    show_post_text: bool = False,
 ) -> NurtureResult:
     if not 1 <= max_posts <= 20:
         raise UiReadError("POST_LIMIT_INVALID")
@@ -87,6 +132,7 @@ async def run_page_workflow(
     pending = list(checkpoint.pending_read_fingerprints)
     pending_set = set(pending)
     found_relevant = False
+    previewed_bodies = 0
     viewport_number = 0
     exhaustion_reason = "MAX_SCROLLS"
     while True:
@@ -96,10 +142,28 @@ async def run_page_workflow(
             break
         viewport_number += 1
         duplicate_count_before_scan = reader.feed_duplicates
-        targets = await reader.scan_viewport(
-            min(max_posts, remaining),
-            scanned_fingerprints=seen_this_run,
-        )
+        try:
+            targets = await reader.scan_viewport(
+                min(max_posts, remaining),
+                scanned_fingerprints=seen_this_run,
+            )
+        except UiReadError:
+            counts = reader.last_scan_counts
+            rejection_reasons = ",".join(
+                f"{reason}:{count}"
+                for reason, count in sorted(counts.rejection_reasons.items())
+            ) or "none"
+            print(
+                f"SCAN_STOP viewport={viewport_number} visible_links={counts.visible_links} "
+                f"inspected={counts.inspected} url_parsed={counts.url_parsed} "
+                f"author_unverified={counts.author_unverified} "
+                f"wrapper_ambiguous={counts.wrapper_ambiguous} "
+                f"card_not_ready={counts.card_not_ready} "
+                f"verified={counts.verified} body_read={counts.body_read} "
+                f"body_unknown={counts.body_unknown} classified=0 relevant=0 "
+                f"skipped={counts.skipped} rejection_reasons={rejection_reasons}"
+            )
+            raise
         duplicates += reader.feed_duplicates - duplicate_count_before_scan
         viewport_relevant = 0
         viewport_irrelevant = 0
@@ -118,6 +182,12 @@ async def run_page_workflow(
             else:
                 duplicates += 1
             decision = classify_body(target.body, normalized_terms)
+            if show_post_text and _print_post_text(
+                viewport_number,
+                decision,
+                target.body,
+            ):
+                previewed_bodies += 1
             if decision == "RELEVANT":
                 relevant += 1
                 viewport_relevant += 1
@@ -144,7 +214,19 @@ async def run_page_workflow(
             f"body_read={scan_counts.body_read} "
             f"body_unknown={scan_counts.body_unknown} "
             f"classified={viewport_classified} "
-            f"irrelevant={viewport_irrelevant} unknown={viewport_unknown}"
+            f"irrelevant={viewport_irrelevant} unknown={viewport_unknown} "
+            f"url_parsed={scan_counts.url_parsed} "
+            f"author_unverified={scan_counts.author_unverified} "
+            f"wrapper_ambiguous={scan_counts.wrapper_ambiguous} "
+            f"card_not_ready={scan_counts.card_not_ready} "
+            "rejection_reasons="
+            + (
+                ",".join(
+                    f"{reason}:{count}"
+                    for reason, count in sorted(scan_counts.rejection_reasons.items())
+                )
+                or "none"
+            )
         )
         if viewport_selected is not None:
             selected = viewport_selected
@@ -171,6 +253,8 @@ async def run_page_workflow(
         pending_set.remove(selected.fingerprint)
         status = "COMPLETE"
     elif len(seen_this_run) == 0:
+        if show_post_text and previewed_bodies == 0:
+            print("POST_TEXT status=NONE verified=0")
         return NurtureResult(
             status="NO_VERIFIED_POSTS_IN_BUDGET",
             home_sampled=0,
@@ -222,6 +306,8 @@ async def run_page_workflow(
         seen_fingerprints=tuple(seen),
     )
     checkpoint_store.save(updated)
+    if show_post_text and previewed_bodies == 0:
+        print("POST_TEXT status=NONE verified=0")
     ratio = None if not seen_this_run else relevant / len(seen_this_run)
     return NurtureResult(
         status=status,
@@ -249,6 +335,7 @@ async def run_browser_nurture(
     max_scrolls: int = 8,
     max_total_posts: int = 40,
     readiness_prompt: Callable[[str, int], Awaitable[bool]] | None = None,
+    show_post_text: bool = False,
 ) -> NurtureResult:
     ensure_safe_browser_profile(account.profile_directory)
     try:
@@ -268,6 +355,7 @@ async def run_browser_nurture(
                     max_scrolls=max_scrolls,
                     max_total_posts=max_total_posts,
                     readiness_prompt=readiness_prompt,
+                    show_post_text=show_post_text,
                 )
             finally:
                 await context.close()

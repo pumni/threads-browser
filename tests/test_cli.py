@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
-from threads_browser import cli
+from threads_browser import cli, workflow
 from threads_browser.cli import main
 
 
@@ -72,6 +73,103 @@ def test_nurture_cli_requires_explicit_headed_mode(tmp_path: Path, monkeypatch, 
     )
     assert code == 1
     assert capsys.readouterr().err == "ERROR HEADED_REQUIRED\n"
+
+
+def test_show_post_text_requires_tty_before_data_or_browser_startup(
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setattr(cli, "_has_interactive_terminal", lambda: False)
+    monkeypatch.setattr(
+        cli,
+        "resolve_data_root",
+        lambda: (_ for _ in ()).throw(AssertionError("data root accessed")),
+    )
+
+    result = main(
+        [
+            "nurture",
+            "run",
+            "offline",
+            "--headed",
+            "--show-post-text",
+            "--max-posts",
+            "1",
+            "--term",
+            "hiring",
+        ]
+    )
+
+    assert result == 1
+    assert capsys.readouterr().err == "ERROR POST_TEXT_TTY_REQUIRED\n"
+
+
+def test_show_post_text_cli_passes_opt_in_only_after_tty_check(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    root = tmp_path / "private-root"
+    profile = tmp_path / "existing-profile"
+    profile.mkdir()
+    monkeypatch.setenv("THREADS_BROWSER_DATA_ROOT", str(root))
+    assert (
+        main(
+            [
+                "account",
+                "add",
+                "pilot",
+                "--actor",
+                "offline.operator",
+                "--profile-dir",
+                str(profile),
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+    monkeypatch.setattr(cli, "_has_interactive_terminal", lambda: True)
+    calls: dict[str, object] = {}
+
+    async def fake_run(_account, _store, **kwargs):
+        calls.update(kwargs)
+        return SimpleNamespace(
+            status="NO_VERIFIED_POSTS_IN_BUDGET",
+            ui_status="UNVERIFIED_LIVE_UI",
+            home_sampled=0,
+            home_new=0,
+            home_relevant=0,
+            home_irrelevant=0,
+            home_unknown=0,
+            home_relevant_ratio=None,
+            duplicates=0,
+            detail_reads=0,
+            scroll_attempts=0,
+            scrolls=0,
+            skipped_unverified=0,
+            checkpoint_runs=0,
+        )
+
+    monkeypatch.setattr(workflow, "run_browser_nurture", fake_run)
+    result = main(
+        [
+            "nurture",
+            "run",
+            "pilot",
+            "--headed",
+            "--show-post-text",
+            "--max-posts",
+            "1",
+            "--term",
+            "hiring",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert calls["show_post_text"] is True
+    assert "POST_TEXT_LOCAL_ONLY" in captured.err
+    assert "do not paste preview text into PRs or chats" in captured.err
 
 
 def test_attended_readiness_prompt_keeps_async_loop_responsive(monkeypatch) -> None:

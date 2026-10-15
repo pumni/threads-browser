@@ -32,6 +32,11 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("alias")
     run.add_argument("--headed", action="store_true", help="confirm headed one-shot operation")
     run.add_argument(
+        "--show-post-text",
+        action="store_true",
+        help="print verified extracted post text to an interactive terminal",
+    )
+    run.add_argument(
         "--max-posts",
         required=True,
         type=int,
@@ -80,6 +85,13 @@ def _format_result(result: object) -> str:
     )
 
 
+def _has_interactive_terminal() -> bool:
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
 async def _prompt_readiness_extension(stage: str, retry: int) -> bool:
     while True:
         try:
@@ -100,6 +112,19 @@ async def _prompt_readiness_extension(stage: str, retry: int) -> bool:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    if (
+        args.command == "nurture"
+        and args.nurture_command == "run"
+        and args.show_post_text
+    ):
+        if not _has_interactive_terminal():
+            print("ERROR POST_TEXT_TTY_REQUIRED", file=sys.stderr)
+            return 1
+        print(
+            "WARNING POST_TEXT_LOCAL_ONLY terminal scrollback may retain content; "
+            "do not paste preview text into PRs or chats.",
+            file=sys.stderr,
+        )
     try:
         data_root = resolve_data_root()
         accounts = AccountStore(data_root)
@@ -135,9 +160,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                             terms=tuple(args.term),
                             max_scrolls=args.max_scrolls,
                             max_total_posts=args.max_total_posts,
+                            show_post_text=args.show_post_text,
                             readiness_prompt=(
                                 _prompt_readiness_extension
-                                if sys.stdin.isatty() and sys.stdout.isatty()
+                                if _has_interactive_terminal()
                                 else None
                             ),
                         )

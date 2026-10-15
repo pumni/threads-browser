@@ -218,8 +218,8 @@ def test_offline_chromium_cli_reads_once_and_resumes_without_double_counting(
     assert "home_sampled=3 home_new=1" in second.out
     assert "home_relevant=2 home_irrelevant=1" in second.out
     assert "home_relevant_ratio=0.67" in second.out
-    assert "duplicates=2 detail_reads=1" in second.out
-    assert "scroll_attempts=2 scrolls=2" in second.out
+    assert "duplicates=4 detail_reads=1" in second.out
+    assert "scroll_attempts=4 scrolls=4" in second.out
     assert all(
         value not in first.out + first.err + second.out + second.err
         for value in (
@@ -233,6 +233,7 @@ def test_offline_chromium_cli_reads_once_and_resumes_without_double_counting(
             new_relevant_url,
         )
     )
+    assert "POST_TEXT" not in first.out + first.err + second.out + second.err
 
     assert requests
     assert all(urlsplit(url).netloc == "www.threads.com" for url in requests)
@@ -248,10 +249,10 @@ def test_offline_chromium_cli_reads_once_and_resumes_without_double_counting(
     assert checkpoint.home_new == 3
     assert checkpoint.home_relevant == 3
     assert checkpoint.home_irrelevant == 2
-    assert checkpoint.duplicates == 2
+    assert checkpoint.duplicates == 4
     assert checkpoint.detail_reads == 2
-    assert checkpoint.scroll_attempts == 3
-    assert checkpoint.scrolls == 3
+    assert checkpoint.scroll_attempts == 5
+    assert checkpoint.scrolls == 5
     assert len(checkpoint.seen_fingerprints) == 3
     assert checkpoint.pending_read_fingerprints == ()
     checkpoint_path = (
@@ -1709,7 +1710,8 @@ def test_overlapping_wheel_finds_intermediate_relevant_post(
     detail_body = "Hiring an engineer for the infrastructure team"
     feed_html = f"""<!doctype html><html><head><style>
 article {{ box-sizing: border-box; padding-top: 60px; }}
-article:first-of-type, article:last-of-type {{ height: 800px; }}
+article:first-of-type {{ height: 800px; padding-top: 350px; }}
+article:last-of-type {{ height: 800px; }}
 article:nth-of-type(2) {{ height: 180px; padding-top: 0; }}
 </style></head><body>
 <nav aria-label="Main" role="navigation">
@@ -1756,6 +1758,7 @@ window.addEventListener("wheel", event => {{
             max_scrolls=1,
             max_total_posts=10,
             terms=("hiring", "engineer"),
+            show_post_text=True,
         )
         assert result.status == "COMPLETE"
         assert result.home_sampled == 2
@@ -1767,9 +1770,13 @@ window.addEventListener("wheel", event => {{
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
     assert "delta_band=SMALL" in output
-    assert "body_read=1 body_unknown=0 classified=1" in output
+    assert "classified=1 irrelevant=0 unknown=0" in output
+    assert output.count("A weather update") == 1
+    assert output.count(detail_body) == 1
+    assert output.count("<<< POST TEXT BEGIN >>>") == 2
+    assert "POST_TEXT viewport=1 status=EXTRACTED decision=IRRELEVANT" in output
+    assert "POST_TEXT viewport=2 status=EXTRACTED decision=RELEVANT" in output
     assert "STOP" not in output
-    assert detail_body not in output
     checkpoint = store.load(
         account.account_id,
         policy_fingerprint(canonical_terms(("hiring", "engineer"))),
@@ -1778,6 +1785,22 @@ window.addEventListener("wheel", event => {{
     assert checkpoint.home_sampled == 2
     assert checkpoint.detail_reads == 1
     assert checkpoint.scroll_attempts == checkpoint.scrolls == 1
+    checkpoint_path = (
+        data_root
+        / "nurture"
+        / "checkpoints"
+        / f"{account.account_id}-{checkpoint.policy_fingerprint}.json"
+    )
+    persisted = checkpoint_path.read_text(encoding="utf-8")
+    assert "A weather update" not in persisted
+    assert detail_body not in persisted
+
+
+def test_post_text_preview_escapes_terminal_and_bidi_controls() -> None:
+    unsafe = "Hiring\x1b[31m engineer\u202e remote\nnext\rline\tend"
+    assert workflow._terminal_safe_post_text(unsafe) == (
+        "Hiring\\u001B[31m engineer\\u202E remote\nnext\\u000Dline\\tend"
+    )
 
 
 def test_noncanonical_first_viewport_can_advance_to_verified_relevant_post(
@@ -1850,7 +1873,10 @@ window.addEventListener("wheel", event => {{
 
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
-    assert "SKIPPED stage=FEED_INITIAL reason=CANDIDATE_NONCANONICAL count=2" in output
+    assert (
+        "SKIPPED stage=FEED_INITIAL reason=CANDIDATE_NONCANONICAL count=2 "
+        "cause=POST_PATH_SHAPE_INVALID"
+    ) in output
     assert (
         "SCANNING viewport=1 verified=0 relevant=0 skipped=2 visible_links=2 "
         "inspected=2 body_read=0 body_unknown=0 classified=0"
@@ -1863,6 +1889,94 @@ window.addEventListener("wheel", event => {{
     )
     assert checkpoint.home_sampled == 1
     assert checkpoint.home_relevant == 1
+
+
+def test_noncanonical_link_reasons_are_aggregate_and_privacy_safe(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    private_values = (
+        "query-private-marker",
+        "fragment-private-marker",
+        "private-origin.invalid",
+        "off-origin-private-marker",
+        "broken-path-private-marker",
+        "bad-author-private-marker",
+        "private-author-body-marker",
+        "private-wrapper-body-marker",
+    )
+    rejected_bodies = (
+        "Hiring query body",
+        "Hiring fragment body",
+        "Hiring origin body",
+        "Hiring path body",
+        private_values[6],
+        private_values[7],
+    )
+    feed_html = f"""<!doctype html><html><head><style>
+.post-card {{ box-sizing: border-box; height: 55px; }}
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main>
+<div class="post-card"><a href="/@candidate/post/query-id?token={private_values[0]}">Query</a>
+  <p>Hiring query body</p></div>
+<div class="post-card"><a href="/@candidate/post/fragment-id#{private_values[1]}">Fragment</a>
+  <p>Hiring fragment body</p></div>
+<div class="post-card"><a href="https://{private_values[2]}/@candidate/post/{private_values[3]}">Origin</a>
+  <p>Hiring origin body</p></div>
+<div class="post-card"><a href="/@candidate/post/{private_values[4]}/extra">Path</a>
+  <p>Hiring path body</p></div>
+<div class="post-card"><a href="/@bad!author/post/{private_values[5]}">Author</a>
+  <p>Hiring author body</p></div>
+<div class="post-card"><a href="/@candidate/post/author-mismatch">Post</a>
+  <a href="/@different.author">Author</a><p>{private_values[6]}</p></div>
+<div class="post-card"><a href="/@candidate/post/wrapper-one">Post one</a>
+  <a href="/@candidate/post/wrapper-two">Post two</a>
+  <a href="/@candidate">Author</a><p>{private_values[7]}</p></div>
+</main></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+
+    async def exercise(page) -> None:
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=1,
+            max_scrolls=0,
+            max_total_posts=10,
+            terms=("hiring",),
+            show_post_text=True,
+        )
+        assert result.status == "NO_VERIFIED_POSTS_IN_BUDGET"
+        assert result.home_sampled == 0
+        assert result.skipped_unverified == 8, result
+        assert result.detail_reads == result.checkpoint_runs == 0
+
+    _run_offline_page(feed_html, exercise)
+    output = capsys.readouterr().out
+    assert "cause=POST_LINK_HAS_QUERY_OR_FRAGMENT" in output
+    assert "cause=POST_ORIGIN_INVALID" in output
+    assert "cause=POST_PATH_SHAPE_INVALID" in output
+    assert "cause=POST_AUTHOR_OR_ID_INVALID" in output
+    assert "cause=CANDIDATE_AUTHOR_MISMATCH" in output
+    assert "cause=CANDIDATE_WRAPPER_AMBIGUOUS" in output
+    assert "url_parsed=3 author_unverified=1 wrapper_ambiguous=2 card_not_ready=0" in output
+    assert (
+        "rejection_reasons=CANDIDATE_AUTHOR_MISMATCH:1,"
+        "CANDIDATE_WRAPPER_AMBIGUOUS:2,POST_AUTHOR_OR_ID_INVALID:1,"
+        "POST_LINK_HAS_QUERY_OR_FRAGMENT:2,POST_ORIGIN_INVALID:1,"
+        "POST_PATH_SHAPE_INVALID:1"
+    ) in output
+    assert "POST_TEXT status=NONE verified=0" in output
+    assert all(value not in output for value in private_values)
+    assert all(body not in output for body in rejected_bodies)
 
 
 def test_verified_multiline_body_stays_unknown_without_private_text_logging(
@@ -1896,6 +2010,7 @@ def test_verified_multiline_body_stays_unknown_without_private_text_logging(
             max_scrolls=0,
             max_total_posts=10,
             terms=("hiring",),
+            show_post_text=True,
         )
         assert result.status == "VERIFIED_BUT_UNKNOWN_BODY"
         assert result.home_sampled == 1
@@ -1913,6 +2028,8 @@ def test_verified_multiline_body_stays_unknown_without_private_text_logging(
     ) in output
     assert first_paragraph not in output
     assert quoted_paragraph not in output
+    assert "POST_TEXT viewport=1 status=UNKNOWN" in output
+    assert "POST_TEXT status=NONE verified=0" in output
     checkpoint = store.load(
         account.account_id,
         policy_fingerprint(canonical_terms(("hiring",))),
@@ -2089,6 +2206,7 @@ window.addEventListener("wheel", event => {{
             max_scrolls=2,
             max_total_posts=10,
             terms=("hiring",),
+            show_post_text=True,
         )
         assert result.status == "NO_VERIFIED_POSTS_IN_BUDGET"
         assert result.home_sampled == result.home_new == 0
@@ -2105,3 +2223,4 @@ window.addEventListener("wheel", event => {{
     output = capsys.readouterr().out
     assert "SEARCH_BUDGET_EXHAUSTED reason=MAX_TOTAL_POSTS viewports=2" in output
     assert "SEARCH_BUDGET_EXHAUSTED reason=MAX_SCROLLS viewports=3" in output
+    assert "POST_TEXT status=NONE verified=0" in output
