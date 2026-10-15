@@ -53,6 +53,7 @@ _ERROR_CODES = {
     "DATA_ROOT_INVALID",
     "DATA_ROOT_UNAVAILABLE",
     "PROFILE_UNAVAILABLE",
+    "PROFILE_EXISTS",
     "LOCK_UNAVAILABLE",
     "STATE_INVALID",
     "STATE_PATH_INVALID",
@@ -143,6 +144,44 @@ def ensure_safe_browser_profile(profile_directory: Path) -> None:
                     raise BrowserDataError("PROFILE_UNAVAILABLE")
             except ValueError:
                 continue
+    except BrowserDataError:
+        raise
+    except (OSError, RuntimeError, ValueError):
+        raise BrowserDataError("PROFILE_UNAVAILABLE") from None
+
+
+def _is_link_or_junction(path: Path) -> bool:
+    return path.is_symlink() or path.is_junction()
+
+
+def _create_dedicated_profile(profile_directory: Path) -> Path:
+    """Create a previously absent profile without following existing path links."""
+    try:
+        candidate = Path(os.path.abspath(profile_directory))
+        parts = candidate.parts
+        if len(parts) < 2:
+            raise BrowserDataError("PROFILE_UNAVAILABLE")
+
+        current = Path(candidate.anchor)
+        if _is_link_or_junction(current):
+            raise BrowserDataError("PROFILE_UNAVAILABLE")
+        for part in parts[1:-1]:
+            current = current / part
+            try:
+                current.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            if _is_link_or_junction(current) or not current.is_dir():
+                raise BrowserDataError("PROFILE_UNAVAILABLE")
+
+        target = current / parts[-1]
+        try:
+            target.mkdir(mode=0o700)
+        except FileExistsError:
+            raise BrowserDataError("PROFILE_EXISTS") from None
+        if _is_link_or_junction(target) or not target.is_dir():
+            raise BrowserDataError("PROFILE_UNAVAILABLE")
+        return target.resolve(strict=True)
     except BrowserDataError:
         raise
     except (OSError, RuntimeError, ValueError):
@@ -281,17 +320,38 @@ class AccountStore:
     def __init__(self, data_root: Path) -> None:
         self._data_root = data_root
 
-    def add(self, alias: str, actor: str, profile_directory: Path) -> BrowserAccount:
+    def add(
+        self,
+        alias: str,
+        actor: str,
+        profile_directory: Path,
+        *,
+        create_profile: bool = False,
+    ) -> BrowserAccount:
         if _ALIAS.fullmatch(alias) is None:
             raise BrowserDataError("ACCOUNT_INVALID")
         expected_actor = normalize_actor(actor)
         try:
-            profile = profile_directory.expanduser().resolve(strict=True)
-        except (OSError, RuntimeError):
+            expanded_profile = profile_directory.expanduser()
+            if create_profile and ".." in expanded_profile.parts:
+                raise BrowserDataError("PROFILE_UNAVAILABLE")
+            profile_candidate = (
+                Path(os.path.abspath(expanded_profile))
+                if create_profile
+                else expanded_profile.resolve(strict=False)
+            )
+        except (OSError, RuntimeError, ValueError):
             raise BrowserDataError("PROFILE_UNAVAILABLE") from None
-        if not profile.is_dir():
-            raise BrowserDataError("PROFILE_UNAVAILABLE")
-        ensure_safe_browser_profile(profile)
+        ensure_safe_browser_profile(profile_candidate)
+
+        if not create_profile:
+            try:
+                profile = profile_directory.expanduser().resolve(strict=True)
+            except (OSError, RuntimeError, ValueError):
+                raise BrowserDataError("PROFILE_UNAVAILABLE") from None
+            if not profile.is_dir():
+                raise BrowserDataError("PROFILE_UNAVAILABLE")
+            ensure_safe_browser_profile(profile)
 
         root = _ensure_root(self._data_root)
         lock_path = root / "locks" / "registry.lock"
@@ -299,6 +359,10 @@ class AccountStore:
             target = _account_path(root, alias)
             if target.exists():
                 raise BrowserDataError("ACCOUNT_EXISTS")
+            created_profile = False
+            if create_profile:
+                profile = _create_dedicated_profile(profile_candidate)
+                created_profile = True
             account = BrowserAccount(uuid4(), alias, expected_actor, profile)
             document = {
                 "schema_version": 1,
@@ -307,7 +371,15 @@ class AccountStore:
                 "expected_actor": account.expected_actor,
                 "profile_directory": str(account.profile_directory),
             }
-            _write_json(root, target, document)
+            try:
+                _write_json(root, target, document)
+            except Exception:
+                if created_profile:
+                    try:
+                        profile.rmdir()
+                    except OSError:
+                        pass
+                raise
             return account
 
     def get(self, alias: str) -> BrowserAccount:

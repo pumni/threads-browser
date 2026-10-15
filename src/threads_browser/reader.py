@@ -570,6 +570,38 @@ class ThreadsHomeReader:
         )
         await self._follow_profile_control(control)
 
+    async def verify_login_actor(self) -> None:
+        """Verify the signed-in actor from Threads navigation without reading feed posts."""
+        try:
+            await self._page.goto(
+                HOME_URL,
+                wait_until="domcontentloaded",
+                timeout=_NAVIGATION_TIMEOUT_MS,
+            )
+        except PlaywrightTimeoutError:
+            raise UiReadError("HOME_NAVIGATION_TIMEOUT") from None
+
+        if not _same_home_origin(self._page.url):
+            raise UiReadError("OFF_ORIGIN_REDIRECT")
+        try:
+            path = urlsplit(self._page.url).path.casefold()
+        except ValueError:
+            raise UiReadError("PROFILE_ROUTE_UNVERIFIED") from None
+        if "challenge" in path or "checkpoint" in path:
+            raise UiReadError("CHALLENGE_REQUIRED")
+        if path in {"/login", "/accounts/login"}:
+            raise UiReadError("LOGIN_REQUIRED")
+        if any(marker in path for marker in ("rate_limit", "too_many_requests")):
+            raise UiReadError("RATE_LIMITED")
+        await self._check_blocker()
+        if not self._is_home_navigation_url(self._page.url):
+            raise UiReadError("PROFILE_ROUTE_UNVERIFIED")
+
+        controls = await self._visible_profile_controls()
+        if not controls:
+            raise UiReadError("LOGIN_REQUIRED")
+        await self._follow_profile_control(controls[0], return_home=False)
+
     async def _visible_profile_controls(self) -> list[Locator]:
         controls = await self._visible_navigation_controls("link")
         controls.extend(await self._visible_navigation_controls("button"))
@@ -612,7 +644,12 @@ class ThreadsHomeReader:
                     matches.append(label)
         return matches
 
-    async def _follow_profile_control(self, control: Locator) -> None:
+    async def _follow_profile_control(
+        self,
+        control: Locator,
+        *,
+        return_home: bool = True,
+    ) -> None:
         href = await control.get_attribute("href")
         destination = None if href is None else urljoin(self._page.url, href)
         if destination is not None and not _same_home_origin(destination):
@@ -654,7 +691,8 @@ class ThreadsHomeReader:
             verify_profile_navigation,
             recoverable_codes=("PROFILE_CLICK_NO_NAVIGATION",),
         )
-        await self._go_back_to_home()
+        if return_home:
+            await self._go_back_to_home()
 
     async def _verify_current_profile_route(self) -> None:
         await self._check_blocker()
@@ -668,6 +706,8 @@ class ThreadsHomeReader:
             raise UiReadError("CHALLENGE_REQUIRED")
         if path in {"/login", "/accounts/login"}:
             raise UiReadError("LOGIN_REQUIRED")
+        if any(marker in path for marker in ("rate_limit", "too_many_requests")):
+            raise UiReadError("RATE_LIMITED")
         actor = _profile_author(self._page.url)
         if actor is None:
             raise UiReadError("PROFILE_ROUTE_UNVERIFIED")

@@ -39,6 +39,33 @@ def test_account_cli_keeps_profile_reference_and_actor_out_of_output(
     assert "offline.operator" not in output
 
 
+def test_account_cli_create_profile_registers_a_new_directory(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    root = tmp_path / "private-root"
+    profile = tmp_path / "profiles" / "pilot"
+    monkeypatch.setenv("THREADS_BROWSER_DATA_ROOT", str(root))
+
+    result = main(
+        [
+            "account",
+            "add",
+            "pilot",
+            "--actor",
+            "@offline.operator",
+            "--profile-dir",
+            str(profile),
+            "--create-profile",
+        ]
+    )
+
+    assert result == 0
+    assert profile.is_dir()
+    assert capsys.readouterr().out == "ACCOUNT status=REGISTERED\n"
+
+
 def test_nurture_cli_requires_explicit_headed_mode(tmp_path: Path, monkeypatch, capsys) -> None:
     root = tmp_path / "private-root"
     profile = tmp_path / "existing-profile"

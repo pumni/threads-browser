@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import pytest
 
+from threads_browser import storage as storage_module
 from threads_browser.storage import (
     AccountStore,
     BrowserDataError,
@@ -95,6 +96,141 @@ def test_account_registration_rejects_invalid_alias_and_missing_profile(
         store.add("../private", "actor", tmp_path)
     assert invalid_alias.value.code == "ACCOUNT_INVALID"
 
+    with pytest.raises(BrowserDataError) as invalid_actor:
+        store.add("pilot", "not an actor", tmp_path)
+    assert invalid_actor.value.code == "ACCOUNT_INVALID"
+
     with pytest.raises(BrowserDataError) as missing_profile:
         store.add("pilot", "actor", tmp_path / "missing")
     assert missing_profile.value.code == "PROFILE_UNAVAILABLE"
+
+
+def test_account_registration_can_create_a_new_profile_and_preserves_schema(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "private-root"
+    profile = tmp_path / "profiles" / "pilot"
+    store = AccountStore(root)
+
+    account = store.add("pilot", "@Offline.Operator", profile, create_profile=True)
+
+    assert profile.is_dir()
+    assert account.profile_directory == profile.resolve()
+    document = json.loads((root / "accounts" / "pilot.json").read_text(encoding="utf-8"))
+    assert set(document) == {
+        "schema_version",
+        "account_id",
+        "alias",
+        "expected_actor",
+        "profile_directory",
+    }
+    assert store.get("pilot") == account
+
+
+def test_account_creation_does_not_overwrite_an_existing_profile(
+    tmp_path: Path,
+) -> None:
+    profile = tmp_path / "existing-profile"
+    profile.mkdir()
+    marker = profile / "keep.txt"
+    marker.write_text("leave this directory alone", encoding="utf-8")
+
+    with pytest.raises(BrowserDataError) as caught:
+        AccountStore(tmp_path / "root").add(
+            "pilot",
+            "actor",
+            profile,
+            create_profile=True,
+        )
+
+    assert caught.value.code == "PROFILE_EXISTS"
+    assert marker.read_text(encoding="utf-8") == "leave this directory alone"
+
+
+@pytest.mark.parametrize(
+    ("vendor", "browser"),
+    [("Google", "Chrome"), ("Microsoft", "Edge")],
+)
+def test_account_creation_rejects_default_desktop_browser_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    vendor: str,
+    browser: str,
+) -> None:
+    import os
+
+    if os.name != "nt":
+        pytest.skip("Windows desktop browser roots are platform-specific")
+    local_app_data = tmp_path / "LocalAppData"
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+    profile = local_app_data / vendor / browser / "User Data" / "automation"
+
+    with pytest.raises(BrowserDataError) as caught:
+        AccountStore(tmp_path / "root").add(
+            "pilot",
+            "actor",
+            profile,
+            create_profile=True,
+        )
+
+    assert caught.value.code == "PROFILE_UNAVAILABLE"
+    assert not profile.exists()
+
+
+def test_account_creation_rejects_parent_traversal_segments(tmp_path: Path) -> None:
+    profile = tmp_path / "profiles" / ".." / "traversed"
+
+    with pytest.raises(BrowserDataError) as caught:
+        AccountStore(tmp_path / "root").add(
+            "pilot",
+            "actor",
+            profile,
+            create_profile=True,
+        )
+
+    assert caught.value.code == "PROFILE_UNAVAILABLE"
+    assert not (tmp_path / "traversed").exists()
+
+
+def test_account_creation_rejects_symlinked_parent_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "linked-parent"
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        link.mkdir()
+        monkeypatch.setattr(
+            storage_module,
+            "_is_link_or_junction",
+            lambda path: path == link,
+        )
+
+    with pytest.raises(BrowserDataError) as caught:
+        AccountStore(tmp_path / "root").add(
+            "pilot",
+            "actor",
+            link / "pilot",
+            create_profile=True,
+        )
+
+    assert caught.value.code == "PROFILE_UNAVAILABLE"
+    assert not (target / "pilot").exists()
+    assert not (link / "pilot").exists()
+
+
+def test_duplicate_alias_does_not_create_another_profile(tmp_path: Path) -> None:
+    store = AccountStore(tmp_path / "root")
+    first_profile = tmp_path / "first"
+    first_profile.mkdir()
+    store.add("pilot", "actor", first_profile)
+    second_profile = tmp_path / "profiles" / "second"
+
+    with pytest.raises(BrowserDataError) as caught:
+        store.add("pilot", "other", second_profile, create_profile=True)
+
+    assert caught.value.code == "ACCOUNT_EXISTS"
+    assert not second_profile.exists()
