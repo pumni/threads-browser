@@ -32,6 +32,9 @@ _DETAIL_TIMEOUT_MS = 15_000
 _READINESS_TIMEOUT_MS = 8_000
 _AUTOMATIC_READINESS_WINDOWS = 2
 _READINESS_RECHECK_INTERVAL_MS = 200
+_SCROLL_ADVANCE_RATIO = 0.4
+_SCROLL_ADVANCE_MIN_PX = 64
+_SCROLL_ADVANCE_MAX_PX = 360
 _MAX_BODY_CODEPOINTS = 10_000
 _MAX_CARD_ANCESTORS = 8
 _MAX_CARD_LINKS = 40
@@ -132,6 +135,16 @@ class HomeSample:
     skipped_unverified: int = 0
 
 
+@dataclass(slots=True)
+class _FeedScanCounts:
+    visible_links: int = 0
+    inspected: int = 0
+    verified: int = 0
+    body_read: int = 0
+    body_unknown: int = 0
+    skipped: int = 0
+
+
 def normalize_text(value: str) -> str:
     return unicodedata.normalize("NFKC", value).casefold().strip()
 
@@ -212,6 +225,7 @@ class ThreadsHomeReader:
         self.scroll_attempts = 0
         self.scrolls = 0
         self.feed_duplicates = 0
+        self.last_scan_counts = _FeedScanCounts()
         self._skipped_candidate_identities: set[str] = set()
         self._reported_candidate_skips: dict[tuple[str, str], set[str]] = {}
 
@@ -595,62 +609,72 @@ class ThreadsHomeReader:
             timeout_code="HOME_SCROLL_SURFACE_UNVERIFIED",
         )
         surface = await self._scroll_surface()
+        witness: JSHandle | None = None
         try:
-            point = await self._safe_feed_scroll_point(surface)
-            initial_position = await surface.evaluate("element => element.scrollTop")
-            await self._page.mouse.move(*point)
-            self.scroll_attempts += 1
-            await self._page.mouse.wheel(0, 850)
-        except PlaywrightError:
-            print(f"SCROLL attempt={self.scroll_attempts} observed=0")
-            await surface.dispose()
-            raise UiReadError("HOME_SCROLL_FAILED") from None
-        except BaseException:
-            await surface.dispose()
-            raise
-
-        async def observe_scroll(window_deadline: float) -> bool:
-            while True:
-                self._remaining_readiness_ms(
-                    window_deadline,
-                    "HOME_SCROLL_UNVERIFIED",
+            try:
+                point, wheel_delta, viewport_height = (
+                    await self._safe_feed_scroll_point(surface)
                 )
+                initial_position = await surface.evaluate("element => element.scrollTop")
+                witness = await self._watch_scroll_completion(
+                    surface,
+                    initial_position,
+                )
+                await self._page.mouse.move(*point)
+                self.scroll_attempts += 1
+                await self._page.mouse.wheel(0, wheel_delta)
+            except PlaywrightError:
+                print(f"SCROLL attempt={self.scroll_attempts} observed=0")
+                raise UiReadError("HOME_SCROLL_FAILED") from None
+
+            async def observe_scroll(window_deadline: float) -> float:
+                if witness is None:
+                    raise UiReadError("HOME_SCROLL_UNVERIFIED")
+                observed_delta = await self._wait_for_scroll_movement(
+                    witness,
+                    window_deadline,
+                )
+                if observed_delta is None:
+                    raise UiReadError("HOME_SCROLL_UNVERIFIED")
+                if observed_delta > viewport_height * 0.5 + 1:
+                    raise UiReadError("HOME_SCROLL_ADVANCE_OVERSIZED")
                 await self._wait_for_verified_feed(
                     window_deadline,
                     timeout_code="HOME_SCROLL_UNVERIFIED",
                 )
-                if await self._wait_for_scroll_movement(
-                    surface,
-                    initial_position,
-                    window_deadline,
-                ):
-                    await self._wait_for_verified_feed(
-                        window_deadline,
-                        timeout_code="HOME_SCROLL_UNVERIFIED",
-                    )
-                    return True
-                await self._wait_for_pending_card(
-                    _CardNotReady(
-                        self._page.locator("body"),
-                        condition="mutation",
-                    ),
-                    window_deadline,
-                )
+                return observed_delta
 
-        try:
-            await self._recoverable_stage(
-                "HOME_SCROLL",
-                "HOME_SCROLL_UNVERIFIED",
-                observe_scroll,
+            try:
+                observed_delta = await self._recoverable_stage(
+                    "HOME_SCROLL",
+                    "HOME_SCROLL_UNVERIFIED",
+                    observe_scroll,
+                )
+            except UiReadError:
+                print(f"SCROLL attempt={self.scroll_attempts} observed=0")
+                raise
+            self.scrolls += 1
+            delta_ratio = observed_delta / viewport_height
+            delta_band = (
+                "SMALL"
+                if delta_ratio <= 0.5
+                else "MEDIUM"
+                if delta_ratio <= 0.75
+                else "LARGE"
             )
-        except UiReadError:
-            print(f"SCROLL attempt={self.scroll_attempts} observed=0")
-            raise
+            print(
+                f"SCROLL attempt={self.scroll_attempts} observed=1 "
+                f"delta_band={delta_band}"
+            )
+            return True
         finally:
+            if witness is not None:
+                try:
+                    await witness.evaluate("state => state.cancel()")
+                except PlaywrightError:
+                    pass
+                await witness.dispose()
             await surface.dispose()
-        self.scrolls += 1
-        print(f"SCROLL attempt={self.scroll_attempts} observed=1")
-        return True
 
     async def sample_and_scroll(self, max_posts: int) -> HomeSample:
         """Compatibility helper for callers that need a before/after sample."""
@@ -748,6 +772,7 @@ class ThreadsHomeReader:
                     window_deadline,
                     timeout_code=timeout_code,
                 )
+                self.last_scan_counts = _FeedScanCounts()
                 try:
                     targets, scroll_anchor = await self._visible_targets(
                         max_posts,
@@ -924,7 +949,28 @@ class ThreadsHomeReader:
                 return True
         return False
 
-    async def _safe_feed_scroll_point(self, surface: JSHandle) -> tuple[float, float]:
+    async def _count_visible_permalink_links(self) -> int:
+        viewport = self._page.viewport_size
+        if viewport is None:
+            return 0
+        region = await self._content_region()
+        permalinks = region.locator('a[href*="/post/"]')
+        count = 0
+        for index in range(min(await permalinks.count(), _MAX_PERMALINK_CANDIDATES)):
+            permalink = permalinks.nth(index)
+            if not await permalink.is_visible():
+                continue
+            if await self._is_outside_content_landmark(permalink):
+                continue
+            box = await permalink.bounding_box()
+            if box is not None and self._intersects_viewport(box, viewport):
+                count += 1
+        return count
+
+    async def _safe_feed_scroll_point(
+        self,
+        surface: JSHandle,
+    ) -> tuple[tuple[float, float], int, float]:
         viewport = self._page.viewport_size
         if viewport is None:
             raise UiReadError("FEED_VIEWPORT_UNVERIFIED")
@@ -942,6 +988,14 @@ class ThreadsHomeReader:
         bottom = min(float(viewport["height"]), box["y"] + box["height"])
         if left >= right or top >= bottom:
             raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
+        visible_height = bottom - top
+        if visible_height < 2:
+            raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
+        advance = min(
+            _SCROLL_ADVANCE_MAX_PX,
+            max(_SCROLL_ADVANCE_MIN_PX, round(visible_height * _SCROLL_ADVANCE_RATIO)),
+            max(1, int(visible_height * 0.5)),
+        )
         xs = (left + (right - left) * 0.55, left + (right - left) * 0.75)
         ys = (
             top + (bottom - top) * 0.4,
@@ -968,7 +1022,7 @@ class ThreadsHomeReader:
                     {"x": x, "y": y},
                 )
                 if safe:
-                    return x, y
+                    return (x, y), advance, visible_height
         raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
 
     async def _scroll_surface(self) -> JSHandle:
@@ -1033,27 +1087,72 @@ class ThreadsHomeReader:
             raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
         return surface
 
-    async def _wait_for_scroll_movement(
+    async def _watch_scroll_completion(
         self,
         surface: JSHandle,
         initial_position: float,
+    ) -> JSHandle:
+        return await self._page.evaluate_handle(
+            """([element, initialPosition]) => {
+                const eventTarget = element === document.scrollingElement
+                    ? document : element;
+                const supportsScrollEnd = "onscrollend" in eventTarget;
+                const state = {done: false, delta: 0, cancel: () => {}};
+                let active = true;
+                let frameOne = 0;
+                let frameTwo = 0;
+                const cleanup = () => {
+                    element.removeEventListener("scroll", onScroll);
+                    eventTarget.removeEventListener("scrollend", finish);
+                    if (frameOne) cancelAnimationFrame(frameOne);
+                    if (frameTwo) cancelAnimationFrame(frameTwo);
+                };
+                const finish = () => {
+                    if (!active) return;
+                    state.delta = Math.abs(element.scrollTop - initialPosition);
+                    state.done = true;
+                    active = false;
+                    cleanup();
+                };
+                const onScroll = () => {
+                    if (supportsScrollEnd) return;
+                    if (frameOne) cancelAnimationFrame(frameOne);
+                    if (frameTwo) cancelAnimationFrame(frameTwo);
+                    frameOne = requestAnimationFrame(() => {
+                        frameTwo = requestAnimationFrame(finish);
+                    });
+                };
+                state.cancel = () => {
+                    active = false;
+                    cleanup();
+                };
+                element.addEventListener("scroll", onScroll, {passive: true});
+                eventTarget.addEventListener("scrollend", finish, {once: true});
+                return state;
+            }""",
+            arg=[surface, initial_position],
+        )
+
+    async def _wait_for_scroll_movement(
+        self,
+        witness: JSHandle,
         deadline: float,
-    ) -> bool:
+    ) -> float | None:
         result = None
         try:
             result = await self._page.wait_for_function(
-                "([element, initialPosition]) => element !== null && "
-                "element.isConnected && Math.abs(element.scrollTop - initialPosition) > 1",
-                arg=[surface, initial_position],
-                timeout=min(
-                    self._remaining_readiness_ms(deadline, "HOME_SCROLL_UNVERIFIED"),
-                    _READINESS_RECHECK_INTERVAL_MS,
+                "state => state.done && state.delta > 1 ? state.delta : false",
+                arg=witness,
+                timeout=self._remaining_readiness_ms(
+                    deadline,
+                    "HOME_SCROLL_UNVERIFIED",
                 ),
                 polling="raf",
             )
-            return bool(await result.json_value())
+            delta = await result.json_value()
+            return None if delta is False or delta is None else float(delta)
         except PlaywrightTimeoutError:
-            return False
+            return None
         except PlaywrightError:
             raise UiReadError("HOME_SCROLL_UNVERIFIED") from None
         finally:
@@ -1078,6 +1177,7 @@ class ThreadsHomeReader:
         targets: list[PostTarget] = []
         scroll_anchor: dict[str, float] | None = None
         article_count = await articles.count()
+        self.last_scan_counts.visible_links = await self._count_visible_permalink_links()
         if article_count == 0:
             return await self._visible_permalink_targets(
                 max_posts,
@@ -1118,6 +1218,7 @@ class ThreadsHomeReader:
                         break
                 if permalink_count and not visible_permalink:
                     continue
+            self.last_scan_counts.inspected += 1
             try:
                 target = await self._read_card(
                     article,
@@ -1128,6 +1229,7 @@ class ThreadsHomeReader:
                 pending_cards.append(pending)
                 continue
             except _UnverifiedFeedCandidate as error:
+                self.last_scan_counts.skipped += 1
                 self._record_skipped_candidate(stage, error)
                 continue
             if currently_visible:
@@ -1137,6 +1239,11 @@ class ThreadsHomeReader:
                     or not self._intersects_viewport(permalink_box, viewport)
                 ):
                     continue
+            self.last_scan_counts.verified += 1
+            if target.body and target.body.strip():
+                self.last_scan_counts.body_read += 1
+            else:
+                self.last_scan_counts.body_unknown += 1
             if (
                 target.fingerprint in scanned_fingerprints
                 or (
@@ -1152,7 +1259,11 @@ class ThreadsHomeReader:
                 scroll_anchor = box
             if len(targets) >= max_posts:
                 break
-        if not targets and pending_cards:
+        if (
+            not targets
+            and pending_cards
+            and self.last_scan_counts.skipped == 0
+        ):
             raise _CardNotReady.combine(pending_cards)
         return tuple(targets), scroll_anchor
 
@@ -1342,10 +1453,12 @@ class ThreadsHomeReader:
             permalink_box = await permalink.bounding_box()
             if permalink_box is None or not self._intersects_viewport(permalink_box, viewport):
                 continue
+            self.last_scan_counts.inspected += 1
             href = await permalink.get_attribute("href")
             parsed_post = None if href is None else _post_url(href)
             if parsed_post is None:
                 if href is not None and "/post/" in href:
+                    self.last_scan_counts.skipped += 1
                     self._record_skipped_candidate(
                         stage,
                         _UnverifiedFeedCandidate(
@@ -1376,9 +1489,11 @@ class ThreadsHomeReader:
                 pending_cards.append(pending)
                 continue
             except _UnverifiedFeedCandidate as error:
+                self.last_scan_counts.skipped += 1
                 self._record_skipped_candidate(stage, error)
                 continue
             if target.url != parsed_post[0] or target.author != parsed_post[1]:
+                self.last_scan_counts.skipped += 1
                 self._record_skipped_candidate(
                     stage,
                     _UnverifiedFeedCandidate(
@@ -1388,6 +1503,11 @@ class ThreadsHomeReader:
                     ),
                 )
                 continue
+            self.last_scan_counts.verified += 1
+            if target.body and target.body.strip():
+                self.last_scan_counts.body_read += 1
+            else:
+                self.last_scan_counts.body_unknown += 1
             if (
                 target.fingerprint in scanned_fingerprints
                 or (
@@ -1405,7 +1525,11 @@ class ThreadsHomeReader:
             if len(scanned_fingerprints) >= max_posts:
                 break
 
-        if not targets_by_url and pending_cards:
+        if (
+            not targets_by_url
+            and pending_cards
+            and self.last_scan_counts.skipped == 0
+        ):
             raise _CardNotReady.combine(pending_cards)
         targets = [
             target
@@ -1817,6 +1941,7 @@ class ThreadsHomeReader:
                 nonempty_text=True,
                 timeout_code="DETAIL_BODY_UNVERIFIED",
             )
+        # Multiple paragraphs may include quoted or reposted text; keep them UNKNOWN.
         fingerprint = sha256(f"{url}\n{author}".encode()).hexdigest()
         return PostTarget(
             url,

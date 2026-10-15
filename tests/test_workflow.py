@@ -1647,7 +1647,8 @@ window.addEventListener("wheel", event => {{
   event.preventDefault();
   const count = Number(sessionStorage.getItem("wheel-count") || "0") + 1;
   sessionStorage.setItem("wheel-count", String(count));
-  window.scrollBy(0, 560);
+  sessionStorage.setItem("wheel-delta", String(event.deltaY));
+  window.scrollBy(0, event.deltaY);
 }}, {{ passive: false }});
 </script></body></html>"""
     detail_html = f"""<!doctype html><html><body><main><article>
@@ -1699,6 +1700,86 @@ window.addEventListener("wheel", event => {{
     assert checkpoint.scroll_attempts == checkpoint.scrolls == 2
 
 
+def test_overlapping_wheel_finds_intermediate_relevant_post(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    detail_url = "https://www.threads.com/@candidate/post/intermediate"
+    detail_body = "Hiring an engineer for the infrastructure team"
+    feed_html = f"""<!doctype html><html><head><style>
+article {{ box-sizing: border-box; padding-top: 60px; }}
+article:first-of-type, article:last-of-type {{ height: 800px; }}
+article:nth-of-type(2) {{ height: 180px; padding-top: 0; }}
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main>
+<article><a href="/@candidate/post/first"><time>3h</time></a>
+  <a href="/@candidate">@candidate</a><p>A weather update</p></article>
+<article><a href="/@candidate/post/intermediate"><time>2h</time></a>
+  <a href="/@candidate">@candidate</a><p>{detail_body}</p></article>
+<article><a href="/@candidate/post/last"><time>1h</time></a>
+  <a href="/@candidate">@candidate</a><p>A local event</p></article>
+</main><script>
+window.addEventListener("wheel", event => {{
+  event.preventDefault();
+  sessionStorage.setItem("wheel-delta", String(event.deltaY));
+  window.scrollBy(0, event.deltaY);
+}}, {{ passive: false }});
+</script></body></html>"""
+    detail_html = f"""<!doctype html><html><body><article>
+<a href="/@candidate/post/intermediate"><time>2h</time></a>
+<a href="/@candidate">@candidate</a><p>{detail_body}</p>
+</article></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+
+    async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=detail_html,
+            )
+
+        await page.route(detail_url, serve_detail)
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=1,
+            max_scrolls=1,
+            max_total_posts=10,
+            terms=("hiring", "engineer"),
+        )
+        assert result.status == "COMPLETE"
+        assert result.home_sampled == 2
+        assert result.home_irrelevant == result.home_relevant == 1
+        assert result.detail_reads == 1
+        assert result.scroll_attempts == result.scrolls == 1
+        assert float(await page.evaluate("sessionStorage.getItem('wheel-delta')")) < 360
+
+    _run_offline_page(feed_html, exercise)
+    output = capsys.readouterr().out
+    assert "delta_band=SMALL" in output
+    assert "body_read=1 body_unknown=0 classified=1" in output
+    assert "STOP" not in output
+    assert detail_body not in output
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring", "engineer"))),
+    )
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.home_sampled == 2
+    assert checkpoint.detail_reads == 1
+    assert checkpoint.scroll_attempts == checkpoint.scrolls == 1
+
+
 def test_noncanonical_first_viewport_can_advance_to_verified_relevant_post(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1726,7 +1807,8 @@ window.addEventListener("wheel", event => {{
   event.preventDefault();
   const count = Number(sessionStorage.getItem("wheel-count") || "0") + 1;
   sessionStorage.setItem("wheel-count", String(count));
-  window.scrollBy(0, 560);
+  sessionStorage.setItem("wheel-delta", String(event.deltaY));
+  window.scrollBy(0, event.deltaY);
 }}, {{ passive: false }});
 </script></body></html>"""
     detail_html = f"""<!doctype html><html><body><main><article>
@@ -1764,11 +1846,16 @@ window.addEventListener("wheel", event => {{
         assert result.scroll_attempts == result.scrolls == 1
         assert result.detail_reads == 1
         assert await page.evaluate("sessionStorage.getItem('wheel-count')") == "1"
+        assert float(await page.evaluate("sessionStorage.getItem('wheel-delta')")) < 360
 
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
     assert "SKIPPED stage=FEED_INITIAL reason=CANDIDATE_NONCANONICAL count=2" in output
-    assert "SCANNING viewport=1 verified=0 relevant=0 skipped=2" in output
+    assert (
+        "SCANNING viewport=1 verified=0 relevant=0 skipped=2 visible_links=2 "
+        "inspected=2 body_read=0 body_unknown=0 classified=0"
+    ) in output
+    assert "STOP stage=FEED_SCROLL" not in output
     assert all(value not in output for value in (*invalid_urls, "Hiring content must be skipped"))
     checkpoint = store.load(
         account.account_id,
@@ -1776,6 +1863,71 @@ window.addEventListener("wheel", event => {{
     )
     assert checkpoint.home_sampled == 1
     assert checkpoint.home_relevant == 1
+
+
+def test_verified_multiline_body_stays_unknown_without_private_text_logging(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    first_paragraph = "Hiring for a confidential engineering role"
+    quoted_paragraph = "Quoted context mentions a separate hiring plan"
+    feed_html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main><article>
+  <a href="/@candidate/post/multiline"><time>1h</time></a>
+  <a href="/@candidate">@candidate</a>
+  <p>{first_paragraph}</p><blockquote><p>{quoted_paragraph}</p></blockquote>
+</article></main></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+
+    async def exercise(page) -> None:
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=1,
+            max_scrolls=0,
+            max_total_posts=10,
+            terms=("hiring",),
+        )
+        assert result.status == "VERIFIED_BUT_UNKNOWN_BODY"
+        assert result.home_sampled == 1
+        assert result.home_relevant == result.home_irrelevant == 0
+        assert result.home_unknown == 1
+        assert result.detail_reads == 0
+        assert result.checkpoint_runs == 1
+
+    _run_offline_page(feed_html, exercise)
+    output = capsys.readouterr().out
+    assert (
+        "SCANNING viewport=1 verified=1 relevant=0 skipped=0 visible_links=1 "
+        "inspected=1 body_read=0 body_unknown=1 classified=1 "
+        "irrelevant=0 unknown=1"
+    ) in output
+    assert first_paragraph not in output
+    assert quoted_paragraph not in output
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.home_unknown == 1
+    persisted = (
+        data_root
+        / "nurture"
+        / "checkpoints"
+        / f"{account.account_id}-{checkpoint.policy_fingerprint}.json"
+    ).read_text(encoding="utf-8")
+    assert first_paragraph not in persisted
+    assert quoted_paragraph not in persisted
+    assert "@candidate/post/multiline" not in persisted
 
 
 def test_irrelevant_posts_exhaust_scroll_budget_as_completed_read_only_search(
@@ -1801,7 +1953,7 @@ window.addEventListener("wheel", event => {{
   event.preventDefault();
   const count = Number(sessionStorage.getItem("wheel-count") || "0") + 1;
   sessionStorage.setItem("wheel-count", String(count));
-  window.scrollBy(0, 560);
+  window.scrollBy(0, event.deltaY);
 }}, {{ passive: false }});
 </script></body></html>"""
     data_root = tmp_path / "data"
@@ -1820,7 +1972,7 @@ window.addEventListener("wheel", event => {{
             max_total_posts=20,
             terms=("hiring",),
         )
-        assert result.status == "NO_RELEVANT_POST_IN_BUDGET"
+        assert result.status == "VERIFIED_IRRELEVANT"
         assert result.home_sampled == 3
         assert result.home_irrelevant == 3
         assert result.home_unknown == 0
@@ -1862,7 +2014,7 @@ window.addEventListener("wheel", event => {{
   event.preventDefault();
   const count = Number(sessionStorage.getItem("wheel-count") || "0") + 1;
   sessionStorage.setItem("wheel-count", String(count));
-  window.scrollBy(0, 560);
+  window.scrollBy(0, event.deltaY);
 }}, {{ passive: false }});
 </script></body></html>"""
     zero_verified_html = f"""<!doctype html><html><head><style>
@@ -1880,7 +2032,7 @@ window.addEventListener("wheel", event => {{
   event.preventDefault();
   const count = Number(sessionStorage.getItem("wheel-count") || "0") + 1;
   sessionStorage.setItem("wheel-count", String(count));
-  window.scrollBy(0, 560);
+  window.scrollBy(0, event.deltaY);
 }}, {{ passive: false }});
 </script></body></html>"""
     valid_root = tmp_path / "valid"
@@ -1903,7 +2055,7 @@ window.addEventListener("wheel", event => {{
             max_total_posts=2,
             terms=("hiring",),
         )
-        assert result.status == "NO_RELEVANT_POST_IN_BUDGET"
+        assert result.status == "VERIFIED_IRRELEVANT"
         assert result.home_sampled == 2
         assert result.scroll_attempts == result.scrolls == 1
         assert result.checkpoint_runs == 1

@@ -101,14 +101,17 @@ async def run_page_workflow(
             scanned_fingerprints=seen_this_run,
         )
         duplicates += reader.feed_duplicates - duplicate_count_before_scan
-        viewport_verified = 0
         viewport_relevant = 0
+        viewport_irrelevant = 0
+        viewport_unknown = 0
+        viewport_classified = 0
         viewport_selected = None
+        scan_counts = reader.last_scan_counts
         for target in targets:
             if target.fingerprint in seen_this_run:
                 continue
             seen_this_run.add(target.fingerprint)
-            viewport_verified += 1
+            viewport_classified += 1
             is_new = target.fingerprint not in previously_seen
             if is_new:
                 new_fingerprints.add(target.fingerprint)
@@ -129,11 +132,19 @@ async def run_page_workflow(
                     viewport_selected = target
             elif decision == "IRRELEVANT":
                 irrelevant += 1
+                viewport_irrelevant += 1
             else:
                 unknown += 1
+                viewport_unknown += 1
         print(
-            f"SCANNING viewport={viewport_number} verified={viewport_verified} "
-            f"relevant={viewport_relevant} skipped={reader.skipped_unverified}"
+            f"SCANNING viewport={viewport_number} verified={scan_counts.verified} "
+            f"relevant={viewport_relevant} skipped={scan_counts.skipped} "
+            f"visible_links={scan_counts.visible_links} "
+            f"inspected={scan_counts.inspected} "
+            f"body_read={scan_counts.body_read} "
+            f"body_unknown={scan_counts.body_unknown} "
+            f"classified={viewport_classified} "
+            f"irrelevant={viewport_irrelevant} unknown={viewport_unknown}"
         )
         if viewport_selected is not None:
             selected = viewport_selected
@@ -179,6 +190,10 @@ async def run_page_workflow(
         status = "RELEVANT_POST_NOT_CURRENT"
     elif found_relevant or relevant:
         status = "NO_NEW_RELEVANT_POST"
+    elif unknown:
+        status = "VERIFIED_BUT_UNKNOWN_BODY"
+    elif irrelevant:
+        status = "VERIFIED_IRRELEVANT"
     else:
         status = "NO_RELEVANT_POST_IN_BUDGET"
 
