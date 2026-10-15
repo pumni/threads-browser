@@ -1,4 +1,4 @@
-"""Command line entry point."""
+"""Short command line entry point for the local Browser services."""
 
 from __future__ import annotations
 
@@ -14,74 +14,113 @@ from .storage import (
     AccountStore,
     BrowserDataError,
     CheckpointStore,
+    TermsStore,
     profile_lock,
     resolve_data_root,
 )
 
 
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m threads_browser.cli")
-    commands = parser.add_subparsers(dest="command", required=True)
-    account = commands.add_parser("account", help="register and maintain local accounts")
-    account_commands = account.add_subparsers(dest="account_command", required=True)
-    add = account_commands.add_parser("add", help="create a local account or register a profile")
-    add.add_argument("alias")
-    add.add_argument("--actor", help="expected visible Threads actor for an existing profile")
-    add.add_argument("--profile-dir", type=Path)
-    add.add_argument(
+def _add_legacy_registration_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--actor", help="expected visible Threads actor for an existing profile")
+    parser.add_argument("--profile-dir", type=Path)
+    parser.add_argument(
         "--create-profile",
         action="store_true",
         help="create the absent dedicated Chromium profile directory",
     )
-    login = account_commands.add_parser(
-        "login",
-        help="open the account's persistent Chromium profile",
-    )
-    login.add_argument("alias")
-    login.add_argument(
+
+
+def _add_run_options(parser: argparse.ArgumentParser, *, legacy: bool) -> None:
+    parser.add_argument(
         "--headed",
         action="store_true",
-        help="accepted for compatibility; login is always visible",
+        help="accepted for compatibility; Chromium is always visible",
     )
-    nurture = commands.add_parser("nurture", help="run a bounded read-only workflow")
-    nurture_commands = nurture.add_subparsers(dest="nurture_command", required=True)
-    run = nurture_commands.add_parser("run", help="search Home / For You within bounded budgets")
-    run.add_argument("alias")
-    run.add_argument("--headed", action="store_true", help="confirm headed one-shot operation")
-    run.add_argument(
+    parser.add_argument(
         "--show-post-text",
         action="store_true",
         help="print verified extracted post text to an interactive terminal",
     )
-    run.add_argument(
+    parser.add_argument(
         "--show-observed-text",
         action="store_true",
         help="print identity-unverified observed text to an interactive terminal",
     )
-    run.add_argument(
+    parser.add_argument(
         "--max-posts",
-        required=True,
+        required=legacy,
         type=int,
-        help="maximum visible post rows to account for per viewport (1-20)",
+        default=None if legacy else 20,
+        help="maximum visible post rows per viewport (1-20; default: 20)",
     )
-    run.add_argument(
+    parser.add_argument(
         "--max-scrolls",
         type=int,
         default=8,
         help="maximum observed read-only feed advances (0-20; default: 8)",
     )
-    run.add_argument(
+    parser.add_argument(
         "--max-total-posts",
         type=int,
         default=40,
         help="maximum distinct verified posts per run (1-400; default: 40)",
     )
-    run.add_argument(
+    parser.add_argument(
+        "-t",
         "--term",
         action="append",
-        required=True,
-        help="local relevance term; repeat for more terms",
+        dest="terms",
+        required=legacy,
+        help="one-time local relevance term; repeat for more terms",
     )
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="tb")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    add = commands.add_parser("add", help="create a local account")
+    add.add_argument("alias")
+    _add_legacy_registration_options(add)
+
+    login = commands.add_parser("login", help="open an account's persistent Chromium profile")
+    login.add_argument("alias")
+
+    commands.add_parser("ls", help="list local account aliases and verification status")
+
+    terms = commands.add_parser("terms", help="view or replace an account's nurture terms")
+    terms.add_argument("alias")
+    terms.add_argument("terms", nargs="*", help="replacement relevance terms")
+    terms.add_argument("--clear", action="store_true", help="clear saved relevance terms")
+
+    run = commands.add_parser("run", help="run bounded, read-only nurture")
+    run.add_argument("alias")
+    _add_run_options(run, legacy=False)
+
+    account = commands.add_parser("account", help="legacy account management commands")
+    account_commands = account.add_subparsers(dest="account_command", required=True)
+    legacy_add = account_commands.add_parser(
+        "add", help="create a local account or register a dedicated profile"
+    )
+    legacy_add.add_argument("alias")
+    _add_legacy_registration_options(legacy_add)
+    legacy_login = account_commands.add_parser(
+        "login", help="open the account's persistent Chromium profile"
+    )
+    legacy_login.add_argument("alias")
+    legacy_login.add_argument(
+        "--headed",
+        action="store_true",
+        help="accepted for compatibility; login is always visible",
+    )
+
+    nurture = commands.add_parser("nurture", help="legacy bounded nurture command")
+    nurture_commands = nurture.add_subparsers(dest="nurture_command", required=True)
+    legacy_run = nurture_commands.add_parser(
+        "run", help="search Home / For You within bounded budgets"
+    )
+    legacy_run.add_argument("alias")
+    _add_run_options(legacy_run, legacy=True)
     return parser
 
 
@@ -144,7 +183,7 @@ async def _prompt_readiness_extension(stage: str, retry: int) -> bool:
             answer = await asyncio.to_thread(
                 input,
                 f"Stage {stage} is still waiting (retry={retry}). "
-                "Enter to wait again, q to stop safely: "
+                "Enter to wait again, q to stop safely: ",
             )
         except EOFError:
             return False
@@ -155,38 +194,56 @@ async def _prompt_readiness_extension(stage: str, retry: int) -> bool:
         print("Enter to wait again, q to stop safely.")
 
 
+def _run_diagnostics_check(args: argparse.Namespace) -> bool:
+    if not (args.show_post_text or args.show_observed_text):
+        return True
+    if not _has_interactive_terminal():
+        error = "OBSERVED_TEXT_TTY_REQUIRED" if args.show_observed_text else "POST_TEXT_TTY_REQUIRED"
+        print(f"ERROR {error}", file=sys.stderr)
+        return False
+    if args.show_post_text:
+        print(
+            "WARNING POST_TEXT_LOCAL_ONLY terminal scrollback may retain content; "
+            "do not paste preview text into PRs or chats.",
+            file=sys.stderr,
+        )
+    if args.show_observed_text:
+        print(
+            "WARNING OBSERVED_TEXT_LOCAL_ONLY identity is unverified and terminal "
+            "scrollback may retain content; do not paste preview text into PRs or chats.",
+            file=sys.stderr,
+        )
+    return True
+
+
+def _is_login(args: argparse.Namespace) -> bool:
+    return args.command == "login" or (
+        args.command == "account" and args.account_command == "login"
+    )
+
+
+def _is_add(args: argparse.Namespace) -> bool:
+    return args.command == "add" or (
+        args.command == "account" and args.account_command == "add"
+    )
+
+
+def _is_run(args: argparse.Namespace) -> bool:
+    return args.command == "run" or (
+        args.command == "nurture" and args.nurture_command == "run"
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
-    if (
-        args.command == "nurture"
-        and args.nurture_command == "run"
-        and (args.show_post_text or args.show_observed_text)
-    ):
-        if not _has_interactive_terminal():
-            error = (
-                "OBSERVED_TEXT_TTY_REQUIRED"
-                if args.show_observed_text
-                else "POST_TEXT_TTY_REQUIRED"
-            )
-            print(f"ERROR {error}", file=sys.stderr)
-            return 1
-        if args.show_post_text:
-            print(
-                "WARNING POST_TEXT_LOCAL_ONLY terminal scrollback may retain content; "
-                "do not paste preview text into PRs or chats.",
-                file=sys.stderr,
-            )
-        if args.show_observed_text:
-            print(
-                "WARNING OBSERVED_TEXT_LOCAL_ONLY identity is unverified and terminal "
-                "scrollback may retain content; do not paste preview text into PRs or chats.",
-                file=sys.stderr,
-            )
+    if _is_run(args) and not _run_diagnostics_check(args):
+        return 1
+
     try:
         data_root = resolve_data_root()
         accounts = AccountStore(data_root)
-        if args.command == "account" and args.account_command == "add":
+        if _is_add(args):
             if args.actor is None and args.profile_dir is None:
                 add_local_account(args.alias, data_root=data_root)
             else:
@@ -198,7 +255,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             print("ACCOUNT status=REGISTERED")
             return 0
-        if args.command == "account" and args.account_command == "login":
+
+        if _is_login(args):
             from .reader import UiReadError
 
             try:
@@ -216,8 +274,45 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print("LOGIN status=CANCELLED")
                 return 1
             return 0
-        if args.command == "nurture" and args.nurture_command == "run":
-            if not args.headed:
+
+        if args.command == "ls":
+            listed_accounts = accounts.list()
+            if not listed_accounts:
+                print("No local accounts.")
+            for account in listed_accounts:
+                verification = "VERIFIED" if account.expected_actor is not None else "UNVERIFIED"
+                print(f"{account.alias} {verification}")
+            return 0
+
+        if args.command == "terms":
+            account = accounts.get(args.alias)
+            terms_store = TermsStore(data_root)
+            if args.clear and args.terms:
+                print("ERROR TERMS_ARGUMENTS_INVALID", file=sys.stderr)
+                return 1
+            if args.clear:
+                terms_store.clear(account.alias)
+                print("TERMS status=CLEARED")
+            elif args.terms:
+                try:
+                    configured = terms_store.set(account.alias, tuple(args.terms))
+                except BrowserDataError as error:
+                    if error.code != "TERMS_INVALID":
+                        raise
+                    print("ERROR TERMS_INVALID", file=sys.stderr)
+                    return 1
+                print(f"TERMS status=SAVED count={len(configured)}")
+            else:
+                configured = terms_store.get(account.alias)
+                if not configured:
+                    print("TERMS status=NOT_CONFIGURED")
+                else:
+                    print("\n".join(configured))
+            return 0
+
+        if _is_run(args):
+            legacy = args.command == "nurture"
+            if legacy and not args.headed:
                 print("ERROR HEADED_REQUIRED", file=sys.stderr)
                 return 1
             if not 1 <= args.max_posts <= 20:
@@ -229,9 +324,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not 1 <= args.max_total_posts <= 400:
                 print("ERROR TOTAL_SCAN_LIMIT_INVALID", file=sys.stderr)
                 return 1
+
             account = accounts.get(args.alias)
             if account.expected_actor is None:
                 print("ERROR ACCOUNT_NOT_VERIFIED", file=sys.stderr)
+                return 1
+            if args.terms:
+                terms = tuple(args.terms)
+            else:
+                terms = TermsStore(data_root).get(account.alias)
+            if not terms:
+                print("ERROR TERMS_NOT_CONFIGURED", file=sys.stderr)
+                print(
+                    f'Configure terms with: tb terms {account.alias} "hiring"',
+                    file=sys.stderr,
+                )
                 return 1
             lock = profile_lock(data_root, account)
             with lock:
@@ -244,7 +351,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             account,
                             CheckpointStore(data_root),
                             max_posts=args.max_posts,
-                            terms=tuple(args.term),
+                            terms=terms,
                             max_scrolls=args.max_scrolls,
                             max_total_posts=args.max_total_posts,
                             show_post_text=args.show_post_text,
@@ -258,9 +365,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                 except UiReadError as error:
                     print(f"STOP {error.code}", file=sys.stderr)
+                    if error.code == "LOGIN_REQUIRED":
+                        print(f"Run 'tb login {account.alias}' to authenticate.", file=sys.stderr)
                     return 1
-                print(_format_result(result))
-                return 0
+            print(_format_result(result))
+            return 0
     except BrowserDataError as error:
         print(f"ERROR {error.code}", file=sys.stderr)
         return 1

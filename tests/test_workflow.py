@@ -203,15 +203,13 @@ def test_offline_chromium_cli_reads_once_and_resumes_without_double_counting(
         lambda: _offline_playwright_manager(respond),
     )
     command = [
-        "nurture",
         "run",
         "offline",
-        "--headed",
         "--max-posts",
         "2",
-        "--term",
+        "-t",
         "hiring",
-        "--term",
+        "-t",
         "engineer",
     ]
 

@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
+import sys
 import threading
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
 from threads_browser import cli, workflow
 from threads_browser.cli import main
+from threads_browser.reader import UiReadError
+from threads_browser.storage import AccountStore, TermsStore, profile_lock
 
 
 def test_account_cli_keeps_profile_reference_and_actor_out_of_output(
@@ -391,3 +396,213 @@ def test_attended_readiness_prompt_keeps_async_loop_responsive(monkeypatch) -> N
         assert await cli._prompt_readiness_extension("DETAIL", 4) is False
 
     asyncio.run(exercise())
+
+
+def _verified_local_account(data_root: Path, alias: str = "local1"):
+    accounts = AccountStore(data_root)
+    account = accounts.add(alias)
+    accounts.bind_actor(account, "offline.operator")
+    return accounts.get(alias)
+
+
+def _fake_nurture_result():
+    return SimpleNamespace(
+        status="NO_VERIFIED_POSTS_IN_BUDGET",
+        ui_status="UNVERIFIED_LIVE_UI",
+        home_sampled=0,
+        home_new=0,
+        home_relevant=0,
+        home_irrelevant=0,
+        home_unknown=0,
+        home_relevant_ratio=None,
+        duplicates=0,
+        detail_reads=0,
+        scroll_attempts=0,
+        scrolls=0,
+        skipped_unverified=0,
+        checkpoint_runs=0,
+    )
+
+
+def test_project_registers_only_the_short_tb_script() -> None:
+    project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]
+    assert project["scripts"] == {"tb": "threads_browser.cli:main"}
+
+
+def test_module_runner_keeps_legacy_command_tree_available() -> None:
+    completed = subprocess.run(
+        [sys.executable, "-m", "threads_browser", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0
+    assert "account" in completed.stdout
+    assert "nurture" in completed.stdout
+
+
+def test_short_add_login_and_ls_commands(tmp_path: Path, monkeypatch, capsys) -> None:
+    root = tmp_path / "private-root"
+    monkeypatch.setenv("THREADS_BROWSER_DATA_ROOT", str(root))
+    assert main(["add", "local1"]) == 0
+    assert capsys.readouterr().out == "ACCOUNT status=REGISTERED\n"
+
+    login_calls = {}
+
+    async def fake_login(alias, *, data_root, status_callback):
+        login_calls.update(alias=alias, data_root=data_root, callback=status_callback)
+        status_callback("BROWSER_OPEN")
+        return SimpleNamespace(status="CLOSED")
+
+    monkeypatch.setattr(cli, "open_account_login", fake_login)
+    assert main(["login", "local1"]) == 0
+    assert login_calls["alias"] == "local1"
+    assert login_calls["data_root"] == root.resolve()
+    assert "BROWSER status=OPEN" in capsys.readouterr().out
+
+    AccountStore(root).bind_actor(AccountStore(root).get("local1"), "offline.operator")
+    assert main(["ls"]) == 0
+    output = capsys.readouterr().out
+    assert output == "local1 VERIFIED\n"
+    assert str(root / "profiles") not in output
+    assert "offline.operator" not in output
+
+
+def test_short_terms_command_persists_normalized_terms_separately(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    root = tmp_path / "private-root"
+    monkeypatch.setenv("THREADS_BROWSER_DATA_ROOT", str(root))
+    _verified_local_account(root)
+    account_path = root / "accounts" / "local1.json"
+    account_before = account_path.read_bytes()
+
+    assert main(["terms", "local1", "Hiring", "đang tuyển", " hiring "]) == 0
+    assert capsys.readouterr().out == "TERMS status=SAVED count=2\n"
+    assert TermsStore(root).get("local1") == ("hiring", "đang tuyển")
+    assert (root / "preferences" / "terms" / "local1.json").is_file()
+    assert account_path.read_bytes() == account_before
+
+    assert main(["terms", "local1"]) == 0
+    assert capsys.readouterr().out == "hiring\nđang tuyển\n"
+    assert main(["terms", "local1", "--clear"]) == 0
+    assert capsys.readouterr().out == "TERMS status=CLEARED\n"
+    assert TermsStore(root).get("local1") == ()
+
+
+def test_short_run_uses_saved_terms_and_documented_default_budgets(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    root = tmp_path / "private-root"
+    monkeypatch.setenv("THREADS_BROWSER_DATA_ROOT", str(root))
+    _verified_local_account(root)
+    TermsStore(root).set("local1", ("Hiring", "đang tuyển"))
+    calls = {}
+
+    async def fake_run(_account, _store, **kwargs):
+        calls.update(kwargs)
+        return _fake_nurture_result()
+
+    monkeypatch.setattr(workflow, "run_browser_nurture", fake_run)
+    assert main(["run", "local1"]) == 0
+    output = capsys.readouterr().out
+    assert "NURTURE status=NO_VERIFIED_POSTS_IN_BUDGET" in output
+    assert calls["terms"] == ("hiring", "đang tuyển")
+    assert calls["max_posts"] == 20
+    assert calls["max_scrolls"] == 8
+    assert calls["max_total_posts"] == 40
+
+
+def test_one_time_run_terms_override_without_changing_saved_terms(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    root = tmp_path / "private-root"
+    monkeypatch.setenv("THREADS_BROWSER_DATA_ROOT", str(root))
+    _verified_local_account(root)
+    calls = {}
+
+    async def fake_run(_account, _store, **kwargs):
+        calls.update(kwargs)
+        return _fake_nurture_result()
+
+    monkeypatch.setattr(workflow, "run_browser_nurture", fake_run)
+    assert main(["run", "local1", "-t", "Hiring"]) == 0
+    capsys.readouterr()
+    assert calls["terms"] == ("Hiring",)
+    assert TermsStore(root).get("local1") == ()
+
+    TermsStore(root).set("local1", ("saved term",))
+    assert main(
+        ["run", "local1", "--term", "remote", "-t", "engineer", "--max-scrolls", "3"]
+    ) == 0
+    capsys.readouterr()
+    assert calls["terms"] == ("remote", "engineer")
+    assert calls["max_posts"] == 20
+    assert calls["max_scrolls"] == 3
+    assert calls["max_total_posts"] == 40
+    assert TermsStore(root).get("local1") == ("saved term",)
+
+    assert main(
+        ["run", "local1", "--max-posts", "2", "--max-total-posts", "15", "-t", "fresh"]
+    ) == 0
+    capsys.readouterr()
+    assert calls["terms"] == ("fresh",)
+    assert calls["max_posts"] == 2
+    assert calls["max_total_posts"] == 15
+    assert TermsStore(root).get("local1") == ("saved term",)
+
+
+def test_short_run_reports_missing_account_actor_and_terms(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    root = tmp_path / "private-root"
+    monkeypatch.setenv("THREADS_BROWSER_DATA_ROOT", str(root))
+    assert main(["run", "missing"]) == 1
+    assert capsys.readouterr().err == "ERROR ACCOUNT_NOT_FOUND\n"
+
+    assert main(["add", "local1"]) == 0
+    capsys.readouterr()
+    assert main(["run", "local1"]) == 1
+    assert capsys.readouterr().err == "ERROR ACCOUNT_NOT_VERIFIED\n"
+
+    AccountStore(root).bind_actor(AccountStore(root).get("local1"), "offline.operator")
+    assert main(["run", "local1"]) == 1
+    error = capsys.readouterr().err
+    assert "ERROR TERMS_NOT_CONFIGURED" in error
+    assert 'tb terms local1 "hiring"' in error
+
+
+def test_short_run_login_required_and_profile_lock_errors_are_safe(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    root = tmp_path / "private-root"
+    monkeypatch.setenv("THREADS_BROWSER_DATA_ROOT", str(root))
+    account = _verified_local_account(root)
+    TermsStore(root).set("local1", ("hiring",))
+
+    async def login_required(*_args, **_kwargs):
+        raise UiReadError("LOGIN_REQUIRED")
+
+    monkeypatch.setattr(workflow, "run_browser_nurture", login_required)
+    assert main(["run", "local1"]) == 1
+    error = capsys.readouterr().err
+    assert "STOP LOGIN_REQUIRED" in error
+    assert "tb login local1" in error
+
+    lock = profile_lock(root, account)
+    lock.acquire()
+    try:
+        assert main(["run", "local1"]) == 1
+        assert capsys.readouterr().err == "ERROR ACCOUNT_BUSY\n"
+    finally:
+        lock.release()
