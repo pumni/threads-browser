@@ -26,8 +26,8 @@ src/threads_browser/
 - `storage` owns persisted account references, terms, locks and versioned fingerprints; never store raw post bodies, cookies or raw URLs.
 - `login` and `account_service` own interactive session establishment; `cli` is only an adapter around these application entry points.
 
-Existing `threads_browser.reader` imports are kept as aliases for callers/tests while new feature code can import pure helpers from `threads_browser.feed`. The reader stays one class for now: splitting its tightly coupled DOM state across mixins before private Threads UAT would increase risk and obscure failures.
+Existing `threads_browser.reader` imports remain compatibility aliases; new pure helpers belong in `feed`. The reader currently holds tightly coupled DOM state in one class. Refactor it when justified by a task, with regression coverage for behavior.
 
-## Scope of this refactor
+## Evolution
 
-Only extract pure value objects, URLs and text semantics. Do not modify selectors, Playwright event ordering, browser profiles, actor/checkpoint invariants, automation cadence, or CLI behavior. Fix the existing workflow correctness gaps separately with focused regressions, then conduct owner-authorized private UAT before treating live Threads compatibility as proven.
+The earlier `feed` extraction's no-behavior-change scope applied to that refactor, not to future tasks. Selectors, readiness, scrolling, Detail and CLI behavior can evolve when needed. Preserve provenance checks, profile isolation, bounded read-only operation and checkpoint privacy; verify affected behavior with focused regression tests. Offline Chromium fixtures do not establish live Threads UI compatibility: that requires owner-authorized private UAT.
