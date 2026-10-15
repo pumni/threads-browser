@@ -32,6 +32,9 @@ _DETAIL_TIMEOUT_MS = 15_000
 _READINESS_TIMEOUT_MS = 8_000
 _AUTOMATIC_READINESS_WINDOWS = 2
 _READINESS_RECHECK_INTERVAL_MS = 200
+_RENDER_MIN_DWELL_MS = 600
+_RENDER_SETTLE_INTERVAL_MS = 300
+_RENDER_STABLE_OBSERVATIONS = 2
 _SCROLL_ADVANCE_RATIO = 0.4
 _SCROLL_ADVANCE_MIN_PX = 64
 _SCROLL_ADVANCE_MAX_PX = 360
@@ -143,6 +146,7 @@ class PostTarget:
     body: str | None = field(repr=False)
     fingerprint: str
     permalink: Locator = field(repr=False)
+    body_available: bool = field(default=False, repr=False)
     currently_visible: bool = field(default=False, repr=False)
     viewport_y: float = field(default=0.0, repr=False)
 
@@ -193,6 +197,20 @@ class _CandidateStructure:
     visible_times: int = 0
     body_candidates: int = 0
     paragraph_candidates: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _RenderObservation[T]:
+    signature: tuple[object, ...]
+    value: T
+    terminal_code: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _FeedTargetsObservation:
+    targets: tuple[PostTarget, ...]
+    scroll_anchor: dict[str, float]
+    duplicate_delta: int = 0
 
 
 def normalize_text(value: str) -> str:
@@ -293,12 +311,17 @@ class ThreadsHomeReader:
         self._readiness_prompt = readiness_prompt
         self._home_url: str | None = None
         self._verified_actor_route: str | None = None
+        self._last_ui_transition_at: float | None = None
         self.scroll_attempts = 0
         self.scrolls = 0
         self.feed_duplicates = 0
         self.last_scan_counts = _FeedScanCounts()
+        self._reported_render_rescans: set[tuple[str, float | None]] = set()
         self._skipped_candidate_identities: set[str] = set()
         self._reported_candidate_skips: dict[tuple[str, str], set[str]] = {}
+
+    def _mark_ui_transition(self) -> None:
+        self._last_ui_transition_at = time.monotonic()
 
     @property
     def skipped_unverified(self) -> int:
@@ -395,6 +418,14 @@ class ThreadsHomeReader:
         else:
             await self._require_feed_url()
 
+        self._mark_ui_transition()
+        await self._wait_for_home_render(
+            "HOME_NAVIGATION",
+            timeout_code="HOME_NAVIGATION_TIMEOUT",
+            require_active_for_you=False,
+            require_feed=False,
+        )
+
         async def find_for_you_control(deadline: float) -> Locator:
             remaining = self._remaining_readiness_ms(
                 deadline,
@@ -423,6 +454,7 @@ class ThreadsHomeReader:
                 await control.click(timeout=_NAVIGATION_TIMEOUT_MS)
             except PlaywrightTimeoutError:
                 pass
+            self._mark_ui_transition()
 
             async def verify_for_you_activation(deadline: float) -> Locator:
                 while True:
@@ -501,6 +533,12 @@ class ThreadsHomeReader:
                 verify_for_you_activation,
                 recoverable_codes=("FOR_YOU_ACTIVATION_NOT_READY",),
             )
+        await self._wait_for_home_render(
+            "FOR_YOU_ACTIVATION",
+            timeout_code="FOR_YOU_ACTIVATION_NOT_READY",
+            require_active_for_you=True,
+            require_feed=False,
+        )
         await self._require_feed_url()
         self._home_url = self._page.url
         await self.verify_actor()
@@ -584,6 +622,7 @@ class ThreadsHomeReader:
             await control.click(timeout=_READINESS_TIMEOUT_MS)
         except PlaywrightTimeoutError:
             pass
+        self._mark_ui_transition()
 
         async def verify_profile_navigation(deadline: float) -> None:
             remaining = self._remaining_readiness_ms(
@@ -602,6 +641,12 @@ class ThreadsHomeReader:
                 except PlaywrightTimeoutError:
                     raise UiReadError("PROFILE_CLICK_NO_NAVIGATION") from None
             await self._verify_current_profile_route()
+            await self._await_render_settled(
+                "PROFILE_VERIFY",
+                deadline,
+                timeout_code="PROFILE_CLICK_NO_NAVIGATION",
+                observe=self._observe_profile_render,
+            )
 
         await self._recoverable_stage(
             "PROFILE_VERIFY",
@@ -639,6 +684,7 @@ class ThreadsHomeReader:
             )
         except PlaywrightTimeoutError:
             pass
+        self._mark_ui_transition()
 
         async def verify_home_return(deadline: float) -> None:
             self._remaining_readiness_ms(deadline, "RETURN_UNVERIFIED")
@@ -671,6 +717,17 @@ class ThreadsHomeReader:
             )
             if self._page.url != self._home_url:
                 raise UiReadError("RETURN_ROUTE_CHANGED")
+            await self._await_render_settled(
+                "HOME_RETURN",
+                deadline,
+                timeout_code="RETURN_UNVERIFIED",
+                observe=lambda: self._observe_home_render(
+                    deadline,
+                    timeout_code="RETURN_UNVERIFIED",
+                    require_active_for_you=True,
+                    require_feed=False,
+                ),
+            )
 
         await self._recoverable_stage(
             "HOME_RETURN",
@@ -722,6 +779,7 @@ class ThreadsHomeReader:
                 await self._page.mouse.move(*point)
                 self.scroll_attempts += 1
                 await self._page.mouse.wheel(0, wheel_delta)
+                self._mark_ui_transition()
             except PlaywrightError:
                 print(f"SCROLL attempt={self.scroll_attempts} observed=0")
                 raise UiReadError("HOME_SCROLL_FAILED") from None
@@ -740,6 +798,20 @@ class ThreadsHomeReader:
                 await self._wait_for_verified_feed(
                     window_deadline,
                     timeout_code="HOME_SCROLL_UNVERIFIED",
+                )
+                await self._await_render_settled(
+                    "FEED_SCROLL",
+                    window_deadline,
+                    timeout_code="HOME_SCROLL_UNVERIFIED",
+                    observe=lambda: self._observe_feed_targets(
+                        1,
+                        window_deadline,
+                        timeout_code="HOME_SCROLL_UNVERIFIED",
+                        currently_visible=True,
+                        prefer_new_fingerprints=None,
+                        stage="FEED_SCROLL",
+                        report_rescan=True,
+                    ),
                 )
                 return observed_delta
 
@@ -849,6 +921,353 @@ class ThreadsHomeReader:
             if not await self._readiness_prompt(stage, window):
                 raise UiReadError(final_code) from None
 
+    async def _wait_for_home_render(
+        self,
+        stage: str,
+        *,
+        timeout_code: str,
+        require_active_for_you: bool,
+        require_feed: bool,
+    ) -> None:
+        async def observe_stage(deadline: float) -> None:
+            await self._await_render_settled(
+                stage,
+                deadline,
+                timeout_code=timeout_code,
+                observe=lambda: self._observe_home_render(
+                    deadline,
+                    timeout_code=timeout_code,
+                    require_active_for_you=require_active_for_you,
+                    require_feed=require_feed,
+                ),
+            )
+
+        await self._recoverable_stage(
+            stage,
+            timeout_code,
+            observe_stage,
+            recoverable_codes=(timeout_code,),
+        )
+
+    async def _observe_home_render(
+        self,
+        deadline: float,
+        *,
+        timeout_code: str,
+        require_active_for_you: bool,
+        require_feed: bool,
+    ) -> _RenderObservation[None] | None:
+        self._remaining_readiness_ms(deadline, timeout_code)
+        try:
+            await self._require_feed_url(route_error_code=timeout_code)
+        except UiReadError as error:
+            if error.code in {
+                "PROFILE_CONTROL_NOT_READY",
+                "FOR_YOU_CONTROL_NOT_READY",
+                "FOR_YOU_STATE_CHANGED",
+                timeout_code,
+            }:
+                return None
+            raise
+
+        profiles = await self._visible_profile_controls()
+        for_you_controls = await self._visible_for_you_controls()
+        if len(profiles) > 1:
+            raise UiReadError("PROFILE_CONTROL_AMBIGUOUS")
+        if len(for_you_controls) > 1:
+            raise UiReadError("FOR_YOU_CONTROL_AMBIGUOUS")
+        if not profiles or not for_you_controls:
+            return None
+
+        profile_href = await profiles[0].get_attribute("href")
+        if profile_href is not None:
+            profile_destination = urljoin(self._page.url, profile_href)
+            if not _same_home_origin(profile_destination):
+                raise UiReadError("OFF_ORIGIN_REDIRECT")
+            profile_actor = _profile_author(profile_destination)
+            if profile_actor is not None and profile_actor != self._expected_actor:
+                raise UiReadError("ACTOR_MISMATCH")
+        for_you_href = await for_you_controls[0].get_attribute("href")
+        if for_you_href is not None and not _same_home_origin(
+            urljoin(self._page.url, for_you_href)
+        ):
+            raise UiReadError("OFF_ORIGIN_REDIRECT")
+        active = await self._for_you_is_active(for_you_controls[0])
+        on_for_you_route = self._is_for_you_route(self._page.url)
+        if require_active_for_you and not (active or on_for_you_route):
+            return None
+        feed_ready = await self._visible_feed_evidence() if require_feed else False
+        if require_feed and not feed_ready:
+            return None
+
+        dom_state = await self._page.evaluate(
+            """rootSelector => {
+                const body = document.body;
+                const visibleCount = selector => Array.from(
+                    document.querySelectorAll(selector)
+                ).filter(element => {
+                    const rect = element.getBoundingClientRect();
+                    const style = getComputedStyle(element);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none';
+                }).length;
+                return [
+                    body ? (body.innerText || '').trim().length : 0,
+                    body ? body.childElementCount : 0,
+                    visibleCount(rootSelector),
+                    visibleCount('a[href*="/post/"]'),
+                ];
+            }""",
+            _FEED_ROOT_SELECTOR,
+        )
+        if not dom_state[0]:
+            return None
+        signature = (
+            self._page.url,
+            profile_href,
+            for_you_href,
+            active,
+            on_for_you_route,
+            feed_ready,
+            *dom_state,
+        )
+        return _RenderObservation(signature, None)
+
+    async def _observe_profile_render(
+        self,
+    ) -> _RenderObservation[None] | None:
+        await self._verify_current_profile_route()
+        dom_state = await self._page.evaluate(
+            """() => {
+                const body = document.body;
+                const visibleCount = selector => Array.from(
+                    document.querySelectorAll(selector)
+                ).filter(element => {
+                    const rect = element.getBoundingClientRect();
+                    const style = getComputedStyle(element);
+                    return rect.width > 0 && rect.height > 0 &&
+                        style.visibility !== 'hidden' && style.display !== 'none';
+                }).length;
+                return [
+                    body ? (body.innerText || '').trim().length : 0,
+                    body ? body.childElementCount : 0,
+                    visibleCount('main, [role="main"], h1, [role="tab"]'),
+                ];
+            }"""
+        )
+        if not dom_state[0]:
+            return None
+        return _RenderObservation((self._page.url, *dom_state), None)
+
+    async def _await_animation_frames(
+        self,
+        deadline: float,
+        timeout_code: str,
+    ) -> None:
+        timeout_seconds = self._remaining_readiness_ms(deadline, timeout_code) / 1000
+        try:
+            await asyncio.wait_for(
+                self._page.evaluate(
+                    """() => new Promise(resolve =>
+                        requestAnimationFrame(() => requestAnimationFrame(resolve))
+                    )"""
+                ),
+                timeout=timeout_seconds,
+            )
+        except TimeoutError:
+            raise UiReadError(timeout_code) from None
+
+    async def _await_render_settled(
+        self,
+        stage: str,
+        deadline: float,
+        *,
+        timeout_code: str,
+        observe: Callable[
+            [], Awaitable[_RenderObservation[_ReadinessResult] | None]
+        ],
+    ) -> _ReadinessResult:
+        transition_at = self._last_ui_transition_at or time.monotonic()
+        dwell_until = transition_at + _RENDER_MIN_DWELL_MS / 1000
+        dwell_remaining = min(
+            max(0.0, dwell_until - time.monotonic()),
+            self._remaining_readiness_ms(deadline, timeout_code) / 1000,
+        )
+        if dwell_remaining:
+            await asyncio.sleep(dwell_remaining)
+
+        checks = 0
+        stable_observations = 0
+        previous_signature: tuple[object, ...] | None = None
+        waiting_reported = False
+        while True:
+            self._remaining_readiness_ms(deadline, timeout_code)
+            await self._await_animation_frames(deadline, timeout_code)
+            observation = await observe()
+            checks += 1
+            if observation is None:
+                if previous_signature is not None:
+                    print(f"RESCAN stage={stage} reason=DOM_CHANGED_AFTER_SCAN")
+                previous_signature = None
+                stable_observations = 0
+                if not waiting_reported:
+                    print(f"WAITING stage={stage} reason=RENDER_PENDING")
+                    waiting_reported = True
+            else:
+                signature = observation.signature
+                if signature == previous_signature:
+                    stable_observations += 1
+                else:
+                    if previous_signature is not None:
+                        print(f"RESCAN stage={stage} reason=DOM_CHANGED_AFTER_SCAN")
+                    previous_signature = signature
+                    stable_observations = 1
+                if stable_observations >= _RENDER_STABLE_OBSERVATIONS:
+                    if observation.terminal_code is not None:
+                        raise UiReadError(observation.terminal_code)
+                    print(f"READY stage={stage} render_checks={checks}")
+                    return observation.value
+
+            remaining = self._remaining_readiness_ms(deadline, timeout_code)
+            interval_ms = min(max(1, _RENDER_SETTLE_INTERVAL_MS), remaining)
+            await asyncio.sleep(interval_ms / 1000)
+
+    async def _observe_feed_targets(
+        self,
+        max_posts: int,
+        deadline: float,
+        *,
+        timeout_code: str,
+        currently_visible: bool,
+        prefer_new_fingerprints: set[str] | None,
+        stage: str,
+        report_rescan: bool,
+    ) -> _RenderObservation[_FeedTargetsObservation] | None:
+        await self._wait_for_verified_feed(
+            deadline,
+            timeout_code=timeout_code,
+        )
+        evidence_before_scan = await self._visible_feed_evidence()
+        duplicate_count_before = self.feed_duplicates
+        try:
+            targets, scroll_anchor = await self._visible_targets(
+                max_posts,
+                currently_visible=currently_visible,
+                prefer_new_fingerprints=prefer_new_fingerprints,
+                stage=stage,
+            )
+        except _CardNotReady as pending:
+            self.feed_duplicates = duplicate_count_before
+            await self._wait_for_pending_card(pending, deadline)
+            return None
+        duplicate_delta = self.feed_duplicates - duplicate_count_before
+        self.feed_duplicates = duplicate_count_before
+
+        if targets and scroll_anchor is not None:
+            if any(not target.body_available for target in targets):
+                return None
+            signature = (
+                "verified-cards",
+                tuple(
+                    (target.url, target.author, target.body, target.body_available)
+                    for target in targets
+                ),
+                self.last_scan_counts.article_roots,
+                self.last_scan_counts.pressable_roots,
+            )
+            return _RenderObservation(
+                signature,
+                _FeedTargetsObservation(targets, scroll_anchor, duplicate_delta),
+            )
+
+        if not await self._visible_feed_evidence():
+            counts = self.last_scan_counts
+            if counts.unsupported_roots:
+                signature = (
+                    "visible-unsupported-feed-structure",
+                    counts.visible_post_links,
+                    counts.article_roots,
+                    counts.pressable_roots,
+                    counts.unsupported_roots,
+                    tuple(sorted(counts.structural_reasons.items())),
+                )
+                return _RenderObservation(
+                    signature,
+                    _FeedTargetsObservation((), {}, duplicate_delta),
+                )
+            pending = await self._feed_readiness_signals()
+            if pending is None:
+                pending = _CardNotReady(
+                    self._page.locator("body"),
+                    condition="mutation",
+                )
+            await self._wait_for_pending_card(pending, deadline)
+            return None
+
+        # A feed card can arrive between the first empty scan and the evidence
+        # check. Rescan immediately before treating that viewport as empty.
+        transition_key = (stage, self._last_ui_transition_at)
+        if (
+            report_rescan
+            and not evidence_before_scan
+            and transition_key not in self._reported_render_rescans
+        ):
+            print(f"RESCAN stage={stage} reason=DOM_CHANGED_AFTER_SCAN")
+            self._reported_render_rescans.add(transition_key)
+        duplicate_count_before_rescan = self.feed_duplicates
+        try:
+            rescanned, rescanned_anchor = await self._visible_targets(
+                max_posts,
+                currently_visible=currently_visible,
+                prefer_new_fingerprints=prefer_new_fingerprints,
+                stage=stage,
+            )
+        except _CardNotReady as pending:
+            self.feed_duplicates = duplicate_count_before_rescan
+            await self._wait_for_pending_card(pending, deadline)
+            return None
+        duplicate_delta += self.feed_duplicates - duplicate_count_before_rescan
+        self.feed_duplicates = duplicate_count_before
+        if rescanned and rescanned_anchor is not None:
+            if any(not target.body_available for target in rescanned):
+                return None
+            signature = (
+                "verified-cards",
+                tuple(
+                    (target.url, target.author, target.body, target.body_available)
+                    for target in rescanned
+                ),
+                self.last_scan_counts.article_roots,
+                self.last_scan_counts.pressable_roots,
+            )
+            return _RenderObservation(
+                signature,
+                _FeedTargetsObservation(
+                    rescanned,
+                    rescanned_anchor,
+                    duplicate_delta,
+                ),
+            )
+
+        if not await self._visible_feed_evidence():
+            return None
+        self._remaining_readiness_ms(deadline, timeout_code)
+        await self._wait_for_verified_feed(deadline, timeout_code=timeout_code)
+        counts = self.last_scan_counts
+        signature = (
+            "visible-feed-without-verified-target",
+            counts.visible_post_links,
+            counts.article_roots,
+            counts.pressable_roots,
+            counts.unsupported_roots,
+            counts.skipped,
+            tuple(sorted(counts.structural_reasons.items())),
+        )
+        return _RenderObservation(
+            signature,
+            _FeedTargetsObservation((), {}, duplicate_delta),
+        )
+
     async def _wait_for_home_targets(
         self,
         max_posts: int,
@@ -864,68 +1283,56 @@ class ThreadsHomeReader:
             "HOME_SCROLL_UNVERIFIED": "FEED_SCROLL",
         }.get(timeout_code, "FEED")
 
-        async def attempt(window_deadline: float) -> tuple[tuple[PostTarget, ...], dict[str, float]]:
+        async def attempt(
+            window_deadline: float,
+        ) -> tuple[tuple[PostTarget, ...], dict[str, float]]:
             self.last_scan_counts = _FeedScanCounts()
             unsupported_scans = 0
-            while True:
-                self._remaining_readiness_ms(window_deadline, timeout_code)
-                await self._wait_for_verified_feed(
+
+            async def observe() -> _RenderObservation[
+                _FeedTargetsObservation
+            ] | None:
+                nonlocal unsupported_scans
+                observation = await self._observe_feed_targets(
+                    max_posts,
                     window_deadline,
                     timeout_code=timeout_code,
+                    currently_visible=currently_visible,
+                    prefer_new_fingerprints=prefer_new_fingerprints,
+                    stage=stage_name,
+                    report_rescan=True,
                 )
-                try:
-                    targets, scroll_anchor = await self._visible_targets(
-                        max_posts,
-                        currently_visible=currently_visible,
-                        prefer_new_fingerprints=prefer_new_fingerprints,
-                        stage=stage_name,
-                    )
-                except _CardNotReady as pending:
-                    await self._wait_for_pending_card(
-                        pending,
-                        window_deadline,
-                    )
-                    continue
-                if targets and scroll_anchor is not None:
-                    self._remaining_readiness_ms(window_deadline, timeout_code)
-                    await self._wait_for_verified_feed(
-                        window_deadline,
-                        timeout_code=timeout_code,
-                    )
-                    return targets, scroll_anchor
-                if await self._visible_feed_evidence():
-                    self._remaining_readiness_ms(window_deadline, timeout_code)
-                    await self._wait_for_verified_feed(
-                        window_deadline,
-                        timeout_code=timeout_code,
-                    )
-                    return (), {}
+                if observation is None:
+                    unsupported_scans = 0
+                    return None
+                targets = observation.value.targets
+                if targets:
+                    unsupported_scans = 0
+                    return observation
                 if self.last_scan_counts.unsupported_roots:
                     unsupported_scans += 1
-                    if unsupported_scans >= _UNSUPPORTED_CONFIRMATION_SCANS:
-                        raise UiReadError("FEED_VISIBLE_UNSUPPORTED")
-                    await self._wait_for_pending_card(
-                        _CardNotReady(
-                            self._page.locator("body"),
-                            condition="mutation",
-                        ),
-                        min(
-                            window_deadline,
-                            time.monotonic()
-                            + _READINESS_RECHECK_INTERVAL_MS / 1000,
-                        ),
+                    if unsupported_scans < _UNSUPPORTED_CONFIRMATION_SCANS:
+                        return None
+                    return _RenderObservation(
+                        observation.signature,
+                        observation.value,
+                        "FEED_VISIBLE_UNSUPPORTED",
                     )
-                    continue
-                pending = await self._feed_readiness_signals()
-                if not pending:
-                    pending = _CardNotReady(
-                        self._page.locator("body"),
-                        condition="mutation",
-                    )
-                await self._wait_for_pending_card(
-                    pending,
-                    window_deadline,
-                )
+                unsupported_scans = 0
+                return observation
+
+            result = await self._await_render_settled(
+                stage_name,
+                window_deadline,
+                timeout_code=timeout_code,
+                observe=observe,
+            )
+            self.feed_duplicates += result.duplicate_delta
+            await self._wait_for_verified_feed(
+                window_deadline,
+                timeout_code=timeout_code,
+            )
+            return result.targets, result.scroll_anchor
 
         try:
             return await self._recoverable_stage(
@@ -2080,6 +2487,7 @@ class ThreadsHomeReader:
                 "DETAIL_NAVIGATION_UNVERIFIED",
             )
             await target.permalink.click(timeout=remaining)
+            self._mark_ui_transition()
             await self._page.wait_for_url(
                 target.url,
                 timeout=self._remaining_readiness_ms(
@@ -2094,7 +2502,9 @@ class ThreadsHomeReader:
 
         async def read_detail_window(window_deadline: float) -> PostTarget:
             last_timeout_code = "DETAIL_ROOT_UNVERIFIED"
-            while True:
+
+            async def observe() -> _RenderObservation[PostTarget] | None:
+                nonlocal last_timeout_code
                 self._remaining_readiness_ms(
                     window_deadline,
                     last_timeout_code,
@@ -2127,14 +2537,40 @@ class ThreadsHomeReader:
                     )
                     self._remaining_readiness_ms(
                         window_deadline,
-                        "DETAIL_ROOT_UNVERIFIED",
+                        last_timeout_code,
                     )
-                    return detail
+                    if not detail.body_available:
+                        last_timeout_code = "DETAIL_BODY_UNVERIFIED"
+                        return None
+                    signature = (
+                        detail.url,
+                        detail.author,
+                        detail.body,
+                        detail.body_available,
+                        len(matching),
+                    )
+                    return _RenderObservation(signature, detail)
                 except _CardNotReady as pending:
                     last_timeout_code = (
                         pending.timeout_code or "DETAIL_ROOT_UNVERIFIED"
                     )
                     await self._wait_for_pending_card(pending, window_deadline)
+                    return None
+
+            try:
+                return await self._await_render_settled(
+                    "DETAIL",
+                    window_deadline,
+                    timeout_code="DETAIL_ROOT_UNVERIFIED",
+                    observe=observe,
+                )
+            except UiReadError as error:
+                if (
+                    error.code == "DETAIL_ROOT_UNVERIFIED"
+                    and last_timeout_code != "DETAIL_ROOT_UNVERIFIED"
+                ):
+                    raise UiReadError(last_timeout_code) from None
+                raise
 
         detail = await self._recoverable_stage(
             "DETAIL",
@@ -2363,12 +2799,12 @@ class ThreadsHomeReader:
         root_handle: JSHandle,
         *,
         require_body: bool,
-    ) -> str | None:
+    ) -> tuple[str | None, bool]:
         buttons = root.get_by_role("button", name=_MORE_NAME)
         for index in range(min(await buttons.count(), _MAX_CARD_LINKS)):
             button = buttons.nth(index)
             if await self._belongs_to_card(button, root, root_handle) and await button.is_visible():
-                return None
+                return None, True
 
         candidates = root.locator(_BODY_TEXT_SELECTOR)
         bodies: list[str] = []
@@ -2412,9 +2848,9 @@ class ThreadsHomeReader:
                     nonempty_text=True,
                     timeout_code="DETAIL_BODY_UNVERIFIED",
                 )
-            return None
+            return None, False
         if len(bodies) > 1 and not all(body_is_auto):
-            return None
+            return None, True
         body = "\n".join(bodies)
         if len(body) > _MAX_BODY_CODEPOINTS:
             if require_body:
@@ -2423,8 +2859,8 @@ class ThreadsHomeReader:
                     nonempty_text=True,
                     timeout_code="DETAIL_BODY_UNVERIFIED",
                 )
-            return None
-        return body
+            return None, True
+        return body, True
 
     async def _read_card(
         self,
@@ -2507,7 +2943,7 @@ class ThreadsHomeReader:
                 diagnostic_reason="CANDIDATE_AUTHOR_MISMATCH",
             )
 
-        body = await self._extract_card_body(
+        body, body_available = await self._extract_card_body(
             root,
             root_handle,
             require_body=require_body,
@@ -2519,6 +2955,7 @@ class ThreadsHomeReader:
             body,
             fingerprint,
             link,
-            currently_visible,
-            viewport_y,
+            body_available=body_available,
+            currently_visible=currently_visible,
+            viewport_y=viewport_y,
         )

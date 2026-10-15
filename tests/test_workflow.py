@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlsplit
@@ -96,6 +97,12 @@ def _offline_playwright_manager(respond):
             await self.playwright.stop()
 
     return OfflinePlaywrightManager()
+
+
+@pytest.fixture(autouse=True)
+def _short_offline_render_settle(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(reader_module, "_RENDER_MIN_DWELL_MS", 25)
+    monkeypatch.setattr(reader_module, "_RENDER_SETTLE_INTERVAL_MS", 20)
 
 
 def test_relevance_classifier_is_conservative() -> None:
@@ -663,12 +670,17 @@ def test_attended_wait_can_extend_then_stop_without_checkpoint(
         assert checkpoint.detail_reads == 0
 
 
-def test_delayed_wheel_and_detail_hydration_return_to_home() -> None:
+def test_delayed_wheel_and_detail_hydration_return_to_home(
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     actor = "offline.operator"
     detail_url = "https://www.threads.com/@candidate/post/ready-detail"
     detail_body = "Hiring a frontend engineer in Vietnam"
+    monkeypatch.setattr(reader_module, "_RENDER_MIN_DWELL_MS", 250)
+    monkeypatch.setattr(reader_module, "_RENDER_SETTLE_INTERVAL_MS", 100)
     feed_html = f"""<!doctype html><html><head><style>
-.post-card {{ box-sizing: border-box; height: 760px; padding-top: 80px; }}
+.post-card {{ box-sizing: border-box; height: 760px; padding-top: 20px; }}
 </style></head><body>
 <nav aria-label="Main" role="navigation">
   <a aria-current="page" aria-label="For you" href="/">For you</a>
@@ -676,14 +688,20 @@ def test_delayed_wheel_and_detail_hydration_return_to_home() -> None:
 </nav><main>
   <div class="post-card"><a href="/@candidate/post/first"><time>2h</time></a>
     <a href="/@candidate">@candidate</a><p>A weather update</p></div>
-  <div class="post-card"><a href="/@candidate/post/ready-detail"><time>1h</time></a>
-    <a href="/@candidate">@candidate</a><p>{detail_body}</p></div>
+  <div id="scroll-room" style="height: 400px"></div>
 </main><script>
+const main = document.querySelector("main");
+const scrollRoom = document.querySelector("#scroll-room");
+const delayedCard = `<div class="post-card">
+  <a href="/@candidate/post/ready-detail"><time>1h</time></a>
+  <a href="/@candidate">@candidate</a><p>{detail_body}</p></div>`;
 window.addEventListener("wheel", event => {{
   event.preventDefault();
-  setTimeout(() => window.scrollBy(0, 850), 100);
+  setTimeout(() => {{
+    window.scrollBy(0, 360);
+    setTimeout(() => scrollRoom.insertAdjacentHTML("beforebegin", delayedCard), 100);
+  }}, 100);
 }}, {{ once: true, passive: false }});
-const main = document.querySelector("main");
 const restoreFeed = () => main.innerHTML = `
   <div class="post-card"><a href="/@candidate/post/first"><time>2h</time></a>
     <a href="/@candidate">@candidate</a><p>A weather update</p></div>
@@ -707,7 +725,11 @@ document.querySelector("#profile").addEventListener("click", () => {{
 </script></body></html>"""
 
     async def exercise(page) -> None:
+        detail_requests = 0
+
         async def serve_detail(route: Route) -> None:
+            nonlocal detail_requests
+            detail_requests += 1
             await route.fulfill(
                 status=200,
                 content_type="text/html",
@@ -734,8 +756,169 @@ setTimeout(() => document.querySelector("#detail").insertAdjacentHTML(
         assert page.url == HOME_URL
         home_targets, _ = await reader._visible_targets(1)
         assert home_targets
+        assert detail_requests == 1
 
     _run_offline_page(feed_html, exercise)
+    output = capsys.readouterr().out
+    assert "READY stage=FEED_SCROLL render_checks=" in output
+    assert "READY stage=DETAIL render_checks=" in output
+    assert "READY stage=HOME_RETURN render_checks=" in output
+
+
+def test_empty_scan_rescans_new_feed_with_zero_scroll_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    target_url = "https://www.threads.com/@candidate/post/late-feed"
+    body = "Hiring a backend engineer"
+    feed_html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a id="profile" aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main><article id="seed">
+  <a href="/@candidate/post/seed"><time>2h</time></a>
+  <a href="/@candidate">@candidate</a><p>A weather update</p>
+</article></main></body></html>"""
+    detail_html = f"""<!doctype html><html><body><article>
+<a href="/@candidate/post/late-feed"><time>now</time></a>
+<a href="/@candidate">@candidate</a><p>{body}</p>
+</article></body></html>"""
+    state = {"scan": False, "empty_once": False, "injected": False}
+
+    with tempfile.TemporaryDirectory(prefix="threads-browser-render-race-") as root:
+        synthetic_root = Path(root)
+        profile = synthetic_root / "profile"
+        profile.mkdir()
+        account = AccountStore(synthetic_root / "data").add(
+            "offline",
+            actor,
+            profile,
+        )
+        store = CheckpointStore(synthetic_root / "data")
+        policy = policy_fingerprint(canonical_terms(("hiring",)))
+
+        original_open_home = ThreadsHomeReader.open_home
+        original_visible_targets = ThreadsHomeReader._visible_targets
+        original_feed_evidence = ThreadsHomeReader._visible_feed_evidence
+
+        async def open_then_clear_seed(reader: ThreadsHomeReader) -> None:
+            await original_open_home(reader)
+
+            async def serve_detail(route: Route) -> None:
+                await route.fulfill(
+                    status=200,
+                    content_type="text/html",
+                    body=detail_html,
+                )
+
+            await reader._page.route(target_url, serve_detail)
+            await reader._page.locator("#seed").evaluate("element => element.remove()")
+            state["scan"] = True
+
+        async def empty_once(
+            reader: ThreadsHomeReader,
+            *args,
+            **kwargs,
+        ):
+            if state["scan"] and not state["empty_once"]:
+                state["empty_once"] = True
+                return (), None
+            return await original_visible_targets(reader, *args, **kwargs)
+
+        async def inject_after_empty_scan(reader: ThreadsHomeReader) -> bool:
+            if state["scan"] and state["empty_once"] and not state["injected"]:
+                state["injected"] = True
+                await reader._page.locator("main").evaluate(
+                    """main => main.innerHTML = `
+                      <article>
+                        <a href="/@candidate/post/late-feed"><time>now</time></a>
+                        <a href="/@candidate">@candidate</a>
+                        <p>Hiring a backend engineer</p>
+                      </article>`"""
+                )
+            return await original_feed_evidence(reader)
+
+        monkeypatch.setattr(ThreadsHomeReader, "open_home", open_then_clear_seed)
+        monkeypatch.setattr(ThreadsHomeReader, "_visible_targets", empty_once)
+        monkeypatch.setattr(
+            ThreadsHomeReader,
+            "_visible_feed_evidence",
+            inject_after_empty_scan,
+        )
+
+        async def exercise(page) -> None:
+            result = await workflow.run_page_workflow(
+                page,
+                account,
+                store,
+                max_posts=1,
+                max_scrolls=0,
+                terms=("hiring",),
+            )
+            assert result.status == "COMPLETE"
+            assert result.scroll_attempts == 0
+            assert result.scrolls == 0
+            assert result.detail_reads == 1
+
+        _run_offline_page(feed_html, exercise)
+        checkpoint = store.load(account.account_id, policy)
+        assert checkpoint.completed_runs == 1
+        assert checkpoint.scroll_attempts == 0
+        assert checkpoint.detail_reads == 1
+        assert state == {"scan": True, "empty_once": True, "injected": True}
+        assert "RESCAN stage=FEED_INITIAL reason=DOM_CHANGED_AFTER_SCAN" in (
+            capsys.readouterr().out
+        )
+
+
+def test_feed_barrier_waits_through_body_hydration_and_dom_change(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    target_url = "https://www.threads.com/@candidate/post/body-hydration"
+    feed_html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main><article>
+  <a href="/@candidate/post/seed"><time>2h</time></a>
+  <a href="/@candidate">@candidate</a><p>A weather update</p>
+</article></main></body></html>"""
+    monkeypatch.setattr(reader_module, "_RENDER_MIN_DWELL_MS", 80)
+    monkeypatch.setattr(reader_module, "_RENDER_SETTLE_INTERVAL_MS", 50)
+
+    async def exercise(page) -> None:
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        await page.locator("main").evaluate(
+            """main => {
+                main.innerHTML = `
+                  <article id="hydrating">
+                    <a href="/@candidate/post/body-hydration"><time>now</time></a>
+                    <a id="author" href="/@candidate">@candidate</a>
+                  </article>`;
+                setTimeout(() => document.querySelector('#hydrating')
+                    .insertAdjacentHTML('beforeend', '<p>A weather update</p>'), 90);
+                setTimeout(() => document.querySelector('#hydrating p').textContent =
+                    'Hiring a backend engineer', 175);
+            }"""
+        )
+        reader._mark_ui_transition()
+        started = time.monotonic()
+        targets = await reader.scan_viewport(1)
+        elapsed = time.monotonic() - started
+        assert len(targets) == 1
+        assert targets[0].url == target_url
+        assert targets[0].body == "Hiring a backend engineer"
+        assert targets[0].body_available
+        assert classify_body(targets[0].body, canonical_terms(("hiring",))) == "RELEVANT"
+        assert elapsed >= 0.18
+
+    _run_offline_page(feed_html, exercise)
+    assert "READY stage=FEED_INITIAL render_checks=" in capsys.readouterr().out
 
 
 def test_readiness_timeouts_and_unverified_feed_candidates_do_not_checkpoint(
