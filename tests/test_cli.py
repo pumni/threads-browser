@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -64,6 +65,55 @@ def test_account_cli_create_profile_registers_a_new_directory(
     assert result == 0
     assert profile.is_dir()
     assert capsys.readouterr().out == "ACCOUNT status=REGISTERED\n"
+
+
+def test_account_cli_creates_a_local_unverified_account(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    root = tmp_path / "private-root"
+    monkeypatch.setenv("THREADS_BROWSER_DATA_ROOT", str(root))
+
+    assert main(["account", "add", "local1"]) == 0
+
+    assert capsys.readouterr().out == "ACCOUNT status=REGISTERED\n"
+    assert (root / "profiles" / "local1").is_dir()
+    account = json.loads((root / "accounts" / "local1.json").read_text(encoding="utf-8"))
+    assert account["expected_actor"] is None
+    assert account["schema_version"] == 2
+
+
+def test_nurture_rejects_an_unverified_local_account_before_browser_startup(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    root = tmp_path / "private-root"
+    monkeypatch.setenv("THREADS_BROWSER_DATA_ROOT", str(root))
+    assert main(["account", "add", "local1"]) == 0
+    capsys.readouterr()
+
+    result = main(
+        [
+            "nurture",
+            "run",
+            "local1",
+            "--headed",
+            "--max-posts",
+            "2",
+            "--max-scrolls",
+            "1",
+            "--max-total-posts",
+            "5",
+            "--term",
+            "hiring",
+        ]
+    )
+
+    assert result == 1
+    assert capsys.readouterr().err == "ERROR ACCOUNT_NOT_VERIFIED\n"
+    assert not (root / "nurture").exists()
 
 
 def test_nurture_cli_requires_explicit_headed_mode(tmp_path: Path, monkeypatch, capsys) -> None:

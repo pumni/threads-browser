@@ -20,20 +20,27 @@ from .storage import (
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="threads-browser")
     commands = parser.add_subparsers(dest="command", required=True)
-    account = commands.add_parser("account", help="register and maintain account profiles")
+    account = commands.add_parser("account", help="register and maintain local accounts")
     account_commands = account.add_subparsers(dest="account_command", required=True)
-    add = account_commands.add_parser("add", help="register a dedicated profile reference")
+    add = account_commands.add_parser("add", help="create a local account or register a profile")
     add.add_argument("alias")
-    add.add_argument("--actor", required=True, help="expected visible Threads actor")
-    add.add_argument("--profile-dir", required=True, type=Path)
+    add.add_argument("--actor", help="expected visible Threads actor for an existing profile")
+    add.add_argument("--profile-dir", type=Path)
     add.add_argument(
         "--create-profile",
         action="store_true",
         help="create the absent dedicated Chromium profile directory",
     )
-    login = account_commands.add_parser("login", help="log in manually in headed Chromium")
+    login = account_commands.add_parser(
+        "login",
+        help="open the account's persistent Chromium profile",
+    )
     login.add_argument("alias")
-    login.add_argument("--headed", action="store_true", help="confirm visible browser operation")
+    login.add_argument(
+        "--headed",
+        action="store_true",
+        help="accepted for compatibility; login is always visible",
+    )
     nurture = commands.add_parser("nurture", help="run a bounded read-only workflow")
     nurture_commands = nurture.add_subparsers(dest="nurture_command", required=True)
     run = nurture_commands.add_parser("run", help="search Home / For You within bounded budgets")
@@ -134,13 +141,6 @@ async def _prompt_readiness_extension(stage: str, retry: int) -> bool:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
-    if args.command == "account" and args.account_command == "login":
-        if not args.headed:
-            print("ERROR HEADED_REQUIRED", file=sys.stderr)
-            return 1
-        if not _has_interactive_terminal():
-            print("ERROR LOGIN_TTY_REQUIRED", file=sys.stderr)
-            return 1
     if (
         args.command == "nurture"
         and args.nurture_command == "run"
@@ -185,18 +185,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 from .reader import UiReadError
 
                 try:
-                    result = asyncio.run(run_manual_login(account))
+                    result = asyncio.run(run_manual_login(account, accounts))
                 except UiReadError as error:
                     print(f"STOP {error.code}", file=sys.stderr)
                     return 1
-                if result.status == "VERIFIED":
-                    print("LOGIN status=VERIFIED")
-                    return 0
                 if result.status == "CANCELLED":
                     print("LOGIN status=CANCELLED")
                     return 1
-                print(f"STOP {result.error_code or 'LOGIN_REQUIRED'}", file=sys.stderr)
-                return 1
+                return 0
         if args.command == "nurture" and args.nurture_command == "run":
             if not args.headed:
                 print("ERROR HEADED_REQUIRED", file=sys.stderr)
@@ -211,6 +207,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print("ERROR TOTAL_SCAN_LIMIT_INVALID", file=sys.stderr)
                 return 1
             account = accounts.get(args.alias)
+            if account.expected_actor is None:
+                print("ERROR ACCOUNT_NOT_VERIFIED", file=sys.stderr)
+                return 1
             lock = profile_lock(data_root, account)
             with lock:
                 from .reader import UiReadError

@@ -155,6 +155,8 @@ async def run_page_workflow(
     show_post_text: bool = False,
     show_observed_text: bool = False,
 ) -> NurtureResult:
+    if account.expected_actor is None:
+        raise BrowserDataError("ACCOUNT_NOT_VERIFIED")
     if not 1 <= max_posts <= 20:
         raise UiReadError("POST_LIMIT_INVALID")
     if not 0 <= max_scrolls <= 20:
@@ -564,6 +566,8 @@ async def run_browser_nurture(
     show_post_text: bool = False,
     show_observed_text: bool = False,
 ) -> NurtureResult:
+    if account.expected_actor is None:
+        raise BrowserDataError("ACCOUNT_NOT_VERIFIED")
     ensure_safe_browser_profile(account.profile_directory)
     try:
         async with async_playwright() as playwright:

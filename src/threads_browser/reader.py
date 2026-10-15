@@ -28,6 +28,7 @@ from playwright.async_api import (
 THREADS_ORIGIN = "https://www.threads.com"
 HOME_URL = f"{THREADS_ORIGIN}/"
 _NAVIGATION_TIMEOUT_MS = 20_000
+_AUTHENTICATION_TIMEOUT_MS = 60 * 60 * 1000
 _DETAIL_TIMEOUT_MS = 15_000
 _READINESS_TIMEOUT_MS = 8_000
 _AUTOMATIC_READINESS_WINDOWS = 2
@@ -337,14 +338,14 @@ class ThreadsHomeReader:
     def __init__(
         self,
         page: Page,
-        expected_actor: str,
+        expected_actor: str | None,
         *,
         readiness_prompt: Callable[[str, int], Awaitable[bool]] | None = None,
     ) -> None:
-        if _USERNAME.fullmatch(expected_actor) is None:
+        if expected_actor is not None and _USERNAME.fullmatch(expected_actor) is None:
             raise UiReadError("ACTOR_INVALID")
         self._page = page
-        self._expected_actor = expected_actor.casefold()
+        self._expected_actor = None if expected_actor is None else expected_actor.casefold()
         self._readiness_prompt = readiness_prompt
         self._home_url: str | None = None
         self._verified_actor_route: str | None = None
@@ -615,16 +616,17 @@ class ThreadsHomeReader:
         )
         await self._follow_profile_control(control)
 
-    async def verify_login_actor(self) -> None:
-        """Verify the signed-in actor from Threads navigation without reading feed posts."""
-        try:
-            await self._page.goto(
-                HOME_URL,
-                wait_until="domcontentloaded",
-                timeout=_NAVIGATION_TIMEOUT_MS,
-            )
-        except PlaywrightTimeoutError:
-            raise UiReadError("HOME_NAVIGATION_TIMEOUT") from None
+    async def verify_login_actor(self) -> str:
+        """Verify the signed-in actor through Threads navigation and return Home."""
+        if not self._is_home_navigation_url(self._page.url):
+            try:
+                await self._page.goto(
+                    HOME_URL,
+                    wait_until="domcontentloaded",
+                    timeout=_NAVIGATION_TIMEOUT_MS,
+                )
+            except PlaywrightTimeoutError:
+                raise UiReadError("HOME_NAVIGATION_TIMEOUT") from None
 
         if not _same_home_origin(self._page.url):
             raise UiReadError("OFF_ORIGIN_REDIRECT")
@@ -644,8 +646,61 @@ class ThreadsHomeReader:
 
         controls = await self._visible_profile_controls()
         if not controls:
-            raise UiReadError("LOGIN_REQUIRED")
-        await self._follow_profile_control(controls[0], return_home=False)
+            body = self._page.locator("body")
+            if (
+                await body.get_attribute("aria-busy") == "true"
+                or not normalize_text(await body.inner_text())
+            ):
+                raise UiReadError("LOGIN_LOADING")
+            raise UiReadError("LOGIN_UI_UNSUPPORTED")
+        actor = await self._follow_profile_control(controls[0], return_home=False)
+        await self._return_to_threads_home()
+        return actor
+
+    async def wait_for_login_control(self) -> None:
+        """Wait for a visible Home navigation control without navigating or submitting."""
+        try:
+            await self._page.wait_for_function(
+                """() => {
+                    if (location.origin !== "https://www.threads.com") return false;
+                    const labels = new Set(["profile", "your profile", "account"]);
+                    const navs = document.querySelectorAll('nav, [role="navigation"]');
+                    for (const nav of navs) {
+                        const navStyle = getComputedStyle(nav);
+                        const navBox = nav.getBoundingClientRect();
+                        if (
+                            navStyle.display === "none"
+                            || navStyle.visibility === "hidden"
+                            || navBox.width <= 0
+                            || navBox.height <= 0
+                        ) continue;
+                        for (const control of nav.querySelectorAll(
+                            'a, button, [role="link"], [role="button"]'
+                        )) {
+                            const label = (
+                                control.getAttribute("aria-label")
+                                || control.innerText
+                                || control.textContent
+                                || ""
+                            ).trim().toLocaleLowerCase();
+                            const style = getComputedStyle(control);
+                            const box = control.getBoundingClientRect();
+                            if (
+                                labels.has(label)
+                                && style.display !== "none"
+                                && style.visibility !== "hidden"
+                                && box.width > 0
+                                && box.height > 0
+                            ) return true;
+                        }
+                    }
+                    return false;
+                }""",
+                polling=1000,
+                timeout=_AUTHENTICATION_TIMEOUT_MS,
+            )
+        except PlaywrightTimeoutError:
+            raise UiReadError("AUTHENTICATION_TIMEOUT") from None
 
     async def _visible_profile_controls(self) -> list[Locator]:
         controls = await self._visible_navigation_controls("link")
@@ -694,7 +749,7 @@ class ThreadsHomeReader:
         control: Locator,
         *,
         return_home: bool = True,
-    ) -> None:
+    ) -> str:
         href = await control.get_attribute("href")
         destination = None if href is None else urljoin(self._page.url, href)
         if destination is not None and not _same_home_origin(destination):
@@ -706,7 +761,7 @@ class ThreadsHomeReader:
             pass
         self._mark_ui_transition()
 
-        async def verify_profile_navigation(deadline: float) -> None:
+        async def verify_profile_navigation(deadline: float) -> str:
             remaining = self._remaining_readiness_ms(
                 deadline,
                 "PROFILE_CLICK_NO_NAVIGATION",
@@ -722,15 +777,16 @@ class ThreadsHomeReader:
                     )
                 except PlaywrightTimeoutError:
                     raise UiReadError("PROFILE_CLICK_NO_NAVIGATION") from None
-            await self._verify_current_profile_route()
+            actor = await self._verify_current_profile_route()
             await self._await_render_settled(
                 "PROFILE_VERIFY",
                 deadline,
                 timeout_code="PROFILE_CLICK_NO_NAVIGATION",
                 observe=self._observe_profile_render,
             )
+            return actor
 
-        await self._recoverable_stage(
+        actor = await self._recoverable_stage(
             "PROFILE_VERIFY",
             "PROFILE_CLICK_NO_NAVIGATION",
             verify_profile_navigation,
@@ -738,8 +794,9 @@ class ThreadsHomeReader:
         )
         if return_home:
             await self._go_back_to_home()
+        return actor
 
-    async def _verify_current_profile_route(self) -> None:
+    async def _verify_current_profile_route(self) -> str:
         await self._check_blocker()
         if not _same_home_origin(self._page.url):
             raise UiReadError("OFF_ORIGIN_REDIRECT")
@@ -756,9 +813,11 @@ class ThreadsHomeReader:
         actor = _profile_author(self._page.url)
         if actor is None:
             raise UiReadError("PROFILE_ROUTE_UNVERIFIED")
-        if actor != self._expected_actor:
+        if self._expected_actor is not None and actor != self._expected_actor:
             raise UiReadError("ACTOR_MISMATCH")
+        self._expected_actor = actor
         self._verified_actor_route = self._page.url
+        return actor
 
     async def _go_back_to_home(self) -> None:
         previous_url = self._page.url
@@ -820,6 +879,21 @@ class ThreadsHomeReader:
             verify_home_return,
             recoverable_codes=("RETURN_UNVERIFIED",),
         )
+
+    async def _return_to_threads_home(self) -> None:
+        try:
+            await self._page.goto(
+                HOME_URL,
+                wait_until="domcontentloaded",
+                timeout=_NAVIGATION_TIMEOUT_MS,
+            )
+        except PlaywrightTimeoutError:
+            raise UiReadError("HOME_NAVIGATION_TIMEOUT") from None
+        if not _same_home_origin(self._page.url):
+            raise UiReadError("OFF_ORIGIN_REDIRECT")
+        if not self._is_home_navigation_url(self._page.url):
+            raise UiReadError("HOME_NAVIGATION_TIMEOUT")
+        await self._check_blocker()
 
     async def scan_viewport(
         self,

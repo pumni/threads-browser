@@ -127,6 +127,120 @@ def test_account_registration_can_create_a_new_profile_and_preserves_schema(
     assert store.get("pilot") == account
 
 
+def test_local_account_registration_creates_an_unbound_dedicated_profile(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "private-root"
+    store = AccountStore(root)
+
+    account = store.add("local1")
+    document = json.loads((root / "accounts" / "local1.json").read_text(encoding="utf-8"))
+
+    assert account.expected_actor is None
+    assert account.profile_directory == (root / "profiles" / "local1").resolve()
+    assert account.profile_directory.is_dir()
+    assert document == {
+        "schema_version": 2,
+        "account_id": str(account.account_id),
+        "alias": "local1",
+        "expected_actor": None,
+        "profile_directory": str(account.profile_directory),
+    }
+    assert store.get("local1") == account
+
+
+def test_local_account_binding_is_atomic_and_preserves_identity(tmp_path: Path) -> None:
+    root = tmp_path / "private-root"
+    store = AccountStore(root)
+    account = store.add("local1")
+
+    bound = store.bind_actor(account, "@Offline.Operator")
+    document = json.loads((root / "accounts" / "local1.json").read_text(encoding="utf-8"))
+
+    assert bound.account_id == account.account_id
+    assert bound.profile_directory == account.profile_directory
+    assert bound.expected_actor == "offline.operator"
+    assert document["schema_version"] == 2
+    assert document["expected_actor"] == "offline.operator"
+    assert set(document) == {
+        "schema_version",
+        "account_id",
+        "alias",
+        "expected_actor",
+        "profile_directory",
+    }
+    assert store.get("local1") == bound
+
+
+def test_local_account_binding_never_replaces_a_saved_actor(tmp_path: Path) -> None:
+    store = AccountStore(tmp_path / "private-root")
+    account = store.add("local1")
+    bound = store.bind_actor(account, "first.actor")
+
+    with pytest.raises(BrowserDataError) as caught:
+        store.bind_actor(bound, "second.actor")
+
+    assert caught.value.code == "ACTOR_MISMATCH"
+    assert store.get("local1") == bound
+
+
+def test_local_accounts_have_independent_profiles_and_ids(tmp_path: Path) -> None:
+    root = tmp_path / "private-root"
+    store = AccountStore(root)
+
+    first = store.add("local1")
+    second = store.add("local2")
+
+    assert first.account_id != second.account_id
+    assert first.profile_directory != second.profile_directory
+    assert store.get("local1") == first
+    assert store.get("local2") == second
+
+
+def test_local_account_duplicate_does_not_overwrite_profile_or_metadata(
+    tmp_path: Path,
+) -> None:
+    store = AccountStore(tmp_path / "private-root")
+    first = store.add("local1")
+    metadata = (tmp_path / "private-root" / "accounts" / "local1.json").read_bytes()
+
+    with pytest.raises(BrowserDataError) as caught:
+        store.add("local1")
+
+    assert caught.value.code == "ACCOUNT_EXISTS"
+    assert (tmp_path / "private-root" / "accounts" / "local1.json").read_bytes() == metadata
+    assert store.get("local1") == first
+
+
+def test_local_account_rejects_an_orphaned_existing_profile(tmp_path: Path) -> None:
+    root = tmp_path / "private-root"
+    orphan = root / "profiles" / "local1"
+    orphan.mkdir(parents=True)
+
+    with pytest.raises(BrowserDataError) as caught:
+        AccountStore(root).add("local1")
+
+    assert caught.value.code == "PROFILE_EXISTS"
+    assert orphan.is_dir()
+    assert not (root / "accounts" / "local1.json").exists()
+
+
+def test_legacy_account_json_remains_readable(tmp_path: Path) -> None:
+    root = tmp_path / "private-root"
+    profile = tmp_path / "legacy-profile"
+    profile.mkdir()
+    store = AccountStore(root)
+    original = store.add("legacy1", "@Offline.Operator", profile)
+
+    loaded = store.get("legacy1")
+
+    assert loaded == original
+    assert loaded.expected_actor == "offline.operator"
+    assert json.loads((root / "accounts" / "legacy1.json").read_text(encoding="utf-8"))[
+        "schema_version"
+    ] == 1
+
+
 def test_account_creation_does_not_overwrite_an_existing_profile(
     tmp_path: Path,
 ) -> None:

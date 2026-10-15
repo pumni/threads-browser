@@ -11,36 +11,52 @@ From this repository, install the package and its development tools, then instal
 
 ### Windows PowerShell onboarding
 
-Create a dedicated profile, then open it in visible Chromium and complete login yourself:
+Create a local account and open its dedicated Chromium profile:
 
 ```powershell
-# 1. Install dependencies and Chromium
 uv sync
 uv run playwright install chromium
 
-# 2. Register the account and create its dedicated profile directory
-uv run threads-browser account add my-account --actor "@example" --profile-dir "$env:LOCALAPPDATA\ThreadsBrowser\profiles\my-account" --create-profile
+uv run threads-browser account add local1
+uv run threads-browser account login local1
 
-# 3. Log into Threads manually in the Chromium window
-uv run threads-browser account login my-account --headed
+# Later, reopen the same account and persistent browser session
+uv run threads-browser account login local1
 
-# 4. Run the existing bounded, read-only workflow
-uv run threads-browser nurture run my-account --headed --max-posts 2 --max-scrolls 8 --max-total-posts 40 --term "hiring"
+# Use the same profile for bounded, read-only nurture
+uv run threads-browser nurture run local1 --headed --max-posts 2 --max-scrolls 1 --max-total-posts 5 --term "hiring"
 ```
 
-`--create-profile` creates the requested profile directory only when that exact path is absent. It creates missing parent directories, rejects existing targets, explicit `..` path segments, and paths under default desktop Chrome or Edge profile roots, and does not follow symlinks or junctions while creating the path. Without the flag, `account add` keeps its existing behavior and requires an existing directory. Never use a default desktop browser data directory or copy another browser profile, cookies, or authentication data.
+`account add local1` creates a unique account ID, account metadata, and a separate Chromium profile under `%LOCALAPPDATA%\ThreadsBrowser\profiles\local1`. The account begins unverified with no expected actor. Each alias gets its own account file and profile. Registration rejects duplicate aliases and does not replace an existing profile. The application rejects unsafe symlinks, junctions, path traversal, and default Chrome or Edge desktop profile roots. Never copy another browser profile or import its cookies or authentication data.
 
-The account JSON keeps only the account ID, alias, expected actor, and profile path. It never stores credentials, cookies, or exported browser state. The login command launches persistent Chromium with that same profile path used by `nurture run`, opens `https://www.threads.com/`, and waits for you to finish login and any MFA or account challenge in the visible browser. The CLI does not accept a password. After you press Enter, it clicks the visible Profile control and checks the resulting on-site `/@actor` route against the registered actor. An incorrect account stops with `ACTOR_MISMATCH`; incomplete login stops with `LOGIN_REQUIRED`. After a failed check, you can correct the browser and explicitly retry once, or enter `q` to cancel.
+On the first `account login`, Chromium opens visibly at Threads. Sign in and complete any MFA or security challenge directly in the official browser UI. The CLI detects the visible Profile navigation control, clicks it, verifies the resulting on-site `/@actor` route, and atomically binds that actor to the local account. It then returns to Threads Home and leaves Chromium open. No terminal confirmation or password entry is needed. Close the Chromium window when finished; the command then exits and releases the profile lock. Ctrl+C is also a cancellation path.
 
-Login requires `--headed` and an interactive terminal with both stdin and stdout attached to a terminal. It keeps Chromium open while waiting for your input. Cancellation, verification failure, and browser errors close the context and release the profile lock. The same lock prevents `account login` and `nurture run` from using one profile concurrently.
+Later logins open the same persistent profile and check the live session. If it is still signed in as the bound actor, the CLI reports `SESSION_REUSED` and `VERIFIED`, navigates to Threads Home, and keeps the browser open. Chromium stores its session only in its own profile. The account JSON contains the account ID, alias, expected actor, and profile path; it never stores a password, cookies, or exported browser state. The CLI does not automate credential entry or bypass verification.
 
-Chromium’s persistent profile is reused by later `nurture run` executions. If the session expires, the read-only workflow stops with `LOGIN_REQUIRED`; run `uv run threads-browser account login my-account --headed` to authenticate again. Re-login reuses the account ID and profile and does not rewrite account metadata.
+If a session expires, `nurture run` stops with `LOGIN_REQUIRED`. Run `uv run threads-browser account login local1` to authenticate manually again in the same profile. This preserves the account ID, actor binding, and checkpoints. A different signed-in actor stops with `ACTOR_MISMATCH`; normal login never relinks an account. If the account has not completed its first verified login, `nurture run` stops with `ACCOUNT_NOT_VERIFIED`.
 
-If a profile directory already exists, register it without `--create-profile` only when it is a dedicated automation profile that you provisioned for this application:
+The browser profile lock is held for the full time Chromium is open. Do not run `nurture run` or another login for the same account until that browser closes. Login always opens headed Chromium; the legacy `--headed` flag remains accepted. It does not require terminal input while the browser is open.
+
+### Existing accounts
+
+Existing schema version 1 accounts remain readable and keep their registered actor, account ID, and profile path. Continue registering a pre-existing dedicated automation profile with the explicit form:
 
 ```powershell
-uv run threads-browser account add my-account --actor "@example" --profile-dir "C:\path\to\dedicated-profile"
+uv run threads-browser account add legacy1 --actor "@example" --profile-dir "C:\path\to\dedicated-profile"
 ```
+
+For compatibility, `--create-profile` remains available with explicit `--actor` and `--profile-dir` when creating a new dedicated directory. Without that flag, explicit registration still requires the directory to exist. Omitting both options selects the local-first flow. Existing accounts are not silently migrated or rebound.
+
+### Owner-run live UI UAT
+
+Automated tests use local Chromium fixtures and do not sign in to Threads. Before relying on the current live UI, an authorized operator should run this Windows PowerShell check with a test account:
+
+1. Run `uv run threads-browser account add local1`, then `uv run threads-browser account login local1` and sign in manually.
+2. Confirm `LOGIN status=VERIFIED` and that the saved account actor matches the profile reached from the visible Profile control.
+3. Close Chromium, then run `uv run threads-browser account login local1` again. Confirm it reports `SESSION_REUSED`, returns to Threads Home, and leaves Chromium open.
+4. Close Chromium and run `uv run threads-browser nurture run local1 --headed --max-posts 2 --max-scrolls 1 --max-total-posts 5 --term "hiring"`. Confirm the same profile is used and the bounded, read-only workflow completes safely.
+
+Live Threads UI compatibility is **UNVERIFIED_LIVE_UI** until this owner-run UAT has been completed. Unsupported UI, rate limits, challenges, navigation failures, and actor mismatches stop with a fixed status instead of being bypassed.
 
 Run a headed, read-only Home / For You search. `--max-posts` caps visible post rows accounted for in each viewport (1-20); if more candidate rows are visible than the cap, the run reports `VIEWPORT_COVERAGE_INCOMPLETE` and stops before scrolling, opening Detail, or saving a checkpoint. The defaults allow up to eight observed wheel advances and forty distinct provenance-verified posts per run. Terms are local relevance hints; they are not search queries and do not navigate to Search. Each `--term` is normalized and matched as a literal substring of extracted text. Configure job-seeking and hiring phrases separately when both matter, for example `--term "đang tìm việc" --term "đang tuyển"`.
 

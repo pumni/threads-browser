@@ -3,29 +3,64 @@
 from __future__ import annotations
 
 import asyncio
-import sys
 from dataclasses import dataclass
 from typing import Literal
 
+from playwright.async_api import BrowserContext, Page, async_playwright
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-from playwright.async_api import async_playwright
 
 from .reader import HOME_URL, ThreadsHomeReader, UiReadError
-from .storage import BrowserAccount, BrowserDataError, ensure_safe_browser_profile
+from .storage import (
+    AccountStore,
+    BrowserAccount,
+    BrowserDataError,
+    ensure_safe_browser_profile,
+)
 
-_MAX_VERIFICATION_ATTEMPTS = 2
-_NAVIGATION_TIMEOUT_MS = 20_000
+_WAITABLE_LOGIN_CODES = {"LOGIN_REQUIRED", "LOGIN_LOADING", "CHALLENGE_REQUIRED"}
 
 
 @dataclass(frozen=True, slots=True)
 class ManualLoginResult:
-    status: Literal["VERIFIED", "CANCELLED", "FAILED"]
-    error_code: str | None = None
+    status: Literal["CLOSED", "CANCELLED"]
 
 
-async def run_manual_login(account: BrowserAccount) -> ManualLoginResult:
-    """Open the registered profile and verify identity after human confirmation."""
+async def _wait_for_authentication(
+    page: Page,
+    context: BrowserContext,
+    expected_actor: str | None,
+) -> bool:
+    """Wait for the visible profile control or for the operator to close Chromium."""
+    reader = ThreadsHomeReader(page, expected_actor)
+    readiness = asyncio.create_task(reader.wait_for_login_control())
+    closed = asyncio.create_task(context.wait_for_event("close"))
+    try:
+        done, _ = await asyncio.wait(
+            (readiness, closed),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if closed in done or context.is_closed():
+            return False
+        try:
+            await readiness
+        except PlaywrightError:
+            if context.is_closed():
+                return False
+            raise
+        return not context.is_closed()
+    finally:
+        for task in (readiness, closed):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(readiness, closed, return_exceptions=True)
+
+
+async def run_manual_login(
+    account: BrowserAccount,
+    accounts: AccountStore,
+) -> ManualLoginResult:
+    """Open Chromium, verify or establish the actor binding, and wait for window close."""
     ensure_safe_browser_profile(account.profile_directory)
     context = None
     try:
@@ -36,56 +71,71 @@ async def run_manual_login(account: BrowserAccount) -> ManualLoginResult:
                     headless=False,
                 )
                 page = context.pages[0] if context.pages else await context.new_page()
+                print(f"ACCOUNT {account.alias}")
                 await page.goto(
                     HOME_URL,
                     wait_until="domcontentloaded",
-                    timeout=_NAVIGATION_TIMEOUT_MS,
+                    timeout=20_000,
                 )
 
-                print("LOGIN status=WAITING_FOR_USER")
-                print("Open Threads in the Chromium window and log in manually.")
-                print("Complete any required verification in the browser.")
-                print("Press Enter after login is complete, or q to cancel.")
+                session_reused = False
+                try:
+                    actor = await ThreadsHomeReader(
+                        page,
+                        account.expected_actor,
+                    ).verify_login_actor()
+                    session_reused = account.expected_actor is not None
+                except UiReadError as error:
+                    if error.code not in _WAITABLE_LOGIN_CODES:
+                        raise
+                    print("LOGIN status=WAITING_FOR_AUTHENTICATION")
+                    print(
+                        "Log in or complete verification in Chromium. "
+                        "Close the browser or press Ctrl+C to cancel."
+                    )
+                    while True:
+                        if not await _wait_for_authentication(
+                            page,
+                            context,
+                            account.expected_actor,
+                        ):
+                            return ManualLoginResult("CANCELLED")
+                        try:
+                            actor = await ThreadsHomeReader(
+                                page,
+                                account.expected_actor,
+                            ).verify_login_actor()
+                        except UiReadError as retry_error:
+                            if retry_error.code in _WAITABLE_LOGIN_CODES:
+                                continue
+                            raise
+                        break
 
-                last_error = "LOGIN_REQUIRED"
-                for attempt in range(_MAX_VERIFICATION_ATTEMPTS):
-                    try:
-                        answer = await asyncio.to_thread(
-                            input,
-                            "Login verification > ",
-                        )
-                    except EOFError:
-                        return ManualLoginResult("CANCELLED")
-                    if answer.strip().casefold() in {"q", "quit"}:
-                        return ManualLoginResult("CANCELLED")
+                try:
+                    accounts.bind_actor(account, actor)
+                except BrowserDataError as error:
+                    if error.code == "ACTOR_MISMATCH":
+                        raise UiReadError("ACTOR_MISMATCH") from None
+                    raise
 
-                    try:
-                        await ThreadsHomeReader(page, account.expected_actor).verify_login_actor()
-                    except UiReadError as error:
-                        last_error = error.code
-                        if attempt + 1 < _MAX_VERIFICATION_ATTEMPTS:
-                            print(f"STOP {error.code}", file=sys.stderr)
-                            print(
-                                f"LOGIN status=NOT_VERIFIED reason={error.code}",
-                                file=sys.stderr,
-                            )
-                            print(
-                                "Finish login or select the registered account in Chromium, "
-                                "then press Enter to retry; enter q to cancel.",
-                                file=sys.stderr,
-                            )
-                            continue
-                        return ManualLoginResult("FAILED", error.code)
-                    return ManualLoginResult("VERIFIED")
-                return ManualLoginResult("FAILED", last_error)
+                if session_reused:
+                    print("LOGIN status=SESSION_REUSED")
+                print("LOGIN status=VERIFIED")
+                print("BROWSER status=OPEN")
+                await context.wait_for_event("close")
+                return ManualLoginResult("CLOSED")
+            except PlaywrightTimeoutError:
+                if context is not None and context.is_closed():
+                    return ManualLoginResult("CANCELLED")
+                raise UiReadError("HOME_NAVIGATION_TIMEOUT") from None
+            except PlaywrightError:
+                if context is not None and context.is_closed():
+                    return ManualLoginResult("CANCELLED")
+                raise UiReadError("BROWSER_SESSION_UNAVAILABLE") from None
             finally:
-                if context is not None:
+                if context is not None and not context.is_closed():
                     await context.close()
     except (UiReadError, BrowserDataError):
         raise
-    except PlaywrightTimeoutError:
-        raise UiReadError("BROWSER_SESSION_UNAVAILABLE") from None
-    except PlaywrightError:
-        raise UiReadError("BROWSER_SESSION_UNAVAILABLE") from None
     except (OSError, RuntimeError, ValueError):
         raise UiReadError("BROWSER_SESSION_UNAVAILABLE") from None

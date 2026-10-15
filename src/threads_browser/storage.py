@@ -50,6 +50,8 @@ _ERROR_CODES = {
     "ACCOUNT_INVALID",
     "ACCOUNT_NOT_FOUND",
     "ACCOUNT_EXISTS",
+    "ACCOUNT_NOT_VERIFIED",
+    "ACTOR_MISMATCH",
     "DATA_ROOT_INVALID",
     "DATA_ROOT_UNAVAILABLE",
     "PROFILE_UNAVAILABLE",
@@ -74,7 +76,7 @@ class BrowserDataError(Exception):
 class BrowserAccount:
     account_id: UUID
     alias: str
-    expected_actor: str = field(repr=False)
+    expected_actor: str | None = field(repr=False)
     profile_directory: Path = field(repr=False)
 
     def __repr__(self) -> str:
@@ -323,49 +325,69 @@ class AccountStore:
     def add(
         self,
         alias: str,
-        actor: str,
-        profile_directory: Path,
+        actor: str | None = None,
+        profile_directory: Path | None = None,
         *,
         create_profile: bool = False,
     ) -> BrowserAccount:
         if _ALIAS.fullmatch(alias) is None:
             raise BrowserDataError("ACCOUNT_INVALID")
-        expected_actor = normalize_actor(actor)
-        try:
-            expanded_profile = profile_directory.expanduser()
-            if create_profile and ".." in expanded_profile.parts:
-                raise BrowserDataError("PROFILE_UNAVAILABLE")
-            profile_candidate = (
-                Path(os.path.abspath(expanded_profile))
-                if create_profile
-                else expanded_profile.resolve(strict=False)
-            )
-        except (OSError, RuntimeError, ValueError):
-            raise BrowserDataError("PROFILE_UNAVAILABLE") from None
-        ensure_safe_browser_profile(profile_candidate)
+        if (actor is None) != (profile_directory is None):
+            raise BrowserDataError("ACCOUNT_INVALID")
 
-        if not create_profile:
+        local_account = actor is None
+        expected_actor = None if local_account else normalize_actor(actor)
+        try:
+            root_candidate = self._data_root.expanduser().resolve(strict=False)
+        except (OSError, RuntimeError, ValueError):
+            raise BrowserDataError("DATA_ROOT_INVALID") from None
+        if local_account:
+            profile_candidate = root_candidate / "profiles" / alias
+            ensure_safe_browser_profile(profile_candidate)
+            root = _ensure_root(root_candidate)
+            profile_candidate = root / "profiles" / alias
+            ensure_safe_browser_profile(profile_candidate)
+            should_create_profile = True
+            schema_version = 2
+        else:
             try:
-                profile = profile_directory.expanduser().resolve(strict=True)
+                expanded_profile = profile_directory.expanduser()
+                if create_profile and ".." in expanded_profile.parts:
+                    raise BrowserDataError("PROFILE_UNAVAILABLE")
+                profile_candidate = (
+                    Path(os.path.abspath(expanded_profile))
+                    if create_profile
+                    else expanded_profile.resolve(strict=False)
+                )
             except (OSError, RuntimeError, ValueError):
                 raise BrowserDataError("PROFILE_UNAVAILABLE") from None
-            if not profile.is_dir():
-                raise BrowserDataError("PROFILE_UNAVAILABLE")
-            ensure_safe_browser_profile(profile)
+            if create_profile:
+                ensure_safe_browser_profile(profile_candidate)
+                should_create_profile = True
+            else:
+                try:
+                    profile = profile_directory.expanduser().resolve(strict=True)
+                except (OSError, RuntimeError, ValueError):
+                    raise BrowserDataError("PROFILE_UNAVAILABLE") from None
+                if not profile.is_dir():
+                    raise BrowserDataError("PROFILE_UNAVAILABLE")
+                ensure_safe_browser_profile(profile)
+                should_create_profile = False
+            schema_version = 1
 
-        root = _ensure_root(self._data_root)
+        root = _ensure_root(root_candidate)
         lock_path = root / "locks" / "registry.lock"
         with ProcessLock(lock_path):
             target = _account_path(root, alias)
             if target.exists():
                 raise BrowserDataError("ACCOUNT_EXISTS")
             created_profile = False
-            if create_profile:
+            if should_create_profile:
                 profile = _create_dedicated_profile(profile_candidate)
                 created_profile = True
             account = BrowserAccount(uuid4(), alias, expected_actor, profile)
             document = {
-                "schema_version": 1,
+                "schema_version": schema_version,
                 "account_id": str(account.account_id),
                 "alias": account.alias,
                 "expected_actor": account.expected_actor,
@@ -390,10 +412,49 @@ class AccountStore:
         document = _read_json(target)
         if document is None:
             raise BrowserDataError("ACCOUNT_NOT_FOUND")
+        return self._decode_account(alias, document, root)
+
+    def bind_actor(self, account: BrowserAccount, actor: str) -> BrowserAccount:
+        """Atomically bind an unverified local account to its first verified actor."""
+        expected_actor = normalize_actor(actor)
+        root = _ensure_root(self._data_root)
+        with ProcessLock(root / "locks" / "registry.lock"):
+            target = _account_path(root, account.alias)
+            document = _read_json(target)
+            if document is None:
+                raise BrowserDataError("ACCOUNT_NOT_FOUND")
+            current = self._decode_account(account.alias, document, root)
+            if (
+                current.account_id != account.account_id
+                or current.profile_directory != account.profile_directory
+            ):
+                raise BrowserDataError("ACCOUNT_INVALID")
+            if current.expected_actor is not None:
+                if current.expected_actor != expected_actor:
+                    raise BrowserDataError("ACTOR_MISMATCH")
+                return current
+            if document.get("schema_version") != 2:
+                raise BrowserDataError("ACCOUNT_INVALID")
+            document["expected_actor"] = expected_actor
+            _write_json(root, target, document)
+            return BrowserAccount(
+                current.account_id,
+                current.alias,
+                expected_actor,
+                current.profile_directory,
+            )
+
+    @staticmethod
+    def _decode_account(
+        alias: str,
+        document: dict[str, object],
+        root: Path,
+    ) -> BrowserAccount:
+        schema_version = document.get("schema_version")
         if (
             set(document) != _ACCOUNT_KEYS
-            or type(document.get("schema_version")) is not int
-            or document.get("schema_version") != 1
+            or type(schema_version) is not int
+            or schema_version not in {1, 2}
         ):
             raise BrowserDataError("ACCOUNT_INVALID")
         raw_id = document.get("account_id")
@@ -403,16 +464,20 @@ class AccountStore:
         if (
             not isinstance(raw_id, str)
             or raw_alias != alias
-            or not isinstance(raw_actor, str)
+            or (schema_version == 1 and not isinstance(raw_actor, str))
+            or (schema_version == 2 and raw_actor is not None and not isinstance(raw_actor, str))
             or not isinstance(raw_profile, str)
         ):
             raise BrowserDataError("ACCOUNT_INVALID")
         try:
             account_id = UUID(raw_id)
-            expected_actor = normalize_actor(raw_actor)
+            expected_actor = None if raw_actor is None else normalize_actor(raw_actor)
         except (ValueError, BrowserDataError):
             raise BrowserDataError("ACCOUNT_INVALID") from None
-        if str(account_id) != raw_id or expected_actor != raw_actor:
+        if (
+            str(account_id) != raw_id
+            or (expected_actor is not None and expected_actor != raw_actor)
+        ):
             raise BrowserDataError("ACCOUNT_INVALID")
         profile = Path(raw_profile)
         if not profile.is_absolute():
@@ -423,6 +488,15 @@ class AccountStore:
             raise BrowserDataError("PROFILE_UNAVAILABLE") from None
         if resolved_profile != profile or not profile.is_dir():
             raise BrowserDataError("PROFILE_UNAVAILABLE")
+        ensure_safe_browser_profile(profile)
+        if schema_version == 2:
+            expected_profile = root / "profiles" / alias
+            try:
+                expected_profile = expected_profile.resolve(strict=True)
+            except (OSError, RuntimeError, ValueError):
+                raise BrowserDataError("PROFILE_UNAVAILABLE") from None
+            if resolved_profile != expected_profile:
+                raise BrowserDataError("ACCOUNT_INVALID")
         return BrowserAccount(account_id, alias, expected_actor, profile)
 
 @dataclass(frozen=True, slots=True, repr=False)
