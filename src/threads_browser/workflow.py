@@ -187,6 +187,7 @@ async def run_page_workflow(
     unverified_relevant = 0
     skipped_rows = 0
     viewport_coverage_complete = True
+    decisions_by_fingerprint: dict[str, str] = {}
     previous_unverified_rows: list[tuple[str, float]] = []
     viewport_number = 0
     exhaustion_reason = "MAX_SCROLLS"
@@ -198,10 +199,7 @@ async def run_page_workflow(
         viewport_number += 1
         duplicate_count_before_scan = reader.feed_duplicates
         try:
-            targets = await reader.scan_viewport(
-                min(max_posts, remaining),
-                scanned_fingerprints=seen_this_run,
-            )
+            targets = await reader.scan_viewport(min(max_posts, remaining))
         except UiReadError:
             counts = reader.last_scan_counts
             rejection_reasons = ",".join(
@@ -232,6 +230,12 @@ async def run_page_workflow(
         scan_counts = reader.last_scan_counts
         for target in targets:
             if target.fingerprint in seen_this_run:
+                duplicates += 1
+                if (
+                    decisions_by_fingerprint.get(target.fingerprint) == "RELEVANT"
+                    and target.fingerprint in pending_set
+                ):
+                    viewport_relevant_targets.append(target)
                 continue
             seen_this_run.add(target.fingerprint)
             if target.body and target.body.strip():
@@ -243,6 +247,7 @@ async def run_page_workflow(
             else:
                 duplicates += 1
             decision = classify_body(target.body, normalized_terms)
+            decisions_by_fingerprint[target.fingerprint] = decision
             classified += 1
             if show_post_text and _print_post_text(
                 viewport_number,
@@ -390,6 +395,37 @@ async def run_page_workflow(
                 viewport_coverage_complete=False,
             )
         if viewport_relevant_targets:
+            viewport_relevant_targets.sort(
+                key=lambda target: target.fingerprint in previously_seen
+            )
+            if max_scrolls > 0 and reader.scroll_attempts == 0:
+                if await reader.advance_feed():
+                    if len(seen_this_run) >= max_total_posts:
+                        if (
+                            reader.last_viewport_coverage_complete
+                            and reader.last_viewport_observed_rows <= max_posts
+                        ):
+                            still_visible = [
+                                target
+                                for target in reader.last_scroll_targets
+                                if target.fingerprint in pending_set
+                                and decisions_by_fingerprint.get(target.fingerprint)
+                                == "RELEVANT"
+                                and classify_body(target.body, normalized_terms)
+                                == "RELEVANT"
+                            ]
+                            still_visible.sort(
+                                key=lambda target: target.fingerprint in previously_seen
+                            )
+                            if still_visible:
+                                selected = still_visible[0]
+                                break
+                        exhaustion_reason = "MAX_TOTAL_POSTS"
+                        break
+                    continue
+                if reader.last_scroll_stop_reason == "FEED_END_REACHED":
+                    exhaustion_reason = "FEED_END_REACHED"
+                    break
             viewport_selected = viewport_relevant_targets[0]
         if viewport_selected is not None:
             selected = viewport_selected
@@ -400,14 +436,22 @@ async def run_page_workflow(
         if reader.scroll_attempts >= max_scrolls:
             exhaustion_reason = "MAX_SCROLLS"
             break
-        await reader.advance_feed()
+        if not await reader.advance_feed():
+            exhaustion_reason = reader.last_scroll_stop_reason or "FEED_NOT_ADVANCED"
+            break
 
     detail_reads = 0
     if selected is None and not found_relevant:
-        print(
-            f"SEARCH_BUDGET_EXHAUSTED reason={exhaustion_reason} "
-            f"viewports={viewport_number}"
-        )
+        if exhaustion_reason in {"FEED_END_REACHED", "FEED_NOT_SCROLLABLE"}:
+            print(
+                f"SEARCH_STOP reason={exhaustion_reason} "
+                f"viewports={viewport_number}"
+            )
+        else:
+            print(
+                f"SEARCH_BUDGET_EXHAUSTED reason={exhaustion_reason} "
+                f"viewports={viewport_number}"
+            )
     if selected is not None:
         await reader.read_detail(selected)
         print("DETAIL_VERIFIED status=PROVENANCE_VERIFIED")
@@ -480,8 +524,44 @@ async def run_page_workflow(
             skipped_rows=skipped_rows,
             viewport_coverage_complete=viewport_coverage_complete,
         )
-    elif pending_set:
-        status = "RELEVANT_POST_NOT_CURRENT"
+    elif pending_set or (
+        found_relevant and exhaustion_reason == "FEED_END_REACHED"
+    ):
+        incomplete_status = (
+            "FEED_END_REACHED"
+            if exhaustion_reason == "FEED_END_REACHED"
+            else "RELEVANT_POST_NOT_CURRENT"
+        )
+        print(f"SEARCH_INCOMPLETE reason={incomplete_status}")
+        return NurtureResult(
+            status=incomplete_status,
+            home_sampled=len(seen_this_run),
+            home_new=len(new_fingerprints),
+            home_relevant=relevant,
+            home_irrelevant=irrelevant,
+            home_unknown=unknown,
+            duplicates=duplicates,
+            detail_reads=0,
+            scroll_attempts=reader.scroll_attempts,
+            scrolls=reader.scrolls,
+            checkpoint_runs=checkpoint.completed_runs,
+            home_relevant_ratio=(
+                None if not seen_this_run else relevant / len(seen_this_run)
+            ),
+            skipped_unverified=reader.skipped_unverified,
+            observed_rows=observed_rows,
+            body_extracted=body_extracted,
+            provenance_verified=provenance_verified,
+            classified=classified,
+            observation_unknown=observation_unknown,
+            unverified_relevant=unverified_relevant,
+            skipped_rows=skipped_rows,
+            viewport_coverage_complete=viewport_coverage_complete,
+        )
+    elif exhaustion_reason == "FEED_END_REACHED":
+        status = "FEED_END_REACHED"
+    elif exhaustion_reason == "FEED_NOT_SCROLLABLE":
+        status = "FEED_NOT_SCROLLABLE"
     elif unverified_relevant and not seen_this_run:
         status = "OBSERVED_UNVERIFIED_ONLY"
     elif found_relevant or relevant:

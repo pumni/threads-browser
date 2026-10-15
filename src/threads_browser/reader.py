@@ -111,7 +111,7 @@ class _UnverifiedFeedCandidate(UiReadError):
 @dataclass(frozen=True, slots=True)
 class _CardWaitSignal:
     locator: Locator
-    condition: Literal["visible", "in_viewport", "nonempty_text", "mutation"]
+    condition: Literal["visible", "in_viewport", "nonempty_text", "retry"]
     timeout_code: str | None = None
 
 
@@ -123,7 +123,7 @@ class _CardNotReady(Exception):
         in_viewport: bool = False,
         nonempty_text: bool = False,
         timeout_code: str | None = None,
-        condition: Literal["visible", "mutation"] = "visible",
+        condition: Literal["visible", "retry"] = "visible",
         signals: tuple[_CardWaitSignal, ...] | None = None,
     ) -> None:
         if signals is None:
@@ -244,13 +244,16 @@ class ThreadsHomeReader:
         self.feed_duplicates = 0
         self.last_scan_counts = _FeedScanCounts()
         self.last_display_observations: tuple[DisplayObservation, ...] = ()
+        self.last_scroll_targets: tuple[PostTarget, ...] = ()
         self.last_viewport_coverage_complete = True
         self.last_viewport_observed_rows = 0
         self._last_viewport_limit = 20
         self.last_scroll_delta = 0.0
+        self.last_scroll_stop_reason: str | None = None
         self._last_viewport_signature: tuple[object, ...] | None = None
         self._last_viewport_candidate_roots: tuple[Locator, ...] = ()
         self._carried_viewport_candidate_roots: tuple[Locator, ...] = ()
+        self._detail_return_anchor: tuple[str, float] | None = None
         self._reported_render_rescans: set[tuple[str, float | None]] = set()
         self._skipped_candidate_identities: set[str] = set()
         self._reported_candidate_skips: dict[tuple[str, str], set[str]] = {}
@@ -429,38 +432,30 @@ class ThreadsHomeReader:
                                 "FOR_YOU_ACTIVATION_NOT_READY"
                             ) from None
                         continue
-                    handle = await active_control.element_handle()
-                    if handle is None:
-                        await self._wait_for_pending_card(
-                            _CardNotReady(
-                                self._page.locator("body"),
-                                condition="mutation",
-                            ),
-                            deadline,
-                        )
-                        continue
-                    result = None
                     try:
-                        result = await self._page.wait_for_function(
-                            "element => element.isConnected && "
-                            "(element.getAttribute('aria-current') === 'page' || "
-                            "element.getAttribute('aria-selected') === 'true' || "
-                            "(location.origin === 'https://www.threads.com' && "
-                            "location.pathname === '/for_you' && !location.search && "
-                            "!location.hash))",
-                            arg=handle,
+                        await expect(active_control).to_have_attribute(
+                            "aria-current",
+                            "page",
                             timeout=remaining,
-                            polling="raf",
                         )
-                    except PlaywrightTimeoutError:
-                        await self._require_feed_url(
-                            route_error_code="FOR_YOU_ROUTE_CHANGED"
-                        )
-                        raise UiReadError("FOR_YOU_ACTIVATION_NOT_READY") from None
-                    finally:
-                        if result is not None:
-                            await result.dispose()
-                        await handle.dispose()
+                    except (AssertionError, PlaywrightTimeoutError):
+                        try:
+                            await expect(active_control).to_have_attribute(
+                                "aria-selected",
+                                "true",
+                                timeout=self._remaining_readiness_ms(
+                                    deadline,
+                                    "FOR_YOU_ACTIVATION_NOT_READY",
+                                ),
+                            )
+                        except (AssertionError, PlaywrightTimeoutError):
+                            if not self._is_for_you_route(self._page.url):
+                                await self._require_feed_url(
+                                    route_error_code="FOR_YOU_ROUTE_CHANGED"
+                                )
+                                raise UiReadError(
+                                    "FOR_YOU_ACTIVATION_NOT_READY"
+                                ) from None
 
             control = await self._recoverable_stage(
                 "FOR_YOU_ACTIVATION",
@@ -492,7 +487,7 @@ class ThreadsHomeReader:
                 await self._wait_for_pending_card(
                     _CardNotReady(
                         self._page.locator("body"),
-                        condition="mutation",
+                        condition="retry",
                     ),
                     deadline,
                 )
@@ -864,6 +859,8 @@ class ThreadsHomeReader:
 
     async def advance_feed(self) -> bool:
         """Issue one read-only wheel event and require observed scroll displacement."""
+        self.last_scroll_stop_reason = None
+        self.last_scroll_targets = ()
         if not self.last_viewport_coverage_complete:
             raise UiReadError("VIEWPORT_COVERAGE_INCOMPLETE")
         await self._wait_for_verified_feed(
@@ -871,13 +868,23 @@ class ThreadsHomeReader:
             timeout_code="HOME_SCROLL_SURFACE_UNVERIFIED",
         )
         surface = await self._scroll_surface()
+        if surface is None:
+            self.last_scroll_stop_reason = "FEED_NOT_SCROLLABLE"
+            return False
         witness: JSHandle | None = None
         try:
             try:
                 point, wheel_delta, viewport_height = (
                     await self._safe_feed_scroll_point(surface)
                 )
-                initial_position = await surface.evaluate("element => element.scrollTop")
+                scroll_state = await surface.evaluate(
+                    "element => ({top: element.scrollTop, max: "
+                    "Math.max(0, element.scrollHeight - element.clientHeight)})"
+                )
+                initial_position = float(scroll_state["top"])
+                if float(scroll_state["max"]) - initial_position <= 1:
+                    self.last_scroll_stop_reason = "FEED_END_REACHED"
+                    return False
                 witness = await self._watch_scroll_completion(
                     surface,
                     initial_position,
@@ -940,6 +947,7 @@ class ThreadsHomeReader:
                     ),
                 )
                 self._last_viewport_signature = rendered.render_signature
+                self.last_scroll_targets = rendered.targets
                 self.last_display_observations = rendered.display_observations
                 self.last_viewport_coverage_complete = rendered.coverage_complete
                 self.last_viewport_observed_rows = rendered.observed_rows
@@ -1197,24 +1205,6 @@ class ThreadsHomeReader:
             return None
         return _RenderObservation((self._page.url, *dom_state), None)
 
-    async def _await_animation_frames(
-        self,
-        deadline: float,
-        timeout_code: str,
-    ) -> None:
-        timeout_seconds = self._remaining_readiness_ms(deadline, timeout_code) / 1000
-        try:
-            await asyncio.wait_for(
-                self._page.evaluate(
-                    """() => new Promise(resolve =>
-                        requestAnimationFrame(() => requestAnimationFrame(resolve))
-                    )"""
-                ),
-                timeout=timeout_seconds,
-            )
-        except TimeoutError:
-            raise UiReadError(timeout_code) from None
-
     async def _await_render_settled(
         self,
         stage: str,
@@ -1241,7 +1231,6 @@ class ThreadsHomeReader:
         waiting_reported = False
         while True:
             self._remaining_readiness_ms(deadline, timeout_code)
-            await self._await_animation_frames(deadline, timeout_code)
             observation = await observe()
             checks += 1
             if observation is None:
@@ -1373,7 +1362,7 @@ class ThreadsHomeReader:
         if scan.pending_roots:
             pending = _CardNotReady(
                 signals=tuple(
-                    _CardWaitSignal(root, "mutation") for root in scan.pending_roots
+                    _CardWaitSignal(root, "retry") for root in scan.pending_roots
                 )
             )
             if await self._wait_for_pending_card(pending, deadline):
@@ -1515,7 +1504,7 @@ class ThreadsHomeReader:
         for root in roots:
             structure = await self._inspect_candidate_root(root, viewport)
             if not structure.body_candidates:
-                signals.append(_CardWaitSignal(root, "mutation"))
+                signals.append(_CardWaitSignal(root, "retry"))
 
         permalinks = region.locator('a[href*="/post/"]')
         for index in range(min(await permalinks.count(), _MAX_PERMALINK_CANDIDATES)):
@@ -1530,7 +1519,7 @@ class ThreadsHomeReader:
 
         if not signals:
             return None
-        signals.append(_CardWaitSignal(self._page.locator("body"), "mutation"))
+        signals.append(_CardWaitSignal(self._page.locator("body"), "retry"))
         return _CardNotReady(signals=tuple(signals))
 
     async def _wait_for_pending_card(
@@ -1553,29 +1542,8 @@ class ThreadsHomeReader:
                         re.compile(r"\S"),
                         timeout=wait_ms,
                     )
-                elif signal.condition == "mutation":
-                    return bool(
-                        await signal.locator.evaluate(
-                            """(element, timeoutMs) => new Promise(resolve => {
-                                const observer = new MutationObserver(() => {
-                                    observer.disconnect();
-                                    clearTimeout(timer);
-                                    resolve(true);
-                                });
-                                observer.observe(element, {
-                                    attributes: true,
-                                    childList: true,
-                                    characterData: true,
-                                    subtree: true,
-                                });
-                                const timer = setTimeout(() => {
-                                    observer.disconnect();
-                                    resolve(false);
-                                }, timeoutMs);
-                            })""",
-                            wait_ms,
-                        )
-                    )
+                elif signal.condition == "retry":
+                    await expect(signal.locator).to_be_visible(timeout=wait_ms)
                 else:
                     await expect(signal.locator).to_be_visible(timeout=wait_ms)
                 return True
@@ -1696,7 +1664,7 @@ class ThreadsHomeReader:
                     return (x, y), advance, visible_height
         raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
 
-    async def _scroll_surface(self) -> JSHandle:
+    async def _scroll_surface(self) -> JSHandle | None:
         if not await self._visible_feed_evidence():
             self.last_scan_counts.scroll_surface_status = "UNVERIFIED"
             raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
@@ -1717,7 +1685,7 @@ class ThreadsHomeReader:
                     self.last_scan_counts.scroll_surface_status = "UNVERIFIED"
                     raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
                 row_handles.append(handle)
-            surface = await self._page.evaluate_handle(
+            surface_state = await self._page.evaluate_handle(
                 """([region, rows, maxCandidates]) => {
                 const root = document.scrollingElement;
                 const visibleItem = item => {
@@ -1749,7 +1717,7 @@ class ThreadsHomeReader:
                         region.querySelectorAll('a[href*="/post/"]')
                     ).slice(0, maxCandidates).filter(visibleItem);
                 }
-                if (!items.length) return null;
+                if (!items.length) return {state: "NOT_SCROLLABLE", surface: null};
 
                 const candidates = new Set();
                 for (const item of items) {
@@ -1764,10 +1732,17 @@ class ThreadsHomeReader:
                         candidate.contains(other) &&
                         items.every(item => other === item || other.contains(item)))
                 );
-                if (innermost.length !== 1) return null;
+                if (!candidates.size) {
+                    return {state: "NOT_SCROLLABLE", surface: null};
+                }
+                if (innermost.length !== 1) {
+                    return {state: "AMBIGUOUS", surface: null};
+                }
                 const surface = innermost[0];
-                if (!items.every(item => surface === item || surface.contains(item))) return null;
-                return surface;
+                if (!items.every(item => surface === item || surface.contains(item))) {
+                    return {state: "AMBIGUOUS", surface: null};
+                }
+                return {state: "READY", surface};
                 }""",
                 arg=[region_handle, row_handles, _MAX_PERMALINK_CANDIDATES],
             )
@@ -1775,10 +1750,19 @@ class ThreadsHomeReader:
             await region_handle.dispose()
             for handle in row_handles:
                 await handle.dispose()
-        if await surface.evaluate("element => element === null"):
-            await surface.dispose()
+        state_handle = await surface_state.get_property("state")
+        state = await state_handle.json_value()
+        await state_handle.dispose()
+        if state == "NOT_SCROLLABLE":
+            await surface_state.dispose()
+            self.last_scan_counts.scroll_surface_status = "NOT_SCROLLABLE"
+            return None
+        if state != "READY":
+            await surface_state.dispose()
             self.last_scan_counts.scroll_surface_status = "UNVERIFIED"
             raise UiReadError("HOME_SCROLL_SURFACE_UNVERIFIED")
+        surface = await surface_state.get_property("surface")
+        await surface_state.dispose()
         self.last_scan_counts.scroll_surface_status = "VALIDATED"
         return surface
 
@@ -1791,38 +1775,25 @@ class ThreadsHomeReader:
             """([element, initialPosition]) => {
                 const eventTarget = element === document.scrollingElement
                     ? document : element;
-                const supportsScrollEnd = "onscrollend" in eventTarget;
-                const state = {done: false, delta: 0, cancel: () => {}};
-                let active = true;
-                let frameOne = 0;
-                let frameTwo = 0;
-                const cleanup = () => {
-                    element.removeEventListener("scroll", onScroll);
-                    eventTarget.removeEventListener("scrollend", finish);
-                    if (frameOne) cancelAnimationFrame(frameOne);
-                    if (frameTwo) cancelAnimationFrame(frameTwo);
+                let resolveMovement;
+                const state = {
+                    delta: 0,
+                    wait: new Promise(resolve => { resolveMovement = resolve; }),
+                    cancel: () => {},
                 };
-                const finish = () => {
-                    if (!active) return;
-                    state.delta = Math.abs(element.scrollTop - initialPosition);
-                    state.done = true;
-                    active = false;
-                    cleanup();
-                };
+                const cleanup = () => eventTarget.removeEventListener("scroll", onScroll);
                 const onScroll = () => {
-                    if (supportsScrollEnd) return;
-                    if (frameOne) cancelAnimationFrame(frameOne);
-                    if (frameTwo) cancelAnimationFrame(frameTwo);
-                    frameOne = requestAnimationFrame(() => {
-                        frameTwo = requestAnimationFrame(finish);
-                    });
+                    const delta = Math.abs(element.scrollTop - initialPosition);
+                    if (delta <= 1) return;
+                    state.delta = delta;
+                    cleanup();
+                    resolveMovement(delta);
                 };
                 state.cancel = () => {
-                    active = false;
                     cleanup();
+                    resolveMovement(false);
                 };
-                element.addEventListener("scroll", onScroll, {passive: true});
-                eventTarget.addEventListener("scrollend", finish, {once: true});
+                eventTarget.addEventListener("scroll", onScroll, {passive: true});
                 return state;
             }""",
             arg=[surface, initial_position],
@@ -1833,29 +1804,19 @@ class ThreadsHomeReader:
         witness: JSHandle,
         deadline: float,
     ) -> float | None:
-        result = None
         try:
-            result = await self._page.wait_for_function(
-                "state => state.done && state.delta > 1 ? state.delta : false",
-                arg=witness,
+            delta = await asyncio.wait_for(
+                witness.evaluate("state => state.wait"),
                 timeout=self._remaining_readiness_ms(
                     deadline,
                     "HOME_SCROLL_UNVERIFIED",
-                ),
-                polling="raf",
+                ) / 1000,
             )
-            delta = await result.json_value()
             return None if delta is False or delta is None else float(delta)
-        except PlaywrightTimeoutError:
+        except TimeoutError:
             return None
         except PlaywrightError:
             raise UiReadError("HOME_SCROLL_UNVERIFIED") from None
-        finally:
-            if result is not None:
-                try:
-                    await result.dispose()
-                except PlaywrightError:
-                    pass
 
     async def _is_carried_viewport_candidate(self, root: Locator) -> bool:
         for previous in self._carried_viewport_candidate_roots:
@@ -3093,8 +3054,18 @@ class ThreadsHomeReader:
         )
         if detail.url != target.url or detail.author != target.author:
             raise UiReadError("DETAIL_PROVENANCE_UNVERIFIED")
-        if detail.body is None or target.body is None or detail.body != target.body:
+        if detail.body is None or target.body is None:
             raise UiReadError("DETAIL_BODY_UNVERIFIED")
+        home_body = " ".join(normalize_text(target.body).split())
+        detail_body = " ".join(normalize_text(detail.body).split())
+        body_matches = detail_body == home_body
+        prefix = home_body
+        if target.body_truncated and not body_matches:
+            prefix = home_body.rstrip(" .…")
+            body_matches = bool(prefix) and detail_body.startswith(prefix)
+        if not body_matches:
+            raise UiReadError("DETAIL_BODY_UNVERIFIED")
+        self._detail_return_anchor = (target.fingerprint, target.viewport_y)
         return detail
 
     async def _detail_permalink_card(self, target: PostTarget) -> Locator:
@@ -3130,13 +3101,19 @@ class ThreadsHomeReader:
 
     async def return_to_home(self) -> None:
         await self._go_back_to_home()
-        await self.verify_actor()
-        await self._wait_for_home_targets(
+        targets, _ = await self._wait_for_home_targets(
             self._last_viewport_limit,
             timeout_code="FEED_RETURN_NOT_READY",
         )
         if not self.last_viewport_coverage_complete:
             raise UiReadError("VIEWPORT_COVERAGE_INCOMPLETE")
+        anchor = self._detail_return_anchor
+        if anchor is not None and not any(
+            target.fingerprint == anchor[0]
+            and abs(target.viewport_y - anchor[1]) <= 48
+            for target in targets
+        ):
+            raise UiReadError("RETURN_CONTEXT_CHANGED")
     async def _for_you_control(self, *, timeout_ms: int | None = None) -> Locator:
         links = self._page.get_by_role("link", name=_FOR_YOU_NAME)
         tabs = self._page.get_by_role("tab", name=_FOR_YOU_NAME)
@@ -3278,7 +3255,7 @@ class ThreadsHomeReader:
                 await self._wait_for_pending_card(
                     _CardNotReady(
                         self._page.locator("body"),
-                        condition="mutation",
+                        condition="retry",
                     ),
                     deadline,
                 )
@@ -3311,12 +3288,14 @@ class ThreadsHomeReader:
         root_handle: JSHandle,
         *,
         require_body: bool,
-    ) -> tuple[str | None, bool]:
+    ) -> tuple[str | None, bool, bool]:
         buttons = root.get_by_role("button", name=_MORE_NAME)
+        body_truncated = False
         for index in range(min(await buttons.count(), _MAX_CARD_LINKS)):
             button = buttons.nth(index)
             if await self._belongs_to_card(button, root, root_handle) and await button.is_visible():
-                return None, True
+                body_truncated = True
+                break
 
         candidates = root.locator(_BODY_TEXT_SELECTOR)
         bodies: list[str] = []
@@ -3365,7 +3344,7 @@ class ThreadsHomeReader:
                     nonempty_text=True,
                     timeout_code="DETAIL_BODY_UNVERIFIED",
                 )
-            return None, False
+            return None, False, body_truncated
         if paragraph_bodies > 1:
             if require_body:
                 raise _CardNotReady(
@@ -3373,7 +3352,7 @@ class ThreadsHomeReader:
                     nonempty_text=True,
                     timeout_code="DETAIL_BODY_UNVERIFIED",
                 )
-            return None, False
+            return None, False, body_truncated
         body = "\n".join(bodies)
         if len(body) > _MAX_BODY_CODEPOINTS:
             if require_body:
@@ -3382,14 +3361,16 @@ class ThreadsHomeReader:
                     nonempty_text=True,
                     timeout_code="DETAIL_BODY_UNVERIFIED",
                 )
-            return None, True
-        return body, True
+            return None, True, body_truncated
+        if body.rstrip().endswith(("…", "...")):
+            body_truncated = True
+        return body, True, body_truncated
 
     async def _observe_display_body(self, root: Locator) -> str | None:
         root_handle = await root.element_handle()
         if root_handle is None:
             return None
-        body, available = await self._extract_card_body(
+        body, available, _ = await self._extract_card_body(
             root,
             root_handle,
             require_body=False,
@@ -3455,7 +3436,7 @@ class ThreadsHomeReader:
                 diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
             )
         if not post_links:
-            raise _CardNotReady(root, condition="mutation")
+            raise _CardNotReady(root, condition="retry")
         if not authors:
             raise _CardNotReady(
                 self._expected_profile_link_signal(root, post_links[0][1])
@@ -3477,7 +3458,7 @@ class ThreadsHomeReader:
                 diagnostic_reason="CANDIDATE_AUTHOR_MISMATCH",
             )
 
-        body, body_available = await self._extract_card_body(
+        body, body_available, body_truncated = await self._extract_card_body(
             root,
             root_handle,
             require_body=require_body,
@@ -3490,6 +3471,7 @@ class ThreadsHomeReader:
             fingerprint,
             link,
             body_available=body_available,
+            body_truncated=body_truncated,
             currently_visible=currently_visible,
             viewport_y=viewport_y,
         )

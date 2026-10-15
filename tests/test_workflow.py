@@ -284,6 +284,110 @@ def test_offline_chromium_cli_reads_once_and_resumes_without_double_counting(
     assert actor not in persisted
 
 
+def test_first_viewport_relevance_scrolls_then_reads_and_restores_home(
+    tmp_path: Path,
+) -> None:
+    actor = "offline.operator"
+    post_url = "https://www.threads.com/@candidate/post/native-cycle"
+    truncated_body = "Hiring a backend engineer…"
+    expanded_body = "Hiring a backend engineer in Ho Chi Minh City"
+    feed_html = f"""<!doctype html><html><head><meta charset="utf-8"><style>
+.post-card {{ box-sizing: border-box; height: 820px; padding-top: 300px; }}
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main>
+  <article class="post-card">
+    <a href="/@candidate/post/native-cycle"><time>now</time></a>
+    <a href="/@candidate">@candidate</a>
+    <p>{truncated_body}</p><button type="button">See more</button>
+  </article>
+  <article class="post-card">
+    <a href="/@candidate/post/weather"><time>1h</time></a>
+    <a href="/@candidate">@candidate</a><p>A synthetic weather update</p>
+  </article>
+</main><script>
+window.addEventListener("wheel", () => {{
+  sessionStorage.setItem("native-cycle-wheel", "1");
+}}, {{ once: true }});
+document.querySelector('a[href*="native-cycle"]').addEventListener("click", () => {{
+  sessionStorage.setItem(
+    "native-cycle-click-after-scroll",
+    String(document.scrollingElement.scrollTop > 0)
+  );
+}});
+</script></body></html>"""
+    detail_html = f"""<!doctype html><html><head><meta charset="utf-8"></head>
+<body><main><article>
+<a href="/@candidate/post/native-cycle"><time>now</time></a>
+<a href="/@candidate">@candidate</a><p>{expanded_body}</p>
+</article></main></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "synthetic-profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+    profile_visits = 0
+    detail_visits = 0
+
+    async def exercise(page) -> None:
+        async def serve_profile(route: Route) -> None:
+            nonlocal profile_visits
+            profile_visits += 1
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body="<!doctype html><html><body><h1>Local profile</h1></body></html>",
+            )
+
+        async def serve_detail(route: Route) -> None:
+            nonlocal detail_visits
+            detail_visits += 1
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=detail_html,
+            )
+
+        await page.route("https://www.threads.com/@offline.operator", serve_profile)
+        await page.route(post_url, serve_detail)
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=3,
+            max_scrolls=1,
+            max_total_posts=5,
+            terms=("hiring",),
+        )
+        assert result.status == "COMPLETE"
+        assert result.scroll_attempts == result.scrolls == 1
+        assert result.detail_reads == 1
+        assert await page.evaluate(
+            "sessionStorage.getItem('native-cycle-click-after-scroll')"
+        ) == "true"
+        assert await page.evaluate(
+            "sessionStorage.getItem('native-cycle-wheel')"
+        ) == "1"
+        assert detail_visits == 1
+
+    _run_offline_page(feed_html, exercise)
+    assert profile_visits == 1
+    policy = policy_fingerprint(canonical_terms(("hiring",)))
+    checkpoint = store.load(account.account_id, policy)
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.home_sampled == 1
+    assert checkpoint.detail_reads == 1
+    persisted = (
+        data_root
+        / "nurture"
+        / "checkpoints"
+        / f"{account.account_id}-{policy}.json"
+    ).read_text(encoding="utf-8")
+    assert all(value not in persisted for value in (truncated_body, expanded_body, post_url, actor))
+
+
 def test_nested_feed_scroll_is_observed_and_no_movement_stops(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -667,7 +771,7 @@ def test_attended_wait_can_extend_then_stop_without_checkpoint(
         assert checkpoint.detail_reads == 0
 
 
-def test_delayed_wheel_and_detail_hydration_return_to_home(
+def test_delayed_wheel_and_detail_hydration_reports_changed_return_context(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -749,10 +853,10 @@ setTimeout(() => document.querySelector("#detail").insertAdjacentHTML(
         assert detail.url == detail_url
         assert detail.author == "candidate"
         assert detail.body == detail_body
-        await reader.return_to_home()
+        with pytest.raises(UiReadError) as caught:
+            await reader.return_to_home()
+        assert caught.value.code == "RETURN_CONTEXT_CHANGED"
         assert page.url == HOME_URL
-        home_targets = await reader._visible_targets(1)
-        assert home_targets.targets
         assert detail_requests == 1
 
     _run_offline_page(feed_html, exercise)
@@ -1488,6 +1592,7 @@ window.addEventListener("wheel", event => {{
                     account,
                     store,
                     max_posts=1,
+                    max_scrolls=0,
                     terms=("hiring",),
                     readiness_prompt=readiness_prompt,
                 )
@@ -1508,6 +1613,57 @@ window.addEventListener("wheel", event => {{
         output = capsys.readouterr().out
         assert "STOP stage=DETAIL code=POST_AUTHOR_UNVERIFIED" in output
         assert "@other" not in output
+
+
+def test_detail_body_mismatch_fails_closed_without_checkpoint(tmp_path: Path) -> None:
+    actor = "offline.operator"
+    target_url = "https://www.threads.com/@candidate/post/body-mismatch"
+    home_body = "Hiring a frontend engineer"
+    wrong_detail_body = "A different post body"
+    feed_html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main><article>
+<a href="/@candidate/post/body-mismatch"><time>now</time></a>
+<a href="/@candidate">@candidate</a><p>{home_body}</p>
+</article></main></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "synthetic-profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+
+    async def exercise(page) -> None:
+        async def serve_wrong_detail(route: Route) -> None:
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=f"""<!doctype html><html><body><article>
+<a href="/@candidate/post/body-mismatch"><time>now</time></a>
+<a href="/@candidate">@candidate</a><p>{wrong_detail_body}</p>
+</article></body></html>""",
+            )
+
+        await page.route(target_url, serve_wrong_detail)
+        with pytest.raises(UiReadError) as caught:
+            await workflow.run_page_workflow(
+                page,
+                account,
+                store,
+                max_posts=2,
+                max_scrolls=0,
+                terms=("hiring",),
+            )
+        assert caught.value.code == "DETAIL_BODY_UNVERIFIED"
+
+    _run_offline_page(feed_html, exercise)
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert checkpoint.completed_runs == 0
+    assert checkpoint.detail_reads == 0
 
 
 def test_overlapping_scan_completes_coverage_before_detail_and_checkpoint(

@@ -28,6 +28,12 @@ src/threads_browser/
 
 Existing `threads_browser.reader` imports are kept as aliases for callers/tests while new feature code can import pure helpers from `threads_browser.feed`. The reader stays one class for now: splitting its tightly coupled DOM state across mixins before private Threads UAT would increase risk and obscure failures.
 
-## Scope of this refactor
+## Evolution
 
-Only extract pure value objects, URLs and text semantics. Do not modify selectors, Playwright event ordering, browser profiles, actor/checkpoint invariants, automation cadence, or CLI behavior. Fix the existing workflow correctness gaps separately with focused regressions, then conduct owner-authorized private UAT before treating live Threads compatibility as proven.
+The earlier `feed` extraction's no-behavior-change scope applied to that refactor, not to future tasks. Selectors, readiness, scrolling, Detail and CLI behavior can evolve when needed. Preserve provenance checks, profile isolation, bounded read-only operation and checkpoint privacy; verify affected behavior with focused regression tests. Offline Chromium fixtures do not establish live Threads UI compatibility: that requires owner-authorized private UAT.
+
+## Current nurture cycle
+
+`workflow` counts verified rows once across overlapping viewports while retaining the current visible locators needed for safe selection. When a relevant Home card appears before any scroll and the feed has room to move, it requires one real bounded wheel advance before Detail. Detail still opens through the verified Home permalink; a visibly truncated body may expand if the canonical author and post remain the same and the visible text is a prefix of the expanded body.
+
+The reader returns with browser history, checks the For You shell and a lightweight post anchor, and avoids a second Profile visit. Wheel input, locators, route waits and native scroll events are the default. DOM geometry is limited to identifying an actual nested scroll surface and confirming its measured displacement. Checkpoints are written only for a safely completed scan or cycle; incomplete selection, uncertain coverage, failed Detail, or lost return context does not increment completed runs.

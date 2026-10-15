@@ -17,6 +17,7 @@ class PostTarget:
     body_available: bool = field(default=False, repr=False)
     currently_visible: bool = field(default=False, repr=False)
     viewport_y: float = field(default=0.0, repr=False)
+    body_truncated: bool = field(default=False, repr=False)
 
     def __repr__(self) -> str:
         return "PostTarget(<private>)"
