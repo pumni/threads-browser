@@ -230,6 +230,7 @@ class BodyTextReader:
                 let closestTextTop = null;
                 let closestTextBottom = null;
                 let truncated = false;
+                let limitReached = false;
                 let node;
                 while ((node = walker.nextNode())) {
                     const parent = node.parentElement;
@@ -260,6 +261,7 @@ class BodyTextReader:
                     const inspect = (start, end) => {
                         if (rangeChecks++ >= args.maxRangeChecks) {
                             truncated = true;
+                            limitReached = true;
                             return;
                         }
                         range.setStart(node, start);
@@ -383,7 +385,11 @@ class BodyTextReader:
                         frontier,
                     });
                     if (truncated) break;
-                    if (nodes.length >= args.maxNodes) { truncated = true; break; }
+                    if (nodes.length >= args.maxNodes) {
+                        truncated = true;
+                        limitReached = true;
+                        break;
+                    }
                 }
                 const closestTextSide = closestTextBelow !== null &&
                     (closestTextAbove === null || closestTextBelow <= closestTextAbove)
@@ -407,7 +413,7 @@ class BodyTextReader:
                     textEvidence = "UNSUPPORTED_STRUCTURE";
                 }
                 return {
-                    nodes, truncated, bodyContainers, bodyTextNodesPresent,
+                    nodes, truncated, limitReached, bodyContainers, bodyTextNodesPresent,
                     unsupportedTextNodesPresent,
                     renderRectCount: renderRectKeys.size,
                     visibleTextRectCount: visibleRectKeys.size,
@@ -482,7 +488,13 @@ class BodyTextReader:
                         False,
                         False,
                         truncated=True,
-                        read_evidence=read_evidence,
+                        read_evidence=replace(
+                            read_evidence,
+                            body_incomplete_reason="LIMIT",
+                            expected_range_count=0,
+                            visited_range_count=0,
+                            missing_range_count=0,
+                        ),
                     )
                 state = {}
                 self._body_text_progress[fingerprint] = state
@@ -491,6 +503,7 @@ class BodyTextReader:
         new_segments: list[VisibleBodySegment] = []
         has_rendered_text = False
         content_changed = False
+        current_progress_identities: set[str] = set()
         deferred_above = 0
         deferred_below = 0
         nearest_deferred_below: float | None = None
@@ -498,6 +511,7 @@ class BodyTextReader:
         for node in observation["nodes"]:
             order = int(node["index"])
             identity = str(node["key"])
+            current_progress_identities.add(identity)
             length = int(node["length"])
             block = int(node["block"])
             expected = self._merge_ranges(
@@ -629,6 +643,19 @@ class BodyTextReader:
                     )
 
         has_text_state = has_rendered_text or bool(progress_state)
+        missing_range_count = 0
+        expected_range_count = 0
+        visited_range_count = 0
+        dom_replaced = False
+        for identity, progress in progress_state.items():
+            expected_range_count += len(progress.expected_ranges)
+            visited_range_count += len(self._merge_ranges(progress.visited_ranges))
+            for start, end in progress.expected_ranges:
+                missing_ranges = self._subtract_ranges(start, end, progress.visited_ranges)
+                missing_range_count += len(missing_ranges)
+                if identity not in current_progress_identities and missing_ranges:
+                    dom_replaced = True
+
         body_complete = bool(
             fingerprint is not None
             and progress_state
@@ -640,6 +667,27 @@ class BodyTextReader:
                 for progress in progress_state.values()
                 for start, end in progress.expected_ranges
             )
+        )
+        if body_complete:
+            body_incomplete_reason = "NONE"
+        elif content_changed:
+            body_incomplete_reason = "CONTENT_CHANGED"
+        elif observation["limitReached"]:
+            body_incomplete_reason = "LIMIT"
+        elif observation["truncated"]:
+            body_incomplete_reason = "TRUNCATED"
+        elif dom_replaced:
+            body_incomplete_reason = "DOM_REPLACED"
+        elif missing_range_count:
+            body_incomplete_reason = "UNVISITED_RANGE"
+        else:
+            body_incomplete_reason = "STABILITY_PENDING"
+        read_evidence = replace(
+            read_evidence,
+            body_incomplete_reason=body_incomplete_reason,
+            expected_range_count=expected_range_count,
+            visited_range_count=visited_range_count,
+            missing_range_count=missing_range_count,
         )
         body_blocks: list[tuple[int, list[str]]] = []
         for _identity, progress in sorted(progress_state.items(), key=lambda item: item[1].order):

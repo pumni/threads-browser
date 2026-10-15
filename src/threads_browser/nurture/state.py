@@ -8,6 +8,15 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from hashlib import sha256
 
+from .observation import (
+    RowCoverageState,
+    RowObservationFacts,
+    RowObservationOutcome,
+)
+from .observation import (
+    observe_row as reduce_row_observation,
+)
+
 
 class WorkflowPhase(StrEnum):
     INITIALIZING = "INITIALIZING"
@@ -103,38 +112,65 @@ class NurtureRunState:
 class CoverageLedger:
     provenance_verified: set[str] = field(default_factory=set)
     fully_read: set[str] = field(default_factory=set)
-    deferred: set[str] = field(default_factory=set)
+    read_in_progress: set[str] = field(default_factory=set)
     unique_deferred: set[str] = field(default_factory=set)
     unresolved_observations: set[str] = field(default_factory=set)
     unrepresented_gaps: set[str] = field(default_factory=set)
     hydration_pending: set[str] = field(default_factory=set)
     observed_body_identities: set[str] = field(default_factory=set)
 
-    def mark_verified(self, fingerprint: str, observation_id: str | None) -> None:
-        self.provenance_verified.add(fingerprint)
-        self.deferred.discard(fingerprint)
-        if observation_id is not None:
-            self.unresolved_observations.discard(observation_id)
+    def observe_row(self, facts: RowObservationFacts) -> RowObservationOutcome:
+        fingerprint = facts.fingerprint
+        observation_id = facts.observation_id
+        previous = RowCoverageState(
+            identity_recognized=(
+                fingerprint is not None and fingerprint in self.provenance_verified
+            ),
+            read_in_progress=(fingerprint is not None and fingerprint in self.read_in_progress),
+            body_complete=(fingerprint is not None and fingerprint in self.fully_read),
+            unresolved_observation=(
+                observation_id is not None and observation_id in self.unresolved_observations
+            ),
+        )
+        outcome = reduce_row_observation(facts, previous)
+        next_state = outcome.coverage
 
-    def mark_deferred(
-        self,
-        fingerprint: str | None,
-        observation_id: str | None,
-        gap_id: str,
-    ) -> None:
         if fingerprint is not None:
-            if observation_id is not None:
+            if next_state.identity_recognized:
+                self.provenance_verified.add(fingerprint)
+            if next_state.read_in_progress:
+                self.read_in_progress.add(fingerprint)
+                self.unique_deferred.add(fingerprint)
+            else:
+                self.read_in_progress.discard(fingerprint)
+            if next_state.body_complete:
+                self.fully_read.add(fingerprint)
+
+        if observation_id is not None:
+            if next_state.unresolved_observation:
+                self.unresolved_observations.add(observation_id)
+            else:
                 self.unresolved_observations.discard(observation_id)
-            self.deferred.add(fingerprint)
-            self.unique_deferred.add(fingerprint)
-        elif observation_id is not None:
-            self.unresolved_observations.add(observation_id)
-        else:
-            self.unrepresented_gaps.add(gap_id)
+        elif next_state.unresolved_observation:
+            self.unrepresented_gaps.add(facts.gap_id)
+
+        hydration_id = observation_id or facts.gap_id
+        if outcome.hydration_pending is True:
+            self.hydration_pending.add(hydration_id)
+        elif outcome.hydration_pending is False:
+            self.hydration_pending.discard(hydration_id)
+
+        if outcome.body_observed:
+            self.observed_body_identities.add(fingerprint or observation_id or facts.gap_id)
+        return outcome
 
     @property
     def unresolved_gap_count(self) -> int:
-        return len(self.deferred) + len(self.unresolved_observations) + len(self.unrepresented_gaps)
+        return (
+            len(self.read_in_progress)
+            + len(self.unresolved_observations)
+            + len(self.unrepresented_gaps)
+        )
 
     @property
     def has_unresolved_gaps(self) -> bool:

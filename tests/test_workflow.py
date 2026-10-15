@@ -24,7 +24,8 @@ from threads_browser.browser_ui.scrolling import (
 )
 from threads_browser.cli import main
 from threads_browser.nurture import state as nurture_state
-from threads_browser.nurture.state import WorkflowPhase
+from threads_browser.nurture.observation import RowObservationFacts
+from threads_browser.nurture.state import CoverageLedger, WorkflowPhase
 from threads_browser.reader import (
     HOME_URL,
     ThreadsHomeReader,
@@ -3366,6 +3367,72 @@ font: 16px/18px monospace; overflow-wrap: anywhere; }}
     _run_offline_page(feed_html, exercise)
 
 
+def test_body_progress_completes_once_when_remaining_ranges_become_visible() -> None:
+    actor = "offline.operator"
+    body = "Synthetic hiring fixture fragment. " * 30
+    feed_html = f"""<!doctype html><html><head><meta charset="utf-8"><style>
+nav {{ height: 32px; }}
+article {{ margin: 0; }}
+article p {{ width: 400px; margin: 0; font: 16px/24px monospace; overflow-wrap: anywhere; }}
+</style></head><body><nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main><article><a href="/@candidate/post/viewport-upgrade"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>{body}</p>
+</article></main></body></html>"""
+
+    async def exercise(page) -> None:
+        await page.set_viewport_size({"width": 1280, "height": 220})
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        ledger = CoverageLedger()
+        outcomes = []
+        first_evidence = []
+
+        async def observe(row) -> None:
+            target = row.target
+            if target is None:
+                return
+            facts = RowObservationFacts(
+                fingerprint=target.fingerprint,
+                observation_id=row.diagnostic.observation_id,
+                gap_id="synthetic-row",
+                state=row.diagnostic.state,
+                has_body=bool(target.body and target.body.strip()),
+                body_complete=target.body_complete,
+            )
+            outcomes.append(ledger.observe_row(facts))
+            first_evidence.append(target.read_evidence)
+
+        await reader.scan_viewport(1, on_row=observe)
+        assert ledger.read_in_progress
+        assert ledger.unresolved_gap_count == 1
+        assert first_evidence[-1] is not None
+        assert first_evidence[-1].body_incomplete_reason == "UNVISITED_RANGE"
+        assert first_evidence[-1].missing_range_count
+
+        await page.set_viewport_size({"width": 1280, "height": 900})
+        completed_targets = await reader.scan_viewport(1, on_row=observe)
+        assert len(completed_targets) == 1
+        assert completed_targets[0].body_complete
+        assert completed_targets[0].read_evidence is not None
+        assert completed_targets[0].read_evidence.body_incomplete_reason == "NONE"
+        assert (
+            completed_targets[0].read_evidence.render_rect_count
+            == completed_targets[0].read_evidence.visible_text_rect_count
+        )
+        assert sum(outcome.body_completed for outcome in outcomes) == 1
+        assert ledger.read_in_progress == set()
+        assert ledger.fully_read == {completed_targets[0].fingerprint}
+        assert ledger.unresolved_gap_count == 0
+
+        await reader.scan_viewport(1, on_row=observe)
+        assert sum(outcome.body_completed for outcome in outcomes) == 1
+        assert ledger.unresolved_gap_count == 0
+
+    _run_offline_page(feed_html, exercise)
+
+
 def test_body_text_changing_during_the_home_read_stays_unverified() -> None:
     actor = "offline.operator"
     initial_body = "Synthetic hiring fixture alpha text."
@@ -4630,7 +4697,7 @@ window.addEventListener("wheel", () => window.nativeWheelCount++);
     assert checkpoint.detail_reads == 0
 
 
-def test_ephemeral_gap_upgrades_only_its_attached_row_and_keeps_other_gap_open(
+def test_ephemeral_gap_upgrade_keeps_below_fold_row_as_lookahead(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -4683,12 +4750,13 @@ window.addEventListener("wheel", () => {{
             terms=("hiring", "engineer"),
             detail=True,
         )
-        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
+        assert result.status == "RELEVANT_POST_NOT_CURRENT"
         assert result.scroll_attempts == result.scrolls == 1
-        assert result.unresolved_gaps == 1
+        assert result.unresolved_gaps == 0
         assert result.detail_reads == 0
         assert result.checkpoint_runs == 0
-        assert not result.viewport_coverage_complete
+        # The second row is below-fold lookahead, not an encountered read gap.
+        assert result.viewport_coverage_complete
         assert await page.evaluate("window.nativeWheelCount") >= 2
 
     _run_offline_page(feed_html, exercise)
@@ -4705,10 +4773,11 @@ window.addEventListener("wheel", () => {{
         row_id != upgraded_id and state == "DEFERRED_TEXT_BELOW"
         for row_id, state in records
     )
-    assert "reason=SCROLL_BUDGET_EXHAUSTED_WITH_GAP" in output
+    assert "SEARCH_INCOMPLETE reason=RELEVANT_POST_NOT_CURRENT" in output
+    assert "COVERAGE_STOP reason=SCROLL_BUDGET_EXHAUSTED_WITH_GAP" not in output
     assert "[DETAIL]" not in output
     assert "[BACK]" not in output
-    assert "[CHECKPOINT] status=NOT_SAVED reason=VIEWPORT_COVERAGE_INCOMPLETE" in output
+    assert "[CHECKPOINT] status=NOT_SAVED reason=RELEVANT_POST_NOT_CURRENT" in output
     checkpoint = store.load(
         account.account_id,
         policy_fingerprint(canonical_terms(("hiring", "engineer"))),

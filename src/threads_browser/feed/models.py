@@ -41,6 +41,10 @@ class BodyReadEvidence:
     frontier_content_px: float | None = field(default=None, repr=False)
     root_intersects: bool | None = False
     root_position_band: str = "UNKNOWN"
+    body_incomplete_reason: str = "UNKNOWN"
+    expected_range_count: int | None = None
+    visited_range_count: int | None = None
+    missing_range_count: int | None = None
     scroller_scroll_top: float | None = field(default=None, repr=False)
     scroll_surface_key: str = field(default="", repr=False)
 

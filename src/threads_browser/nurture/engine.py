@@ -23,6 +23,7 @@ from .diagnostics import (
     _print_url_structure_diagnostics,
     _print_visible_segments,
 )
+from .observation import RowObservationFacts
 from .state import (
     CoverageLedger,
     DedupeLedger,
@@ -409,36 +410,36 @@ async def run_page_workflow(
                     diagnostic.wheel_surface_matches = False
                     diagnostic.scroll_reason_flags = ("SCROLLER_MISMATCH",)
 
-            if (row.target is not None and row.target.body) or (
-                row.display is not None and row.display.body
-            ):
-                coverage.observed_body_identities.add(
-                    row.fingerprint
-                    or diagnostic.observation_id
-                    or f"viewport:{viewport_number}:row:{diagnostic.row_index}"
-                )
-
-            hydration_id = diagnostic.observation_id or (
-                f"row:{viewport_number}:{diagnostic.row_index}"
+            target = row.target
+            row_fingerprint = (
+                target.fingerprint
+                if target is not None
+                else row.fingerprint or diagnostic.identity_fingerprint
             )
-            if diagnostic.state == "PENDING_HYDRATION":
-                coverage.hydration_pending.add(hydration_id)
-            elif diagnostic.state in {"VERIFIED", "NON_POST"}:
-                coverage.hydration_pending.discard(hydration_id)
-
-            if diagnostic.state == "VERIFIED":
-                if row.fingerprint is not None:
-                    if row.fingerprint not in coverage.provenance_verified:
-                        stats.provenance_verified += 1
-                    coverage.mark_verified(row.fingerprint, diagnostic.observation_id)
-                elif diagnostic.observation_id is not None:
-                    coverage.unresolved_observations.discard(diagnostic.observation_id)
-            elif diagnostic.state != "NON_POST":
-                coverage.mark_deferred(
-                    row.fingerprint,
-                    diagnostic.observation_id,
-                    f"row:{viewport_number}:{diagnostic.row_index}",
+            has_body = bool(
+                (target is not None and target.body and target.body.strip())
+                or (
+                    target is not None
+                    and any(segment.text.strip() for segment in target.visible_segments)
                 )
+                or (row.display is not None and row.display.body and row.display.body.strip())
+            )
+            coverage_outcome = coverage.observe_row(
+                RowObservationFacts(
+                    fingerprint=row_fingerprint,
+                    observation_id=diagnostic.observation_id,
+                    gap_id=f"row:{viewport_number}:{diagnostic.row_index}",
+                    state=diagnostic.state,
+                    has_body=has_body,
+                    body_complete=bool(
+                        diagnostic.state == "VERIFIED"
+                        and target is not None
+                        and target.body_complete
+                    ),
+                )
+            )
+            stats.provenance_verified += int(coverage_outcome.identity_added)
+            reader.last_scan_counts.new_verified_rows += int(coverage_outcome.body_completed)
             if detail:
                 observation_emitted = bool(
                     (row.target and (row.target.body or row.target.visible_segments))
@@ -467,17 +468,17 @@ async def run_page_workflow(
                     f"same_scroller_scrollTop_delta={'UNKNOWN' if diagnostic.same_scroller_scroll_top_delta is None else f'{diagnostic.same_scroller_scroll_top_delta:.1f}'} "
                     f"scroll_surface={'UNKNOWN' if metrics is None else metrics.scroll_surface_key} "
                     f"body_evidence={'UNKNOWN' if metrics is None else metrics.state} "
+                    f"body_incomplete_reason={'UNKNOWN' if metrics is None else metrics.body_incomplete_reason} "
+                    f"body_ranges_expected={metric_count(None if metrics is None else metrics.expected_range_count)} "
+                    f"body_ranges_visited={metric_count(None if metrics is None else metrics.visited_range_count)} "
+                    f"body_ranges_missing={metric_count(None if metrics is None else metrics.missing_range_count)} "
                     f"scroll_flags={','.join(diagnostic.scroll_reason_flags) or 'NONE'} "
                     f"state={diagnostic.state} reason={diagnostic.reason} "
                     f"observation={'EMITTED' if observation_emitted else 'RECORDED'} "
                     "checkpoint=PENDING",
                     flush=True,
                 )
-            target = row.target
             if target is not None:
-                if target.fingerprint not in coverage.provenance_verified:
-                    coverage.mark_verified(target.fingerprint, diagnostic.observation_id)
-                    stats.provenance_verified += 1
                 if diagnostic.state == "PARTIAL_BODY":
                     new_segments = tuple(
                         segment
@@ -498,10 +499,6 @@ async def run_page_workflow(
                     return
                 if diagnostic.state != "VERIFIED" or not target.body or not target.body_complete:
                     return
-                coverage.deferred.discard(target.fingerprint)
-                if target.fingerprint not in coverage.fully_read:
-                    coverage.fully_read.add(target.fingerprint)
-                    reader.last_scan_counts.new_verified_rows += 1
                 new_segments = tuple(
                     segment
                     for segment in target.visible_segments
@@ -1037,7 +1034,7 @@ async def run_page_workflow(
                 )
         if (
             (
-                coverage.deferred
+                coverage.read_in_progress
                 or coverage.unresolved_observations
                 or coverage.unrepresented_gaps
             )

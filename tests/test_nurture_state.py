@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from threads_browser.nurture.observation import RowObservationFacts
 from threads_browser.nurture.state import (
     CoverageLedger,
     DedupeLedger,
@@ -12,24 +13,33 @@ from threads_browser.nurture.state import (
 
 def test_coverage_ledger_preserves_unique_and_unresolved_counts() -> None:
     ledger = CoverageLedger()
-    ledger.mark_deferred("post-one", "row-one", "gap-one")
-    ledger.mark_deferred(None, "row-two", "gap-two")
-    ledger.mark_deferred(None, None, "gap-three")
+    ledger.observe_row(
+        RowObservationFacts("post-one", "row-one", "gap-one", "PARTIAL_BODY", True, False)
+    )
+    ledger.observe_row(
+        RowObservationFacts(None, "row-two", "gap-two", "POST_ROOT_UNRESOLVED", False, False)
+    )
+    ledger.observe_row(
+        RowObservationFacts(None, None, "gap-three", "POST_ROOT_UNRESOLVED", False, False)
+    )
 
     assert ledger.unresolved_gap_count == 3
     assert ledger.unique_deferred == {"post-one"}
 
-    ledger.mark_verified("post-one", "row-one")
+    ledger.observe_row(
+        RowObservationFacts("post-one", "row-one", "gap-one", "VERIFIED", True, True)
+    )
 
     assert ledger.unresolved_gap_count == 2
     assert ledger.provenance_verified == {"post-one"}
+    assert ledger.fully_read == {"post-one"}
     assert ledger.reliability_metrics(
         viewport_observations=4,
         visible_text_segments=2,
     ) == {
         "viewport_observations": 4,
         "unique_provenance_identities": 1,
-        "unique_verified_posts": 0,
+        "unique_verified_posts": 1,
         "unique_deferred_posts": 1,
         "unresolved_gaps": 2,
         "visible_text_segments": 2,
