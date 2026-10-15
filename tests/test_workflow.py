@@ -286,6 +286,7 @@ def test_offline_chromium_cli_reads_once_and_resumes_without_double_counting(
 
 def test_first_viewport_relevance_scrolls_then_reads_and_restores_home(
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     actor = "offline.operator"
     post_url = "https://www.threads.com/@candidate/post/native-cycle"
@@ -360,6 +361,7 @@ document.querySelector('a[href*="native-cycle"]').addEventListener("click", () =
             max_scrolls=1,
             max_total_posts=5,
             terms=("hiring",),
+            detail=True,
         )
         assert result.status == "COMPLETE"
         assert result.scroll_attempts == result.scrolls == 1
@@ -379,6 +381,26 @@ document.querySelector('a[href*="native-cycle"]').addEventListener("click", () =
     assert checkpoint.completed_runs == 1
     assert checkpoint.home_sampled == 1
     assert checkpoint.detail_reads == 1
+    output = capsys.readouterr().out
+    assert "[HOME] status=READY account=VERIFIED source=FOR_YOU" in output
+    assert "[VIEWPORT 1]" in output
+    assert "[VIEWPORT 2]" in output
+    assert "source=HOME_BODY extent=TRUNCATED" in output
+    assert "[SCROLL] attempt=1 status=ADVANCED observed=1" in output
+    assert "[SELECT] post=1 decision=RELEVANT reason=RELEVANT_NEW" in output
+    assert "[DETAIL] post=1 status=VERIFIED provenance=VERIFIED extent=EXPANDED" in output
+    assert "<<< DETAIL_BODY BEGIN status=VERIFIED decision=RELEVANT extent=EXPANDED >>>" in output
+    assert "[BACK] post=1 status=RESTORED anchor=MATCHED" in output
+    assert "[CHECKPOINT] status=SAVED completed_runs=1" in output
+    assert "[CYCLE] status=COMPLETE" in output
+    assert output.count(f"| {truncated_body}") == 1
+    assert output.count(f"| {expanded_body}") == 1
+    assert output.index("[HOME]") < output.index("[VIEWPORT 1]")
+    assert output.index("[VIEWPORT 1]") < output.index("[SCROLL] attempt=1")
+    assert output.index("[SCROLL] attempt=1 status=ADVANCED") < output.index("[SELECT]")
+    assert output.index("[SELECT]") < output.index("[DETAIL]")
+    assert output.index("[DETAIL]") < output.index("[BACK]")
+    assert output.index("[BACK]") < output.index("[CHECKPOINT]")
     persisted = (
         data_root
         / "nurture"
@@ -866,9 +888,10 @@ setTimeout(() => document.querySelector("#detail").insertAdjacentHTML(
     assert "READY stage=HOME_RETURN state=UI_SHELL_SETTLED" in output
 
 
-def test_empty_scan_rescans_new_feed_with_zero_scroll_budget(
+def test_empty_scan_rescans_new_feed_but_changed_back_anchor_stops_without_checkpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     actor = "offline.operator"
     target_url = "https://www.threads.com/@candidate/post/late-feed"
@@ -949,24 +972,29 @@ def test_empty_scan_rescans_new_feed_with_zero_scroll_budget(
         )
 
         async def exercise(page) -> None:
-            result = await workflow.run_page_workflow(
-                page,
-                account,
-                store,
-                max_posts=1,
-                max_scrolls=0,
-                terms=("hiring",),
-            )
-            assert result.status == "COMPLETE"
-            assert result.scroll_attempts == 0
-            assert result.scrolls == 0
-            assert result.detail_reads == 1
+            with pytest.raises(UiReadError) as caught:
+                await workflow.run_page_workflow(
+                    page,
+                    account,
+                    store,
+                    max_posts=1,
+                    max_scrolls=0,
+                    terms=("hiring",),
+                    detail=True,
+                )
+            assert caught.value.code == "RETURN_CONTEXT_CHANGED"
+            assert page.url == HOME_URL
+            assert await page.locator('a[href$="/late-feed"]').count() == 0
+            assert await page.locator('a[href$="/seed"]').count() == 1
 
         _run_offline_page(feed_html, exercise)
+        output = capsys.readouterr().out
+        assert "[BACK] post=1 status=FAILED anchor=CHANGED code=RETURN_CONTEXT_CHANGED" in output
+        assert "[CHECKPOINT] status=SAVED" not in output
         checkpoint = store.load(account.account_id, policy)
-        assert checkpoint.completed_runs == 1
+        assert checkpoint.completed_runs == 0
         assert checkpoint.scroll_attempts == 0
-        assert checkpoint.detail_reads == 1
+        assert checkpoint.detail_reads == 0
         assert state == {"scan": True, "empty_once": True, "injected": True}
 
 
@@ -2858,6 +2886,9 @@ def test_unmarked_rows_keep_display_and_provenance_evidence_separate(
             max_scrolls=0,
             max_total_posts=20,
             terms=("đang tìm việc", "hiring"),
+            detail=True,
+            show_post_text=True,
+            show_observed_text=True,
         )
         assert result.status == "COMPLETE"
         assert result.observed_rows == 3
@@ -2873,10 +2904,12 @@ def test_unmarked_rows_keep_display_and_provenance_evidence_separate(
     assert "OBSERVED stage=FEED_INITIAL" not in output
     assert "READY stage=FEED_INITIAL state=BODY_EXTRACTED verified=2" in output
     assert "DETAIL_VERIFIED status=PROVENANCE_VERIFIED" in output
-    assert all(
-        body not in output
-        for body in (unverified_body, verified_body, selected_body, quoted_body)
-    )
+    assert output.count(f"| {unverified_body}") == 1
+    assert output.count(f"| {verified_body}") == 1
+    assert output.count(f"| {selected_body}") == 2
+    assert quoted_body not in output
+    assert "status=OBSERVED_UNVERIFIED decision=RELEVANT_UNVERIFIED" in output
+    assert "[DETAIL] post=2 status=VERIFIED provenance=VERIFIED extent=FULL" in output
     checkpoint = store.load(
         account.account_id,
         policy_fingerprint(canonical_terms(("đang tìm việc", "hiring"))),

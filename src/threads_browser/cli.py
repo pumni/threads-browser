@@ -47,6 +47,11 @@ def _add_run_options(parser: argparse.ArgumentParser, *, legacy: bool) -> None:
         help="print identity-unverified observed text to an interactive terminal",
     )
     parser.add_argument(
+        "--detail",
+        action="store_true",
+        help="print an operational trace and extracted post text to an interactive terminal",
+    )
+    parser.add_argument(
         "--max-posts",
         required=legacy,
         type=int,
@@ -195,12 +200,25 @@ async def _prompt_readiness_extension(stage: str, retry: int) -> bool:
 
 
 def _run_diagnostics_check(args: argparse.Namespace) -> bool:
-    if not (args.show_post_text or args.show_observed_text):
+    if not (args.detail or args.show_post_text or args.show_observed_text):
         return True
     if not _has_interactive_terminal():
-        error = "OBSERVED_TEXT_TTY_REQUIRED" if args.show_observed_text else "POST_TEXT_TTY_REQUIRED"
+        error = (
+            "DETAIL_TTY_REQUIRED"
+            if args.detail
+            else "OBSERVED_TEXT_TTY_REQUIRED"
+            if args.show_observed_text
+            else "POST_TEXT_TTY_REQUIRED"
+        )
         print(f"ERROR {error}", file=sys.stderr)
         return False
+    if args.detail:
+        print(
+            "WARNING DETAIL_LOCAL_ONLY extracted post text may remain in terminal "
+            "scrollback; do not capture or share this output in GitHub, PRs, chats, or CI logs.",
+            file=sys.stderr,
+        )
+        return True
     if args.show_post_text:
         print(
             "WARNING POST_TEXT_LOCAL_ONLY terminal scrollback may retain content; "
@@ -356,6 +374,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             max_total_posts=args.max_total_posts,
                             show_post_text=args.show_post_text,
                             show_observed_text=args.show_observed_text,
+                            detail=args.detail,
                             readiness_prompt=(
                                 _prompt_readiness_extension
                                 if _has_interactive_terminal()
@@ -364,7 +383,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                         )
                     )
                 except UiReadError as error:
-                    print(f"STOP {error.code}", file=sys.stderr)
+                    if args.detail:
+                        print("[CHECKPOINT] status=NOT_SAVED", file=sys.stderr)
+                        print(f"[STOP] code={error.code}", file=sys.stderr)
+                    else:
+                        print(f"STOP {error.code}", file=sys.stderr)
                     if error.code == "LOGIN_REQUIRED":
                         print(f"Run 'tb login {account.alias}' to authenticate.", file=sys.stderr)
                     return 1

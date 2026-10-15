@@ -230,12 +230,14 @@ class ThreadsHomeReader:
         expected_actor: str | None,
         *,
         readiness_prompt: Callable[[str, int], Awaitable[bool]] | None = None,
+        detail_mode: bool = False,
     ) -> None:
         if expected_actor is not None and _USERNAME.fullmatch(expected_actor) is None:
             raise UiReadError("ACTOR_INVALID")
         self._page = page
         self._expected_actor = None if expected_actor is None else expected_actor.casefold()
         self._readiness_prompt = readiness_prompt
+        self._detail_mode = detail_mode
         self._home_url: str | None = None
         self._verified_actor_route: str | None = None
         self._last_ui_transition_at: float | None = None
@@ -894,7 +896,8 @@ class ThreadsHomeReader:
                 await self._page.mouse.wheel(0, wheel_delta)
                 self._mark_ui_transition()
             except PlaywrightError:
-                print(f"SCROLL attempt={self.scroll_attempts} observed=0")
+                if not self._detail_mode:
+                    print(f"SCROLL attempt={self.scroll_attempts} observed=0")
                 raise UiReadError("HOME_SCROLL_FAILED") from None
 
             async def observe_scroll(window_deadline: float) -> float:
@@ -961,7 +964,8 @@ class ThreadsHomeReader:
                     observe_scroll,
                 )
             except UiReadError:
-                print(f"SCROLL attempt={self.scroll_attempts} observed=0")
+                if not self._detail_mode:
+                    print(f"SCROLL attempt={self.scroll_attempts} observed=0")
                 raise
             self.scrolls += 1
             self.last_scroll_delta = observed_delta
@@ -973,10 +977,11 @@ class ThreadsHomeReader:
                 if delta_ratio <= 0.75
                 else "LARGE"
             )
-            print(
-                f"SCROLL attempt={self.scroll_attempts} observed=1 "
-                f"delta_band={delta_band}"
-            )
+            if not self._detail_mode:
+                print(
+                    f"SCROLL attempt={self.scroll_attempts} observed=1 "
+                    f"delta_band={delta_band}"
+                )
             return True
         finally:
             if witness is not None:
