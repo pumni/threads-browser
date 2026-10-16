@@ -29,6 +29,11 @@ uv run tb run local1
 
 `tb run` uses headed Chromium, at most 20 visible post rows per viewport, 8 observed feed advances, and 40 distinct verified posts. Terms are local relevance hints, not search queries. They are matched as literal substrings of extracted post text. Terms are stored under the private application data root in `preferences/terms`, separately from account metadata and Chromium session data.
 
+Attended and legacy runs can opt into `--max-runtime-seconds` and
+`--no-readiness-prompt`. For Windows Task Scheduler setup, bounded runtime
+defaults, and the sanitized latest-run status file, see
+[`docs/OPERATIONS_WINDOWS.md`](docs/OPERATIONS_WINDOWS.md).
+
 Useful account and term commands:
 
 ```powershell

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import math
 import sys
 from collections.abc import Awaitable, Callable
 
@@ -23,6 +25,8 @@ __all__ = [
     "run_browser_nurture",
     "run_page_workflow",
 ]
+
+_CLEANUP_ALLOWANCE_SECONDS = 5
 
 
 def _detail_terminal_ready() -> bool:
@@ -117,6 +121,7 @@ async def run_browser_nurture(
     terms: tuple[str, ...],
     max_scrolls: int = 8,
     max_total_posts: int = 40,
+    max_runtime_seconds: float | None = None,
     readiness_prompt: Callable[[str, int], Awaitable[bool]] | None = None,
     show_post_text: bool = False,
     show_observed_text: bool = False,
@@ -126,36 +131,28 @@ async def run_browser_nurture(
         raise BrowserDataError("ACCOUNT_NOT_VERIFIED")
     if detail and not _detail_terminal_ready():
         raise UiReadError("DETAIL_TTY_REQUIRED")
+    if max_runtime_seconds is not None and (
+        not math.isfinite(max_runtime_seconds) or max_runtime_seconds <= 0
+    ):
+        raise UiReadError("RUNTIME_LIMIT_INVALID")
     ensure_safe_browser_profile(account.profile_directory)
     lock = checkpoint_store.profile_lock(account)
     lock.acquire()
+    playwright_manager = None
+    manager_start_attempted = False
+    context = None
+    timeout_scope = None
     try:
-        async with async_playwright() as playwright:
-            try:
+        timeout_scope = asyncio.timeout(max_runtime_seconds)
+        try:
+            async with timeout_scope:
+                playwright_manager = async_playwright()
+                manager_start_attempted = True
+                playwright = await playwright_manager.__aenter__()
                 context = await playwright.chromium.launch_persistent_context(
                     user_data_dir=str(account.profile_directory),
                     headless=False,
                 )
-            except PlaywrightError as error:
-                failure = classify_playwright_failure(None, error)
-                emit_failure_diagnostic(
-                    phase="INITIALIZING",
-                    operation="LAUNCH_SESSION",
-                    error_class=failure.error_class,
-                    page_closed=failure.page_closed,
-                    context_closed=failure.context_closed,
-                )
-                raise UiReadError("BROWSER_SESSION_UNAVAILABLE") from None
-            except OSError:
-                emit_failure_diagnostic(
-                    phase="INITIALIZING",
-                    operation="LAUNCH_SESSION",
-                    error_class="OTHER",
-                    page_closed=False,
-                    context_closed=None,
-                )
-                raise UiReadError("BROWSER_SESSION_UNAVAILABLE") from None
-            try:
                 page = context.pages[0] if context.pages else await context.new_page()
                 return await run_page_workflow(
                     page,
@@ -170,11 +167,18 @@ async def run_browser_nurture(
                     show_observed_text=show_observed_text,
                     detail=detail,
                 )
-            finally:
-                try:
-                    await context.close()
-                except PlaywrightError:
-                    pass
+        except TimeoutError:
+            if timeout_scope is None or not timeout_scope.expired():
+                raise
+            emit_failure_diagnostic(
+                phase="STOPPED",
+                operation="OTHER",
+                error_class="OTHER",
+                error_kind="TIMEOUT",
+                page_closed=None,
+                context_closed=None,
+            )
+            raise UiReadError("CYCLE_TIMEOUT") from None
     except (UiReadError, BrowserDataError):
         raise
     except PlaywrightError as error:
@@ -202,4 +206,42 @@ async def run_browser_nurture(
         )
         raise UiReadError("INTERNAL_OPERATION_ERROR") from None
     finally:
-        lock.release()
+        cleanup_failed = False
+        operation_failed = sys.exc_info()[0] is not None
+        try:
+            if context is not None:
+                try:
+                    async with asyncio.timeout(_CLEANUP_ALLOWANCE_SECONDS):
+                        await context.close()
+                except TimeoutError:
+                    cleanup_failed = True
+                    _emit_cleanup_failure(timed_out=True)
+                except Exception:  # noqa: BLE001 - sanitize cleanup failures; cancellation is not an Exception.
+                    cleanup_failed = True
+                    _emit_cleanup_failure(timed_out=False)
+            if manager_start_attempted:
+                assert playwright_manager is not None
+                try:
+                    async with asyncio.timeout(_CLEANUP_ALLOWANCE_SECONDS):
+                        await playwright_manager.__aexit__(None, None, None)
+                except TimeoutError:
+                    cleanup_failed = True
+                    _emit_cleanup_failure(timed_out=True)
+                except Exception:  # noqa: BLE001 - sanitize cleanup failures; cancellation is not an Exception.
+                    cleanup_failed = True
+                    _emit_cleanup_failure(timed_out=False)
+        finally:
+            lock.release()
+        if cleanup_failed and not operation_failed:
+            raise UiReadError("BROWSER_CLEANUP_FAILED") from None
+
+
+def _emit_cleanup_failure(*, timed_out: bool) -> None:
+    emit_failure_diagnostic(
+        phase="STOPPED",
+        operation="OTHER",
+        error_class="OTHER",
+        error_kind="TIMEOUT" if timed_out else "OTHER",
+        page_closed=None,
+        context_closed=None,
+    )

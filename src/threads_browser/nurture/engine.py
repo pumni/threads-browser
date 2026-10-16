@@ -102,6 +102,7 @@ class NurtureResult:
     unresolved_gaps: int = 0
     visible_text_segments: int = 0
     stop_reason: str = "UNKNOWN"
+    checkpoint_saved: bool = False
 
 
 async def run_page_workflow(
@@ -796,6 +797,7 @@ async def run_page_workflow(
                     _detail_stop("VIEWPORT_OBSERVATION_INCOMPLETE")
                 return NurtureResult(
                     status="VIEWPORT_OBSERVATION_INCOMPLETE",
+                    stop_reason="VIEWPORT_OBSERVATION_INCOMPLETE",
                     home_sampled=len(dedupe.seen_this_run),
                     home_new=len(dedupe.new_fingerprints),
                     home_relevant=stats.relevant,
@@ -1494,4 +1496,5 @@ async def run_page_workflow(
         unresolved_gaps=(coverage.unresolved_gap_count),
         unique_provenance_identities=len(coverage.provenance_verified),
         visible_text_segments=stats.visible_text_segments,
+        checkpoint_saved=True,
     )

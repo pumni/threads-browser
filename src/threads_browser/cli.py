@@ -4,18 +4,24 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import math
+import re
 import sys
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
+from time import monotonic
 
 from .account_service import add_local_account, open_account_login
 from .login import LoginStatus
 from .storage import (
     AccountStore,
+    BrowserAccount,
     BrowserDataError,
     CheckpointStore,
     TermsStore,
     resolve_data_root,
+    write_operation_status,
 )
 
 
@@ -68,6 +74,21 @@ def _add_run_options(parser: argparse.ArgumentParser, *, legacy: bool) -> None:
         type=int,
         default=40,
         help="maximum distinct verified posts per run (1-400; default: 40)",
+    )
+    parser.add_argument(
+        "--max-runtime-seconds",
+        type=float,
+        help="optional maximum browser workflow runtime in seconds",
+    )
+    parser.add_argument(
+        "--no-readiness-prompt",
+        action="store_true",
+        help="stop when readiness checks expire instead of waiting for operator input",
+    )
+    parser.add_argument(
+        "--scheduled",
+        action="store_true",
+        help="write a sanitized latest-run summary and suppress operator readiness prompts",
     )
     parser.add_argument(
         "-t",
@@ -240,6 +261,113 @@ def _run_diagnostics_check(args: argparse.Namespace) -> bool:
     return True
 
 
+def _new_scheduled_status() -> tuple[dict[str, object], float]:
+    started_at = datetime.now(UTC).isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z"
+    )
+    return (
+        {
+            "schema_version": 1,
+            "started_at": started_at,
+            "finished_at": None,
+            "duration_seconds": 0.0,
+            "status": "RUNNING",
+            "cycle_status": None,
+            "stop_reason": "RUNNING",
+            "exit_code": None,
+            "checkpoint_runs": None,
+            "counters": {},
+        },
+        monotonic(),
+    )
+
+
+def _safe_status_code(value: object, *, default: str) -> str:
+    if isinstance(value, str) and re.fullmatch(r"[A-Z0-9_]{1,80}", value):
+        return value
+    return default
+
+
+def _mark_scheduled_failure(summary: dict[str, object] | None, reason: str) -> None:
+    if summary is None:
+        return
+    summary.update(
+        status="FAILED",
+        cycle_status=None,
+        stop_reason=_safe_status_code(reason, default="INTERNAL_OPERATION_ERROR"),
+        exit_code=1,
+        checkpoint_runs=None,
+        counters={},
+    )
+
+
+def _mark_scheduled_result(summary: dict[str, object] | None, result: object) -> None:
+    if summary is None:
+        return
+    checkpoint_saved = getattr(result, "checkpoint_saved", False) is True
+    counters = {
+        name: value
+        for name in (
+            "home_sampled",
+            "home_new",
+            "detail_reads",
+            "scroll_attempts",
+            "scrolls",
+            "skipped_unverified",
+            "unique_verified_posts",
+        )
+        if type(value := getattr(result, name, None)) is int and value >= 0
+    }
+    checkpoint_runs = getattr(result, "checkpoint_runs", None)
+    summary.update(
+        status="COMPLETE" if checkpoint_saved else "STOPPED",
+        cycle_status=_safe_status_code(getattr(result, "status", None), default="UNKNOWN"),
+        stop_reason=_safe_status_code(
+            getattr(result, "stop_reason", None), default="UNKNOWN"
+        ),
+        exit_code=0 if checkpoint_saved else 1,
+        checkpoint_runs=(
+            checkpoint_runs
+            if type(checkpoint_runs) is int and checkpoint_runs >= 0
+            else None
+        ),
+        counters=counters,
+    )
+
+
+def _finish_scheduled_status(
+    summary: dict[str, object], started_monotonic: float
+) -> None:
+    if summary["status"] == "RUNNING":
+        _mark_scheduled_failure(summary, "INTERNAL_OPERATION_ERROR")
+    summary["finished_at"] = datetime.now(UTC).isoformat(
+        timespec="milliseconds"
+    ).replace("+00:00", "Z")
+    summary["duration_seconds"] = round(max(0, monotonic() - started_monotonic), 3)
+
+
+def _record_known_checkpoint_runs(
+    summary: dict[str, object] | None,
+    data_root: Path,
+    account: BrowserAccount,
+    terms: tuple[str, ...],
+) -> None:
+    if summary is None:
+        return
+    from .feed.relevance import canonical_terms
+    from .reader import UiReadError
+    from .workflow import policy_fingerprint
+
+    try:
+        checkpoint = CheckpointStore(data_root).load(
+            account.account_id,
+            policy_fingerprint(canonical_terms(terms)),
+        )
+    except (BrowserDataError, UiReadError):
+        return
+    summary["checkpoint_runs"] = checkpoint.completed_runs
+
+
 def _is_login(args: argparse.Namespace) -> bool:
     return args.command == "login" or (
         args.command == "account" and args.account_command == "login"
@@ -261,11 +389,25 @@ def _is_run(args: argparse.Namespace) -> bool:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
+    scheduled = _is_run(args) and args.scheduled
+    if scheduled and (args.detail or args.show_post_text or args.show_observed_text):
+        print("ERROR SCHEDULED_TEXT_OUTPUT_INVALID", file=sys.stderr)
+        return 1
     if _is_run(args) and not _run_diagnostics_check(args):
         return 1
 
+    scheduled_status, scheduled_started = (
+        _new_scheduled_status() if scheduled else (None, None)
+    )
+    data_root: Path | None = None
+    scheduled_status_ready = False
+    scheduled_account: BrowserAccount | None = None
+    scheduled_terms: tuple[str, ...] | None = None
     try:
         data_root = resolve_data_root()
+        if scheduled_status is not None:
+            write_operation_status(data_root, scheduled_status)
+            scheduled_status_ready = True
         accounts = AccountStore(data_root)
         if _is_add(args):
             if args.actor is None and args.profile_dir is None:
@@ -338,20 +480,37 @@ def main(argv: Sequence[str] | None = None) -> int:
             legacy = args.command == "nurture"
             if legacy and not args.headed:
                 print("ERROR HEADED_REQUIRED", file=sys.stderr)
+                _mark_scheduled_failure(scheduled_status, "HEADED_REQUIRED")
                 return 1
             if not 1 <= args.max_posts <= 20:
                 print("ERROR POST_LIMIT_INVALID", file=sys.stderr)
+                _mark_scheduled_failure(scheduled_status, "POST_LIMIT_INVALID")
                 return 1
             if not 0 <= args.max_scrolls <= 20:
                 print("ERROR SCROLL_LIMIT_INVALID", file=sys.stderr)
+                _mark_scheduled_failure(scheduled_status, "SCROLL_LIMIT_INVALID")
                 return 1
             if not 1 <= args.max_total_posts <= 400:
                 print("ERROR TOTAL_SCAN_LIMIT_INVALID", file=sys.stderr)
+                _mark_scheduled_failure(scheduled_status, "TOTAL_SCAN_LIMIT_INVALID")
+                return 1
+            if args.max_runtime_seconds is not None and (
+                not math.isfinite(args.max_runtime_seconds)
+                or args.max_runtime_seconds <= 0
+            ):
+                print("ERROR RUNTIME_LIMIT_INVALID", file=sys.stderr)
+                _mark_scheduled_failure(scheduled_status, "RUNTIME_LIMIT_INVALID")
+                return 1
+            if args.scheduled and args.max_runtime_seconds is None:
+                print("ERROR SCHEDULED_RUNTIME_REQUIRED", file=sys.stderr)
+                _mark_scheduled_failure(scheduled_status, "SCHEDULED_RUNTIME_REQUIRED")
                 return 1
 
             account = accounts.get(args.alias)
+            scheduled_account = account
             if account.expected_actor is None:
                 print("ERROR ACCOUNT_NOT_VERIFIED", file=sys.stderr)
+                _mark_scheduled_failure(scheduled_status, "ACCOUNT_NOT_VERIFIED")
                 return 1
             if args.terms:
                 terms = tuple(args.terms)
@@ -359,11 +518,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 terms = TermsStore(data_root).get(account.alias)
             if not terms:
                 print("ERROR TERMS_NOT_CONFIGURED", file=sys.stderr)
-                print(
-                    f'Configure terms with: tb terms {account.alias} "hiring"',
-                    file=sys.stderr,
-                )
+                if not args.scheduled:
+                    print(
+                        f'Configure terms with: tb terms {account.alias} "hiring"',
+                        file=sys.stderr,
+                    )
+                _mark_scheduled_failure(scheduled_status, "TERMS_NOT_CONFIGURED")
                 return 1
+            scheduled_terms = terms
             from .reader import UiReadError
             from .workflow import run_browser_nurture
 
@@ -376,17 +538,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                         terms=terms,
                         max_scrolls=args.max_scrolls,
                         max_total_posts=args.max_total_posts,
+                        max_runtime_seconds=args.max_runtime_seconds,
                         show_post_text=args.show_post_text,
                         show_observed_text=args.show_observed_text,
                         detail=args.detail,
                         readiness_prompt=(
                             _prompt_readiness_extension
-                            if _has_interactive_terminal()
+                            if not args.no_readiness_prompt
+                            and not args.scheduled
+                            and _has_interactive_terminal()
                             else None
                         ),
                     )
                 )
             except UiReadError as error:
+                _mark_scheduled_failure(scheduled_status, error.code)
+                _record_known_checkpoint_runs(
+                    scheduled_status, data_root, account, terms
+                )
                 if args.detail:
                     print(
                         f"[CHECKPOINT] status=NOT_SAVED reason={error.code}",
@@ -395,17 +564,45 @@ def main(argv: Sequence[str] | None = None) -> int:
                     print(f"[STOP] code={error.code}", file=sys.stderr)
                 else:
                     print(f"STOP {error.code}", file=sys.stderr)
-                if error.code == "LOGIN_REQUIRED":
+                if error.code == "LOGIN_REQUIRED" and not args.scheduled:
                     print(f"Run 'tb login {account.alias}' to authenticate.", file=sys.stderr)
                 return 1
+            _mark_scheduled_result(scheduled_status, result)
             print(_format_result(result))
+            if args.scheduled and getattr(result, "checkpoint_saved", False) is not True:
+                reason = _safe_status_code(
+                    getattr(result, "stop_reason", None),
+                    default=_safe_status_code(
+                        getattr(result, "status", None), default="CYCLE_NOT_CHECKPOINTED"
+                    ),
+                )
+                print(f"STOP {reason}", file=sys.stderr)
+                return 1
             return 0
     except BrowserDataError as error:
+        _mark_scheduled_failure(scheduled_status, error.code)
+        if (
+            data_root is not None
+            and scheduled_account is not None
+            and scheduled_terms is not None
+        ):
+            _record_known_checkpoint_runs(
+                scheduled_status, data_root, scheduled_account, scheduled_terms
+            )
         print(f"ERROR {error.code}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
+        _mark_scheduled_failure(scheduled_status, "INTERRUPTED")
         print("ERROR INTERRUPTED", file=sys.stderr)
         return 1
+    finally:
+        if scheduled_status_ready and scheduled_status is not None:
+            assert scheduled_started is not None and data_root is not None
+            _finish_scheduled_status(scheduled_status, scheduled_started)
+            try:
+                write_operation_status(data_root, scheduled_status)
+            except BrowserDataError:
+                print("WARNING SCHEDULED_STATUS_WRITE_FAILED", file=sys.stderr)
     return 1
 
 
