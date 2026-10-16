@@ -17,6 +17,7 @@ src/threads_browser/
     scrolling.py             Bounded native wheel gesture engine
     session.py               Home, actor and For You UI verification
     feed_rows.py             Candidate-row discovery and structure checks
+    card_provenance.py       Canonical card identity, body verification and recovery
     body_text.py             Visible body progress and hydration evidence
     loading.py               Render settling and UI readiness observation
     detail.py                Exact Detail navigation and safe return
@@ -34,6 +35,7 @@ src/threads_browser/
 
 - `feed` contains small, testable concepts. It may depend on `errors` and Playwright's `Locator` **type**, but not browser navigation or persistence.
 - `browser_ui` owns reusable Playwright, Locator, DOM and geometry operations. Its modules do not access checkpoint files or decide relevance.
+- `browser_ui.card_provenance` owns card-level canonical permalink, author and body verification, ambiguous-row recovery, stable-card revalidation and the run-local Home body cache. It composes `FeedRowScanner`, `BodyTextReader` and `LoadingObserver`; the reader facade retains scan orchestration, counters, fallback permalink traversal and compatibility wrappers.
 - `reader` preserves the current Python API and composes the UI operations for Home observation. It does not access checkpoint files or choose relevance policy.
 - `nurture.engine` coordinates the reader and checkpoint store. `nurture.state` owns the finite run phases, coverage ledger, dedupe ledger and run statistics; diagnostics stay separate from those decisions.
 - `workflow` preserves the current application entry points and owns only the headed browser context lifecycle. It delegates each page run to `nurture.engine`.
