@@ -301,9 +301,10 @@ def _mark_scheduled_failure(summary: dict[str, object] | None, reason: str) -> N
     )
 
 
-def _mark_scheduled_success(summary: dict[str, object] | None, result: object) -> None:
+def _mark_scheduled_result(summary: dict[str, object] | None, result: object) -> None:
     if summary is None:
         return
+    checkpoint_saved = getattr(result, "checkpoint_saved", False) is True
     counters = {
         name: value
         for name in (
@@ -319,12 +320,12 @@ def _mark_scheduled_success(summary: dict[str, object] | None, result: object) -
     }
     checkpoint_runs = getattr(result, "checkpoint_runs", None)
     summary.update(
-        status="COMPLETE",
+        status="COMPLETE" if checkpoint_saved else "STOPPED",
         cycle_status=_safe_status_code(getattr(result, "status", None), default="UNKNOWN"),
         stop_reason=_safe_status_code(
             getattr(result, "stop_reason", None), default="UNKNOWN"
         ),
-        exit_code=0,
+        exit_code=0 if checkpoint_saved else 1,
         checkpoint_runs=(
             checkpoint_runs
             if type(checkpoint_runs) is int and checkpoint_runs >= 0
@@ -517,10 +518,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 terms = TermsStore(data_root).get(account.alias)
             if not terms:
                 print("ERROR TERMS_NOT_CONFIGURED", file=sys.stderr)
-                print(
-                    f'Configure terms with: tb terms {account.alias} "hiring"',
-                    file=sys.stderr,
-                )
+                if not args.scheduled:
+                    print(
+                        f'Configure terms with: tb terms {account.alias} "hiring"',
+                        file=sys.stderr,
+                    )
                 _mark_scheduled_failure(scheduled_status, "TERMS_NOT_CONFIGURED")
                 return 1
             scheduled_terms = terms
@@ -562,11 +564,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                     print(f"[STOP] code={error.code}", file=sys.stderr)
                 else:
                     print(f"STOP {error.code}", file=sys.stderr)
-                if error.code == "LOGIN_REQUIRED":
+                if error.code == "LOGIN_REQUIRED" and not args.scheduled:
                     print(f"Run 'tb login {account.alias}' to authenticate.", file=sys.stderr)
                 return 1
-            _mark_scheduled_success(scheduled_status, result)
+            _mark_scheduled_result(scheduled_status, result)
             print(_format_result(result))
+            if args.scheduled and getattr(result, "checkpoint_saved", False) is not True:
+                reason = _safe_status_code(
+                    getattr(result, "stop_reason", None),
+                    default=_safe_status_code(
+                        getattr(result, "status", None), default="CYCLE_NOT_CHECKPOINTED"
+                    ),
+                )
+                print(f"STOP {reason}", file=sys.stderr)
+                return 1
             return 0
     except BrowserDataError as error:
         _mark_scheduled_failure(scheduled_status, error.code)

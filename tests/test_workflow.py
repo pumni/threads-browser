@@ -1746,6 +1746,7 @@ window.addEventListener("wheel", () => window.wheelCount++);</script></body></ht
         assert result.observed_rows == 1
         assert result.detail_reads == result.scroll_attempts == 0
         assert result.checkpoint_runs == 1
+        assert result.checkpoint_saved is True
         assert await page.evaluate("window.wheelCount") == 0
         assert provenance_prompts == []
 
@@ -2488,6 +2489,7 @@ def test_workflow_skips_detail_when_no_home_candidate_is_actionable(
         assert result.stop_reason == "NO_ACTIONABLE_TARGET"
         assert result.detail_reads == 0
         assert result.checkpoint_runs == 0
+        assert result.checkpoint_saved is False
 
     _run_offline_page(html, exercise)
     checkpoint = store.load(
@@ -3745,6 +3747,46 @@ def test_browser_runtime_timeout_during_launch_releases_profile_lock(
 
     assert caught.value.code == "CYCLE_TIMEOUT"
     assert manager_state == {"entered": True, "exited": True}
+    checkpoint = store.load(account.account_id, policy_fingerprint(("hiring",)))
+    assert checkpoint.seen_fingerprints == ()
+    assert checkpoint.pending_read_fingerprints == ()
+    with store.profile_lock(account):
+        pass
+
+
+def test_browser_runtime_timeout_during_playwright_startup_attempts_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = tmp_path / "dedicated-profile"
+    profile.mkdir()
+    account = BrowserAccount(uuid4(), "offline", "offline.operator", profile)
+    store = CheckpointStore(tmp_path / "data")
+    manager_state = {"startup_started": False, "shutdown_attempted": False}
+
+    class Manager:
+        async def __aenter__(self):
+            manager_state["startup_started"] = True
+            await asyncio.Event().wait()
+
+        async def __aexit__(self, *_args):
+            manager_state["shutdown_attempted"] = True
+
+    monkeypatch.setattr(workflow, "async_playwright", Manager)
+
+    with pytest.raises(UiReadError) as caught:
+        asyncio.run(
+            workflow.run_browser_nurture(
+                account,
+                store,
+                max_posts=1,
+                terms=("hiring",),
+                max_runtime_seconds=0.01,
+            )
+        )
+
+    assert caught.value.code == "CYCLE_TIMEOUT"
+    assert manager_state == {"startup_started": True, "shutdown_attempted": True}
     checkpoint = store.load(account.account_id, policy_fingerprint(("hiring",)))
     assert checkpoint.seen_fingerprints == ()
     assert checkpoint.pending_read_fingerprints == ()

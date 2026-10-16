@@ -139,7 +139,7 @@ async def run_browser_nurture(
     lock = checkpoint_store.profile_lock(account)
     lock.acquire()
     playwright_manager = None
-    manager_entered = False
+    manager_start_attempted = False
     context = None
     timeout_scope = None
     try:
@@ -147,8 +147,8 @@ async def run_browser_nurture(
         try:
             async with timeout_scope:
                 playwright_manager = async_playwright()
+                manager_start_attempted = True
                 playwright = await playwright_manager.__aenter__()
-                manager_entered = True
                 context = await playwright.chromium.launch_persistent_context(
                     user_data_dir=str(account.profile_directory),
                     headless=False,
@@ -219,7 +219,7 @@ async def run_browser_nurture(
                 except Exception:  # noqa: BLE001 - sanitize cleanup failures; cancellation is not an Exception.
                     cleanup_failed = True
                     _emit_cleanup_failure(timed_out=False)
-            if manager_entered:
+            if manager_start_attempted:
                 assert playwright_manager is not None
                 try:
                     async with asyncio.timeout(_CLEANUP_ALLOWANCE_SECONDS):

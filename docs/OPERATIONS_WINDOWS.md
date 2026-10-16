@@ -64,6 +64,10 @@ bounded. The CLI output contains only operational statuses and counts unless
 an operator explicitly enables a local-only diagnostic mode; the wrapper
 rejects those text-output options in scheduled mode.
 
+`COMPLETE` means this invocation saved its checkpoint. A returned cycle that
+stops before saving is recorded as `STOPPED`, returns exit code 1, and preserves
+the cycle status and stop reason even when an earlier checkpoint count exists.
+
 Use the exit code and `stop_reason` for triage:
 
 | Status | Operator action |
@@ -73,6 +77,7 @@ Use the exit code and `stop_reason` for triage:
 | `CHALLENGE_REQUIRED` | Open the profile manually and resolve the challenge. Do not automate it. |
 | `RATE_LIMITED` | Stop scheduled attempts and review manually before scheduling a later run. |
 | `CYCLE_TIMEOUT` | Review the browser and machine state; allow the next planned trigger after recovery. |
+| `STOPPED` | Review `cycle_status` and `stop_reason`; do not treat the attempt as a completed checkpointed cycle. |
 | `RUNNING` after the task ended | Treat as interrupted cleanup; inspect Task Scheduler history and the browser process before another attempt. |
 
 Do not configure immediate retries for these cases. Keep Task Scheduler history
