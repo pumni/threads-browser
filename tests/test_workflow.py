@@ -1356,6 +1356,40 @@ def test_streamed_row_survives_discovery_deadline_overrun_once(
     _run_offline_page(feed_html, exercise)
 
 
+def test_viewport_scan_cancellation_disposes_candidate_handles() -> None:
+    actor = "offline.operator"
+    feed_html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main><article>
+  <a href="/@candidate/post/cancel-scan"><time>1h</time></a>
+  <a href="/@candidate">@candidate</a><p>A synthetic weather update.</p>
+</article></main></body></html>"""
+
+    async def exercise(page) -> None:
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        handles = []
+
+        async def cancel_after_first_candidate(row) -> None:
+            if row.candidate:
+                active = reader._active_scan_candidate_handles
+                assert active is not None
+                handles.extend(active.values())
+                raise asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            await reader.scan_viewport(1, on_row=cancel_after_first_candidate)
+
+        assert handles
+        assert reader._active_scan_candidate_handles is None
+        with pytest.raises(PlaywrightError):
+            await handles[0].evaluate("node => node.isConnected")
+
+    _run_offline_page(feed_html, exercise)
+
+
 def test_attended_wait_can_extend_then_stop_without_checkpoint(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

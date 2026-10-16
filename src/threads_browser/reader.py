@@ -7,7 +7,7 @@ import re
 import secrets
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from hashlib import sha256
 from typing import Literal, TypeVar
 from urllib.parse import urljoin, urlsplit
@@ -28,14 +28,12 @@ from playwright.async_api import (
 from .browser_ui.body_text import (
     _MAX_BODY_CODEPOINTS,  # noqa: F401 - retained reader-module compatibility name
     BodyTextReader,
-    _body_progress_state,
     _canonicalize_body,  # noqa: F401 - retained reader-module compatibility name
     _canonicalize_body_block,  # noqa: F401 - retained reader-module compatibility name
     _VisibleBodyRead,
 )
 from .browser_ui.card_provenance import (
     CardProvenanceReader,
-    _CardDeferredOffscreen,
 )
 from .browser_ui.detail import DetailNavigator
 from .browser_ui.feed_rows import (
@@ -74,6 +72,15 @@ from .browser_ui.session import (
     classify_playwright_error_kind,
     classify_playwright_failure,
     emit_failure_diagnostic,
+)
+from .browser_ui.viewport_scan import (
+    ViewportScanCoordinator,
+    _HomeRowObservation,
+    _ScanFailureSite,
+    _TrackedRowIdentity,
+    _ViewportScanHooks,
+    _ViewportScanRequest,
+    _VisibleTargets,
 )
 from .errors import UiReadError
 from .feed.models import (
@@ -133,46 +140,6 @@ _ReadinessResult = TypeVar("_ReadinessResult")
 
 
 @dataclass(frozen=True, slots=True)
-class _HomeRowObservation:
-    diagnostic: _CandidateDiagnostic
-    target: PostTarget | None = None
-    display: DisplayObservation | None = None
-    fingerprint: str | None = None
-    candidate: bool = True
-
-
-@dataclass(frozen=True, slots=True, repr=False)
-class _TrackedRowIdentity:
-    """Keep transient DOM identity, observation ID, and post fingerprint distinct."""
-
-    dom_handle: JSHandle = field(repr=False)
-    observation_id: str = field(repr=False)
-    fingerprint: str | None = field(default=None, repr=False)
-    author_fingerprint: str | None = field(default=None, repr=False)
-    body_verified: bool = False
-
-    def __repr__(self) -> str:
-        return "TrackedRowIdentity(<private>)"
-
-
-@dataclass(frozen=True, slots=True, repr=False)
-class _ScanFailureSite:
-    stage: str
-    viewport_index: int | None
-    candidate_index: int | None
-    operation: str
-    root_handle: JSHandle = field(repr=False)
-    canonical_identity: str | None = field(repr=False)
-    identity_source: str
-    author_fingerprint: str | None = field(repr=False)
-    carried_identity: _TrackedRowIdentity | None = field(repr=False)
-    identity_conflict: bool
-    box: tuple[float, float, float, float] = field(repr=False)
-    viewport_size: tuple[int, int] = field(repr=False)
-    scroll_position: tuple[float, float, float] = field(repr=False)
-
-
-@dataclass(frozen=True, slots=True)
 class _FeedTargetsObservation:
     targets: tuple[PostTarget, ...]
     scroll_anchor: dict[str, float] | None
@@ -182,20 +149,6 @@ class _FeedTargetsObservation:
     coverage_complete: bool = True
     render_signature: tuple[object, ...] = field(default=(), repr=False)
     candidate_roots: tuple[Locator, ...] = field(default=(), repr=False)
-    candidate_observation_ids: tuple[str, ...] = field(default=(), repr=False)
-    candidate_identities: tuple[_TrackedRowIdentity, ...] = field(default=(), repr=False)
-
-
-@dataclass(frozen=True, slots=True)
-class _VisibleTargets:
-    targets: tuple[PostTarget, ...]
-    scroll_anchor: dict[str, float] | None
-    display_observations: tuple[DisplayObservation, ...]
-    observed_rows: int
-    coverage_complete: bool
-    signature: tuple[object, ...] = field(repr=False)
-    candidate_roots: tuple[Locator, ...] = field(default=(), repr=False)
-    pending_signals: tuple[_CardWaitSignal, ...] = field(default=(), repr=False)
     candidate_observation_ids: tuple[str, ...] = field(default=(), repr=False)
     candidate_identities: tuple[_TrackedRowIdentity, ...] = field(default=(), repr=False)
 
@@ -222,12 +175,7 @@ class ThreadsHomeReader:
         self._detail_mode = detail_mode
         self._failure_phase = "INITIALIZING"
         self._failure_operation = "SETTLE"
-        self._scan_stage: str | None = None
         self._scan_viewport_index: int | None = None
-        self._scan_candidate_index: int | None = None
-        self._scan_operation = "DISCOVER_ROOTS"
-        self._scan_failure_site: _ScanFailureSite | None = None
-        self._active_scan_candidate_handles: dict[int, JSHandle] | None = None
         self.last_scan_retry_count = 0
         self._home_url: str | None = None
         self._verified_actor_route: str | None = None
@@ -241,6 +189,11 @@ class ThreadsHomeReader:
             self._feed_rows,
             self._body_text,
             self._loading_observer,
+        )
+        self._viewport_scan = ViewportScanCoordinator(
+            self._page,
+            self._feed_rows,
+            self._card_provenance,
         )
         self.last_candidate_diagnostics: tuple[_CandidateDiagnostic, ...] = ()
         self.last_display_observations: tuple[DisplayObservation, ...] = ()
@@ -286,6 +239,42 @@ class ThreadsHomeReader:
     def _cached_home_bodies(self, value: dict[str, tuple[str, bool]]) -> None:
         self._card_provenance.cached_home_bodies = value
 
+    @property
+    def _scan_stage(self) -> str | None:
+        return self._viewport_scan.stage
+
+    @_scan_stage.setter
+    def _scan_stage(self, value: str | None) -> None:
+        self._viewport_scan.stage = value
+
+    @property
+    def _scan_candidate_index(self) -> int | None:
+        return self._viewport_scan.candidate_index
+
+    @_scan_candidate_index.setter
+    def _scan_candidate_index(self, value: int | None) -> None:
+        self._viewport_scan.candidate_index = value
+
+    @property
+    def _scan_operation(self) -> str:
+        return self._viewport_scan.operation
+
+    @property
+    def _scan_failure_site(self) -> _ScanFailureSite | None:
+        return self._viewport_scan.failure_site
+
+    @_scan_failure_site.setter
+    def _scan_failure_site(self, value: _ScanFailureSite | None) -> None:
+        self._viewport_scan.failure_site = value
+
+    @property
+    def _active_scan_candidate_handles(self) -> dict[int, JSHandle] | None:
+        return self._viewport_scan.active_candidate_handles
+
+    @_active_scan_candidate_handles.setter
+    def _active_scan_candidate_handles(self, value: dict[int, JSHandle] | None) -> None:
+        self._viewport_scan.active_candidate_handles = value
+
     def _mark_ui_transition(self) -> None:
         self._last_ui_transition_at = time.monotonic()
 
@@ -297,41 +286,13 @@ class ThreadsHomeReader:
         self._scan_viewport_index = viewport_index
 
     def _set_scan_operation(self, operation: str) -> None:
-        self._scan_operation = operation
-        if self._scan_failure_site is not None:
-            self._scan_failure_site = replace(
-                self._scan_failure_site,
-                operation=operation,
-            )
+        self._viewport_scan.set_operation(operation)
 
     def refresh_viewport_body_coverage_counts(self) -> None:
-        visited: set[str] = set()
-        lookahead: set[str] = set()
-        for diagnostic in self.last_candidate_diagnostics:
-            if diagnostic.state in {"NON_POST", "VERIFIED"}:
-                continue
-            identity = (
-                diagnostic.identity_fingerprint
-                or diagnostic.observation_id
-                or f"row:{diagnostic.row_index}"
-            )
-            evidence = diagnostic.read_evidence
-            if evidence is None:
-                continue
-            body_has_entered_clip = (
-                (evidence.visible_text_rect_count or 0) > 0
-                or (evidence.visited_range_count or 0) > 0
-            )
-            if body_has_entered_clip:
-                visited.add(identity)
-            elif (
-                evidence.closest_text_side == "BELOW"
-                and evidence.closest_text_distance_px is not None
-            ):
-                lookahead.add(identity)
-        lookahead.difference_update(visited)
-        self.last_scan_counts.unresolved_visited_rows = len(visited)
-        self.last_scan_counts.lookahead_rows = len(lookahead)
+        ViewportScanCoordinator.refresh_viewport_body_coverage_counts(
+            self.last_candidate_diagnostics,
+            self.last_scan_counts,
+        )
 
     async def _scan_position(self) -> tuple[float, float, float]:
         values = await self._page.evaluate(
@@ -348,60 +309,12 @@ class ThreadsHomeReader:
         candidate_index: int,
         carried_identity: _TrackedRowIdentity | None = None,
     ) -> None:
-        self._scan_candidate_index = candidate_index
-        self._set_scan_operation("STRUCTURE")
-        evidence = await self._feed_rows._candidate_identity_evidence(root, root_handle)
-        box = await root.bounding_box()
-        position = await self._scan_position()
-        if not evidence.root_matches or box is None:
-            self._scan_failure_site = None
-            return
-        identity_source = "NONE"
-        identity = evidence.canonical_fingerprint
-        author_fingerprint = (
-            next(iter(evidence.author_fingerprints))
-            if len(evidence.author_fingerprints) == 1
-            else None
-        )
-        identity_conflict = False
-        if identity is not None:
-            identity_source = "CURRENT_CANONICAL"
-            if carried_identity is not None and carried_identity.fingerprint is not None:
-                identity_conflict = (
-                    identity != carried_identity.fingerprint
-                    or evidence.conflicts_with(
-                        carried_identity.fingerprint,
-                        carried_identity.author_fingerprint,
-                    )
-                )
-        elif (
-            carried_identity is not None
-            and carried_identity.body_verified
-            and carried_identity.fingerprint is not None
-        ):
-            if not evidence.conflicts_with(
-                carried_identity.fingerprint,
-                carried_identity.author_fingerprint,
-            ):
-                identity = carried_identity.fingerprint
-                author_fingerprint = carried_identity.author_fingerprint
-                identity_source = "CARRIED_VERIFIED"
-            else:
-                identity_conflict = True
-        self._scan_failure_site = _ScanFailureSite(
-            stage=self._scan_stage or "FEED_INITIAL",
-            viewport_index=self._scan_viewport_index,
-            candidate_index=candidate_index,
-            operation=self._scan_operation,
-            root_handle=root_handle,
-            canonical_identity=identity,
-            identity_source=identity_source,
-            author_fingerprint=author_fingerprint,
-            carried_identity=carried_identity,
-            identity_conflict=identity_conflict,
-            box=(float(box["x"]), float(box["y"]), float(box["width"]), float(box["height"])),
-            viewport_size=(viewport["width"], viewport["height"]),
-            scroll_position=position,
+        await self._viewport_scan._capture_scan_failure_site(
+            root,
+            root_handle,
+            viewport,
+            candidate_index,
+            carried_identity,
         )
 
     async def _revalidate_scan_failure(self) -> str:
@@ -510,15 +423,7 @@ class ThreadsHomeReader:
             return "INSUFFICIENT"
 
     async def _dispose_active_scan_candidate_handles(self) -> None:
-        handles = self._active_scan_candidate_handles
-        self._active_scan_candidate_handles = None
-        if handles is None:
-            return
-        for handle in handles.values():
-            try:
-                await handle.dispose()
-            except PlaywrightError:
-                pass
+        await self._viewport_scan._dispose_active_scan_candidate_handles()
 
     @property
     def skipped_unverified(self) -> int:
@@ -1354,7 +1259,14 @@ class ThreadsHomeReader:
             except PlaywrightError as error:
                 failure = classify_playwright_failure(self._page, error)
                 if failure_operation == "SCAN_ROW":
-                    row_identity = await self._revalidate_scan_failure()
+                    try:
+                        row_identity = await self._revalidate_scan_failure()
+                    except asyncio.CancelledError:
+                        await self._dispose_active_scan_candidate_handles()
+                        self._scan_failure_site = None
+                        self._scan_stage = None
+                        self._viewport_scan.clear_scan_state()
+                        raise
                     failure_site = self._scan_failure_site
                     operation_name = self._scan_operation
                     if operation_name not in {
@@ -1402,6 +1314,7 @@ class ThreadsHomeReader:
                         await self._dispose_active_scan_candidate_handles()
                         self._scan_failure_site = None
                         self._scan_stage = None
+                        self._viewport_scan.clear_scan_state()
                         raise UiReadError("BROWSER_SESSION_UNAVAILABLE") from None
                     if (
                         row_identity == "REUSED"
@@ -1409,6 +1322,7 @@ class ThreadsHomeReader:
                     ):
                         await self._dispose_active_scan_candidate_handles()
                         self._scan_failure_site = None
+                        self._viewport_scan.clear_scan_state()
                         self.last_scan_retry_count += 1
                         window += 1
                         print(f"WAITING stage={stage} retry={window}")
@@ -1416,6 +1330,7 @@ class ThreadsHomeReader:
                     await self._dispose_active_scan_candidate_handles()
                     self._scan_failure_site = None
                     self._scan_stage = None
+                    self._viewport_scan.clear_scan_state()
                     raise UiReadError("SCAN_ROW_UNVERIFIED") from None
                 emit_failure_diagnostic(
                     phase=self._failure_phase,
@@ -1457,6 +1372,7 @@ class ThreadsHomeReader:
                     await self._dispose_active_scan_candidate_handles()
                     self._scan_failure_site = None
                     self._scan_stage = None
+                    self._viewport_scan.clear_scan_state()
                 if error.code not in allowed_codes:
                     raise
                 final_code = error.code
@@ -2261,10 +2177,15 @@ class ThreadsHomeReader:
 
     async def _discard_pending_viewport_candidates(self) -> None:
         retained = {id(identity.dom_handle) for identity in self._last_viewport_candidate_identities}
-        for identity in self._pending_viewport_candidate_identities:
-            if id(identity.dom_handle) not in retained:
-                await identity.dom_handle.dispose()
+        pending = self._pending_viewport_candidate_identities
         self._pending_viewport_candidate_identities = ()
+        await self._viewport_scan.dispose_handles(
+            tuple(
+                identity.dom_handle
+                for identity in pending
+                if id(identity.dom_handle) not in retained
+            )
+        )
 
     async def _remember_viewport_candidates(
         self,
@@ -2279,9 +2200,13 @@ class ThreadsHomeReader:
         self._last_viewport_candidate_roots = roots
         self._last_viewport_candidate_identities = identities
         self._pending_viewport_candidate_identities = ()
-        for identity in previous:
-            if id(identity.dom_handle) not in retained:
-                await identity.dom_handle.dispose()
+        await self._viewport_scan.dispose_handles(
+            tuple(
+                identity.dom_handle
+                for identity in previous
+                if id(identity.dom_handle) not in retained
+            )
+        )
 
     async def _visible_targets(
         self,
@@ -2292,1046 +2217,48 @@ class ThreadsHomeReader:
         stage: str = "FEED",
         on_row: Callable[[_HomeRowObservation], Awaitable[None]] | None = None,
     ) -> _VisibleTargets:
-        self._scan_stage = stage
-        self._scan_candidate_index = None
-        self._scan_failure_site = None
-        self._set_scan_operation("DISCOVER_ROOTS")
+        """Compatibility facade for the viewport scan coordinator."""
         await self._dispose_active_scan_candidate_handles()
         await self._discard_pending_viewport_candidates()
-        viewport = self._page.viewport_size
-        if viewport is None:
-            raise UiReadError("FEED_VIEWPORT_UNVERIFIED")
-        counts = self.last_scan_counts
-        counts.visible_links = 0
-        counts.inspected = 0
-        counts.article_roots = 0
-        counts.pressable_roots = 0
-        counts.visible_times = 0
-        counts.profile_anchor_candidates = 0
-        counts.visible_anchors = 0
-        counts.visible_post_links = 0
-        counts.body_candidates = 0
-        counts.paragraph_candidates = 0
-        counts.url_parsed = 0
-        counts.url_timestamp_links = 0
-        counts.url_secondary_links = 0
-        counts.url_canonical_links = 0
-        counts.url_rejected_links = 0
-        counts.card_not_ready = 0
-        counts.deferred_offscreen = 0
-        counts.identity_verified = 0
-        counts.new_verified_rows = 0
-        counts.partial_body_rows = 0
-        counts.deferred_identity_rows = 0
-        counts.new_visible_text_segments = 0
-        counts.deferred_above = 0
-        counts.deferred_below = 0
-        counts.nearest_deferred_below_px = None
-        counts.frontier_content_px = None
-        counts.verified = 0
-        counts.body_read = 0
-        counts.body_unknown = 0
-        counts.observed_rows = 0
-        counts.body_extracted = 0
-        counts.skipped_rows = 0
-        counts.uncertain_rows = 0
-        counts.coverage_complete = True
-        counts.skipped = 0
-        counts.rejection_reasons.clear()
-        counts.url_structure_counts.clear()
-        counts.unsupported_roots = 0
-        counts.roots_truncated = False
-        counts.unrepresented_root_count = 0
-        counts.unresolved_visited_rows = 0
-        counts.lookahead_rows = 0
-        counts.region_status = "UNSET"
-        counts.scroll_surface_status = "NOT_CHECKED"
-        counts.structural_reasons.clear()
-        self.last_candidate_diagnostics = ()
-        self.last_display_observations = ()
-        self.last_scan_timings = _FeedScanTimings()
-        self.last_viewport_can_wheel = False
-        discover_started = time.perf_counter()
-        region = await self._content_region()
-        roots, roots_truncated = await self._top_level_candidate_roots(region, viewport)
-        counts.roots_truncated = roots_truncated
-        counts.unrepresented_root_count = int(roots_truncated)
-        self._set_scan_operation("STRUCTURE")
-        structures = await self._collect_structure_diagnostics(
-            region,
-            roots,
-            viewport,
-        )
-        self.last_scan_timings.discover_ms = round((time.perf_counter() - discover_started) * 1000)
 
-        async def emit_row(
-            diagnostic: _CandidateDiagnostic,
-            *,
-            target: PostTarget | None = None,
-            display: DisplayObservation | None = None,
-            fingerprint: str | None = None,
-            candidate: bool = True,
-        ) -> None:
-            if target is not None:
-                diagnostic.identity_fingerprint = target.fingerprint
-                diagnostic.author_fingerprint = sha256(target.author.encode()).hexdigest()
-            self.last_candidate_diagnostics = tuple(diagnostics)
-            self.refresh_viewport_body_coverage_counts()
-            if on_row is not None:
-                self._set_scan_operation("EMIT_ROW")
-                await on_row(
-                    _HomeRowObservation(
-                        diagnostic,
-                        target,
-                        display,
-                        fingerprint or diagnostic.identity_fingerprint,
-                        candidate,
-                    )
-                )
-
-        candidate_rows: list[
-            tuple[
-                int,
-                Locator,
-                _CandidateStructure,
-                _TrackedRowIdentity | None,
-                _CandidateDiagnostic,
-                str,
-            ]
-        ] = []
-        candidate_dom_handles: dict[int, JSHandle] = {}
-        self._active_scan_candidate_handles = candidate_dom_handles
-        candidate_prior_fingerprints: dict[int, str | None] = {}
-        matched_previous_identity_handles: set[int] = set()
-        diagnostics: list[_CandidateDiagnostic] = []
-        for index, root in enumerate(roots):
-            self._scan_candidate_index = index + 1
-            self._set_scan_operation("STRUCTURE")
-            structure = structures[index]
-            root_kind = structure.root_kind
-            diagnostic = _CandidateDiagnostic(
-                row_index=index + 1,
-                root_kind=root_kind,
-                has_visible_time=structure.visible_times > 0,
-                has_post_permalink=structure.visible_post_links > 0,
-                has_profile_author=structure.profile_anchor_candidates > 0,
-                has_readable_body=structure.readable_body_candidates > 0,
-            )
-            diagnostics.append(diagnostic)
-            has_row_cues = (structure.visible_times or structure.offscreen_times) and (
-                structure.profile_anchor_candidates
-                or structure.visible_post_links
-                or structure.body_candidates
-                or structure.offscreen_post_links
-                or structure.offscreen_profile_anchors
-                or structure.offscreen_body_candidates
-            )
-            semantic_evidence = (
-                structure.body_candidates or structure.offscreen_body_candidates
-            ) and (
-                structure.visible_times
-                or structure.offscreen_times
-                or structure.profile_anchor_candidates
-                or structure.visible_post_links
-                or structure.offscreen_profile_anchors
-                or structure.offscreen_post_links
-            )
-            semantic_row = (
-                semantic_evidence
-                and (
-                    root_kind != "PRESSABLE"
-                    or structure.visible_times
-                    or structure.visible_post_links
-                )
-                and root_kind in {"ARTICLE", "ROLE_ARTICLE", "PRESSABLE"}
-            )
-            unresolved_post_root = bool(
-                (structure.visible_post_links and not structure.canonical_post_links)
-                or (structure.canonical_post_links and not structure.profile_anchor_candidates)
-            )
-            carried_identity = await self._is_carried_viewport_candidate(root)
-            carried_row = carried_identity is not None
-            if carried_identity is not None:
-                matched_previous_identity_handles.add(id(carried_identity.dom_handle))
-                diagnostic.identity_fingerprint = carried_identity.fingerprint
-                diagnostic.author_fingerprint = carried_identity.author_fingerprint
-            if has_row_cues or semantic_row or carried_row:
-                root_handle = await root.element_handle()
-                if root_handle is not None:
-                    candidate_dom_handles[index] = root_handle
-                candidate_prior_fingerprints[index] = (
-                    None if carried_identity is None else carried_identity.fingerprint
-                )
-                diagnostic.state = "PENDING"
-                diagnostic.reason = "POST_ROW_REQUIRES_VERIFICATION"
-                diagnostic.observation_id = (
-                    secrets.token_hex(8)
-                    if carried_identity is None
-                    else carried_identity.observation_id
-                )
-                candidate_rows.append(
-                    (
-                        index,
-                        root,
-                        structure,
-                        carried_identity,
-                        diagnostic,
-                        diagnostic.observation_id,
-                    )
-                )
-            elif unresolved_post_root:
-                diagnostic.state = "DEFERRED_IDENTITY"
-                diagnostic.reason = "POST_ROOT_UNRESOLVED"
-                diagnostic.observation_id = secrets.token_hex(8)
-                self._record_structure_reason("POST_ROOT_UNRESOLVED")
-        self.last_candidate_diagnostics = tuple(diagnostics)
-        self.refresh_viewport_body_coverage_counts()
-        unresolved_root_count = sum(
-            diagnostic.reason == "POST_ROOT_UNRESOLVED" for diagnostic in diagnostics
-        )
-        counts.observed_rows = len(candidate_rows) + unresolved_root_count
-        counts.coverage_complete = (
-            not roots_truncated
-            and counts.observed_rows <= max_posts
-            and unresolved_root_count == 0
-            and not any(structure.visible_times > 1 for _, _, structure, _, _, _ in candidate_rows)
-        )
-        targets: list[PostTarget] = []
-        scroll_anchor: dict[str, float] | None = None
-        display_observations: list[DisplayObservation] = []
-        pending_signals: list[_CardWaitSignal] = []
-        scanned_fingerprints: set[str] = set()
-        candidate_by_index = {
-            index: (root, structure, carried_identity, diagnostic, observation_id)
-            for index, root, structure, carried_identity, diagnostic, observation_id in candidate_rows
-        }
-        processed_candidates = 0
-        for row_index, diagnostic in enumerate(diagnostics):
-            self._scan_candidate_index = row_index + 1
-            self._set_scan_operation("STRUCTURE")
-            candidate = candidate_by_index.get(row_index)
-            if candidate is None:
-                await emit_row(diagnostic, candidate=False)
-                continue
-            if processed_candidates >= max_posts:
-                diagnostic.state = "REJECTED"
-                diagnostic.reason = "POST_SCAN_CAP_REACHED"
-                counts.skipped_rows += 1
-                await emit_row(diagnostic)
-                continue
-            processed_candidates += 1
-            root, structure, carried_identity, diagnostic, _ = candidate
-            carried_row = carried_identity is not None
-            root_handle = candidate_dom_handles.get(row_index)
-            if root_handle is None:
-                counts.skipped_rows += 1
-                counts.uncertain_rows += 1
-                counts.coverage_complete = False
-                diagnostic.state = "REJECTED"
-                diagnostic.reason = "POST_ROOT_IDENTITY_UNAVAILABLE"
-                await emit_row(diagnostic)
-                continue
-            await self._capture_scan_failure_site(
-                root,
-                root_handle,
-                viewport,
-                row_index + 1,
-                carried_identity=carried_identity,
-            )
-            self._set_scan_operation("STRUCTURE")
-            if not await self._same_dom_element(root, root_handle):
-                replacement_handle = await root.element_handle()
-                await root_handle.dispose()
-                if replacement_handle is None:
-                    candidate_dom_handles.pop(row_index, None)
-                    counts.skipped_rows += 1
-                    counts.uncertain_rows += 1
-                    counts.coverage_complete = False
-                    diagnostic.state = "REJECTED"
-                    diagnostic.reason = "POST_ROOT_IDENTITY_CHANGED"
-                    await emit_row(diagnostic)
-                    continue
-                root_handle = replacement_handle
-                candidate_dom_handles[row_index] = replacement_handle
-                candidate_prior_fingerprints[row_index] = None
-                carried_row = False
-                diagnostic.observation_id = secrets.token_hex(8)
-                diagnostic.identity_fingerprint = None
-                diagnostic.author_fingerprint = None
-                structure = await self._inspect_candidate_root(root, viewport)
-                diagnostic.root_kind = structure.root_kind
-                diagnostic.has_visible_time = structure.visible_times > 0
-                diagnostic.has_post_permalink = structure.visible_post_links > 0
-                diagnostic.has_profile_author = structure.profile_anchor_candidates > 0
-                diagnostic.has_readable_body = structure.readable_body_candidates > 0
-                if not await self._same_dom_element(root, root_handle):
-                    counts.skipped_rows += 1
-                    counts.uncertain_rows += 1
-                    counts.coverage_complete = False
-                    diagnostic.state = "REJECTED"
-                    diagnostic.reason = "POST_ROOT_IDENTITY_CHANGED"
-                    await emit_row(diagnostic)
-                    continue
-            self._set_scan_operation("BOUNDING_BOX")
-            box = await root.bounding_box()
-            if box is None:
-                counts.skipped_rows += 1
-                counts.uncertain_rows += 1
-                diagnostic.state = "REJECTED"
-                diagnostic.reason = "POST_ROOT_NOT_VISIBLE"
-                display_observations.append(DisplayObservation(None, "OBSERVATION_UNCERTAIN"))
-                await emit_row(
-                    diagnostic,
-                    display=display_observations[-1],
-                )
-                continue
-            counts.inspected += 1
-            if scroll_anchor is None:
-                scroll_anchor = box
-            if (
-                not (
-                    structure.profile_anchor_candidates
-                    or structure.visible_post_links
-                    or structure.offscreen_post_links
-                    or structure.offscreen_profile_anchors
-                )
-                and not carried_row
-            ):
-                counts.skipped_rows += 1
-                counts.uncertain_rows += 1
-                diagnostic.state = "REJECTED"
-                diagnostic.reason = "DISPLAY_ROW_CUES_INSUFFICIENT"
-                self._record_structure_reason("DISPLAY_ROW_CUES_INSUFFICIENT")
-                display_observations.append(
-                    DisplayObservation(None, "OBSERVATION_UNCERTAIN", box["y"])
-                )
-                await emit_row(diagnostic, display=display_observations[-1])
-                continue
-            if structure.visible_times > 1:
-                counts.skipped_rows += 1
-                counts.uncertain_rows += 1
-                diagnostic.state = "REJECTED"
-                diagnostic.reason = "CANDIDATE_ROW_AMBIGUOUS"
-                self._record_structure_reason("CANDIDATE_ROW_AMBIGUOUS")
-                display_observations.append(
-                    DisplayObservation(None, "OBSERVATION_UNCERTAIN", box["y"])
-                )
-                await emit_row(diagnostic, display=display_observations[-1])
-                continue
-            read_started = time.perf_counter()
-            try:
-                if currently_visible:
-                    stabilize_started = time.perf_counter()
-                    target, body_stable = await self._read_stable_visible_card(
-                        root,
-                        viewport_y=box["y"],
-                        cached_body_fingerprints=prefer_new_fingerprints,
-                        expected_root_handle=root_handle,
-                        allow_hydration_retry=structure.readable_body_candidates == 0,
-                    )
-                    self.last_scan_timings.stabilize_ms += round(
-                        (time.perf_counter() - stabilize_started) * 1000
-                    )
-                    if not body_stable:
-                        diagnostic.state = "OBSERVED_UNVERIFIED"
-                        diagnostic.reason = "ROW_CONTENT_CHANGED_DURING_READ"
-                        diagnostic.identity_fingerprint = target.fingerprint
-                        if candidate_prior_fingerprints.get(row_index) not in {
-                            None,
-                            target.fingerprint,
-                        }:
-                            diagnostic.observation_id = secrets.token_hex(8)
-                            carried_row = False
-                        candidate_prior_fingerprints[row_index] = target.fingerprint
-                        diagnostic.read_evidence = target.read_evidence
-                        diagnostic.has_readable_body = bool(target.body and target.body.strip())
-                        counts.uncertain_rows += 1
-                        counts.skipped_rows += 1
-                        if diagnostic.has_readable_body:
-                            counts.body_extracted += 1
-                            display_observations.append(
-                                DisplayObservation(
-                                    target.body,
-                                    viewport_y=box["y"],
-                                    read_evidence=target.read_evidence,
-                                )
-                            )
-                        else:
-                            counts.body_unknown += 1
-                            display_observations.append(
-                                DisplayObservation(
-                                    None,
-                                    "OBSERVATION_UNCERTAIN",
-                                    box["y"],
-                                    read_evidence=target.read_evidence,
-                                )
-                            )
-                        await emit_row(
-                            diagnostic,
-                            display=display_observations[-1],
-                            fingerprint=target.fingerprint,
-                        )
-                        continue
-                else:
-                    target = await self._read_card(
-                        root,
-                        currently_visible=False,
-                        viewport_y=box["y"],
-                        cached_body_fingerprints=prefer_new_fingerprints,
-                    )
-            except _CardDeferredOffscreen as deferred:
-                self.last_scan_timings.read_row_ms += round(
-                    (time.perf_counter() - read_started) * 1000
-                )
-                counts.deferred_offscreen += 1
-                counts.skipped_rows += 1
-                self.last_scan_timings.wait_reason = "DEFERRED_OFFSCREEN"
-                diagnostic.state = "DEFERRED_OFFSCREEN"
-                diagnostic.reason = deferred.reason
-                diagnostic.identity_fingerprint = deferred.fingerprint
-                await emit_row(diagnostic, fingerprint=deferred.fingerprint)
-                continue
-            except _CardNotReady as pending:
-                if pending.reason_code == "POST_ROOT_DOM_IDENTITY_CHANGED":
-                    replacement_handle = await root.element_handle()
-                    previous_handle = candidate_dom_handles.get(row_index)
-                    if previous_handle is not None:
-                        await previous_handle.dispose()
-                    if replacement_handle is None:
-                        candidate_dom_handles.pop(row_index, None)
-                    else:
-                        candidate_dom_handles[row_index] = replacement_handle
-                    candidate_prior_fingerprints[row_index] = None
-                    diagnostic.observation_id = secrets.token_hex(8)
-                    diagnostic.identity_fingerprint = None
-                    diagnostic.author_fingerprint = None
-                    carried_row = False
-                self.last_scan_timings.read_row_ms += round(
-                    (time.perf_counter() - read_started) * 1000
-                )
-                counts.card_not_ready += 1
-                body, body_signals, read_evidence = await self._observe_display_body(root)
-                diagnostic.read_evidence = read_evidence
-                diagnostic.has_readable_body = bool(body)
-                should_wait_for_permalink = (
-                    pending.reason_code == "POST_PERMALINK_PENDING"
-                    and diagnostic.root_kind in {"ARTICLE", "ROLE_ARTICLE", "PRESSABLE"}
-                )
-                should_wait_for_missing_author = pending.reason_code == "POST_AUTHOR_PENDING"
-                signals = (
-                    pending.signals
-                    if should_wait_for_permalink or should_wait_for_missing_author
-                    else body_signals
-                )
-                if signals:
-                    pending_signals.extend(signals)
-                signal_is_visible = False
-                for signal in signals:
-                    if await self._is_in_visible_scrollports(signal.locator):
-                        signal_is_visible = True
-                        break
-                    if await signal.locator.count() == 0 and await self._is_in_visible_scrollports(
-                        root
-                    ):
-                        signal_is_visible = True
-                        break
-                if signals and not signal_is_visible:
-                    self.last_scan_timings.wait_reason = "DEFERRED_IDENTITY"
-                    if should_wait_for_permalink or should_wait_for_missing_author:
-                        diagnostic.state = "DEFERRED_IDENTITY"
-                        diagnostic.reason = "READINESS_SIGNAL_OUTSIDE_VISIBLE_SCROLLPORT"
-                    else:
-                        diagnostic.state, diagnostic.reason = _body_progress_state(
-                            read_evidence,
-                            has_readable_body=bool(body),
-                        )
-                    counts.deferred_offscreen += 1
-                    counts.skipped_rows += 1
-                    display = DisplayObservation(
-                        body,
-                        "OBSERVATION_UNCERTAIN" if body is None else "OBSERVED_UNVERIFIED",
-                        box["y"],
-                        read_evidence=read_evidence,
-                    )
-                    if body:
-                        counts.body_extracted += 1
-                    else:
-                        counts.body_unknown += 1
-                    display_observations.append(display)
-                    await emit_row(diagnostic, display=display)
-                    continue
-                if should_wait_for_permalink or should_wait_for_missing_author:
-                    diagnostic.state = "PENDING_HYDRATION"
-                    diagnostic.reason = pending.reason_code
-                    counts.skipped_rows += 1
-                    counts.uncertain_rows += 1
-                    counts.body_unknown += int(not body)
-                    if body:
-                        counts.body_extracted += 1
-                elif body:
-                    diagnostic.state = "OBSERVED_UNVERIFIED"
-                    diagnostic.reason = pending.reason_code
-                    counts.body_extracted += 1
-                elif body_signals:
-                    diagnostic.state = "PENDING_HYDRATION"
-                    diagnostic.reason = "POST_BODY_PENDING"
-                    counts.body_unknown += 1
-                    counts.skipped_rows += 1
-                    counts.uncertain_rows += 1
-                else:
-                    diagnostic.state, diagnostic.reason = _body_progress_state(
-                        read_evidence,
-                        has_readable_body=False,
-                    )
-                    counts.body_unknown += 1
-                    counts.skipped_rows += 1
-                    counts.uncertain_rows += 1
-                if body:
-                    display_observations.append(
-                        DisplayObservation(
-                            body,
-                            viewport_y=box["y"],
-                            read_evidence=read_evidence,
-                        )
-                    )
-                else:
-                    display_observations.append(
-                        DisplayObservation(
-                            None,
-                            "OBSERVATION_UNCERTAIN",
-                            box["y"],
-                            read_evidence=read_evidence,
-                        )
-                    )
-                wait_started = time.perf_counter()
-                if signal_is_visible:
-                    self.last_scan_timings.wait_reason = "CARD_HYDRATION"
-                    changed = await self._wait_for_pending_card(
-                        _CardNotReady(signals=tuple(signals)),
-                        self._readiness_deadline(_CARD_HYDRATION_WAIT_MS),
-                        max_wait_ms=_CARD_HYDRATION_WAIT_MS,
-                    )
-                    self.last_scan_timings.stabilize_ms += round(
-                        (time.perf_counter() - wait_started) * 1000
-                    )
-                    if not changed:
-                        self.last_scan_timings.wait_reason = "CARD_HYDRATION_TIMEOUT"
-                    if changed:
-                        self.last_scan_timings.wait_reason = "CARD_HYDRATION"
-                        if currently_visible:
-                            quiet_started = time.perf_counter()
-                            body_quiet = await self._wait_for_stable_card_dom(root)
-                            self.last_scan_timings.stabilize_ms += round(
-                                (time.perf_counter() - quiet_started) * 1000
-                            )
-                            if not body_quiet:
-                                self.last_scan_timings.wait_reason = "CARD_BODY_NOT_STABLE"
-                                await emit_row(
-                                    diagnostic,
-                                    display=display_observations[-1]
-                                    if display_observations
-                                    else None,
-                                )
-                                continue
-                        try:
-                            if currently_visible:
-                                target, body_stable = await self._read_stable_visible_card(
-                                    root,
-                                    viewport_y=box["y"],
-                                    cached_body_fingerprints=(prefer_new_fingerprints),
-                                    expected_root_handle=candidate_dom_handles.get(row_index),
-                                    allow_hydration_retry=(
-                                        structure.readable_body_candidates == 0
-                                    ),
-                                )
-                                if not body_stable:
-                                    self.last_scan_timings.wait_reason = "CARD_BODY_NOT_STABLE"
-                                    await emit_row(
-                                        diagnostic,
-                                        display=display_observations[-1]
-                                        if display_observations
-                                        else None,
-                                    )
-                                    continue
-                            else:
-                                target = await self._read_card(
-                                    root,
-                                    currently_visible=False,
-                                    viewport_y=box["y"],
-                                    cached_body_fingerprints=prefer_new_fingerprints,
-                                )
-                        except (_CardNotReady, _UnverifiedFeedCandidate, _CardDeferredOffscreen):
-                            pass
-                        else:
-                            counts.skipped_rows = max(0, counts.skipped_rows - 1)
-                            counts.uncertain_rows = max(0, counts.uncertain_rows - 1)
-                            if body:
-                                counts.body_extracted = max(
-                                    0,
-                                    counts.body_extracted - 1,
-                                )
-                            else:
-                                counts.body_unknown = max(0, counts.body_unknown - 1)
-                            if display_observations:
-                                display_observations.pop()
-                            diagnostic.identity_fingerprint = target.fingerprint
-                            if candidate_prior_fingerprints.get(row_index) not in {
-                                None,
-                                target.fingerprint,
-                            }:
-                                diagnostic.observation_id = secrets.token_hex(8)
-                                carried_row = False
-                            candidate_prior_fingerprints[row_index] = target.fingerprint
-                            diagnostic.read_evidence = target.read_evidence
-                            diagnostic.has_readable_body = bool(target.body and target.body.strip())
-                            if target.body_complete:
-                                diagnostic.state = "VERIFIED"
-                                diagnostic.reason = "PROVENANCE_VERIFIED"
-                            else:
-                                diagnostic.state, diagnostic.reason = _body_progress_state(
-                                    target.read_evidence,
-                                    has_readable_body=diagnostic.has_readable_body,
-                                )
-                            counts.identity_verified += 1
-                            counts.verified += int(target.body_complete)
-                            counts.partial_body_rows += int(not target.body_complete)
-                            counts.body_read += int(
-                                diagnostic.has_readable_body and target.body_complete
-                            )
-                            counts.body_extracted += int(diagnostic.has_readable_body)
-                            if not diagnostic.has_readable_body:
-                                counts.body_unknown += 1
-                                counts.uncertain_rows += 1
-                                counts.skipped_rows += 1
-                                if diagnostic.state == "UNSUPPORTED_STRUCTURE":
-                                    self._record_structure_reason("POST_BODY_STRUCTURE_UNSUPPORTED")
-                                elif diagnostic.state == "DEFERRED_TEXT_ABOVE":
-                                    counts.deferred_above += 1
-                                elif diagnostic.state == "DEFERRED_TEXT_BELOW":
-                                    counts.deferred_below += 1
-                            elif target.body_complete:
-                                targets.append(target)
-                            await emit_row(diagnostic, target=target)
-                            continue
-                await emit_row(
-                    diagnostic,
-                    display=display_observations[-1],
-                )
-                continue
-            except _UnverifiedFeedCandidate as error:
-                if (
-                    error.diagnostic_reason == "CANDIDATE_WRAPPER_AMBIGUOUS"
-                    and currently_visible
-                ):
-                    try:
-                        target, body_stable = await self._recover_ambiguous_visible_card(
-                            root,
-                            root_handle,
-                            viewport_y=box["y"],
-                            cached_body_fingerprints=prefer_new_fingerprints,
-                        )
-                    except _CardNotReady as pending:
-                        self._record_scan_skip(stage, error)
-                        identity_changed = (
-                            pending.reason_code == "POST_ROOT_DOM_IDENTITY_CHANGED"
-                            or not await self._same_dom_element(root, root_handle)
-                        )
-                        if identity_changed:
-                            diagnostic.observation_id = secrets.token_hex(8)
-                            diagnostic.identity_fingerprint = None
-                            diagnostic.author_fingerprint = None
-                            candidate_prior_fingerprints[row_index] = None
-                            carried_row = False
-                            diagnostic.state = "REJECTED"
-                            diagnostic.reason = "POST_ROOT_IDENTITY_CHANGED"
-                            read_evidence = BodyReadEvidence(state="NO_BODY_NODES")
-                            body = None
-                        else:
-                            observed = await self._read_visible_body_progress(root, root_handle)
-                            read_evidence = observed.read_evidence
-                            body = observed.body if observed.has_rendered_text else None
-                            diagnostic.state = (
-                                "OBSERVED_UNVERIFIED" if body else "REJECTED"
-                            )
-                            diagnostic.reason = "ROW_PROVENANCE_UNRESOLVED"
-                            self._record_structure_reason("ROW_PROVENANCE_UNRESOLVED")
-                        diagnostic.read_evidence = read_evidence
-                        diagnostic.has_readable_body = bool(body)
-                        counts.coverage_complete = False
-                        counts.uncertain_rows += 1
-                        counts.skipped_rows += 1
-                        if body:
-                            counts.body_extracted += 1
-                        else:
-                            counts.body_unknown += 1
-                        display = DisplayObservation(
-                            body,
-                            "OBSERVATION_UNCERTAIN"
-                            if body is None
-                            else "OBSERVED_UNVERIFIED",
-                            box["y"],
-                            read_evidence=read_evidence,
-                        )
-                        display_observations.append(display)
-                        self.last_scan_timings.read_row_ms += round(
-                            (time.perf_counter() - read_started) * 1000
-                        )
-                        await emit_row(diagnostic, display=display)
-                        continue
-                    except (_CardDeferredOffscreen, _UnverifiedFeedCandidate):
-                        self._record_scan_skip(stage, error)
-                        identity_changed = not await self._same_dom_element(root, root_handle)
-                        if identity_changed:
-                            diagnostic.observation_id = secrets.token_hex(8)
-                            diagnostic.identity_fingerprint = None
-                            diagnostic.author_fingerprint = None
-                            candidate_prior_fingerprints[row_index] = None
-                            carried_row = False
-                            diagnostic.state = "REJECTED"
-                            diagnostic.reason = "POST_ROOT_IDENTITY_CHANGED"
-                            read_evidence = BodyReadEvidence(state="NO_BODY_NODES")
-                            body = None
-                        else:
-                            observed = await self._read_visible_body_progress(root, root_handle)
-                            read_evidence = observed.read_evidence
-                            body = observed.body if observed.has_rendered_text else None
-                            diagnostic.state = (
-                                "OBSERVED_UNVERIFIED" if body else "REJECTED"
-                            )
-                            diagnostic.reason = "ROW_PROVENANCE_UNRESOLVED"
-                            self._record_structure_reason("ROW_PROVENANCE_UNRESOLVED")
-                        diagnostic.read_evidence = read_evidence
-                        diagnostic.has_readable_body = bool(body)
-                        counts.coverage_complete = False
-                        counts.uncertain_rows += 1
-                        counts.skipped_rows += 1
-                        if body:
-                            counts.body_extracted += 1
-                        else:
-                            counts.body_unknown += 1
-                        display = DisplayObservation(
-                            body,
-                            "OBSERVATION_UNCERTAIN"
-                            if body is None
-                            else "OBSERVED_UNVERIFIED",
-                            box["y"],
-                            read_evidence=read_evidence,
-                        )
-                        display_observations.append(display)
-                        self.last_scan_timings.read_row_ms += round(
-                            (time.perf_counter() - read_started) * 1000
-                        )
-                        await emit_row(diagnostic, display=display)
-                        continue
-                    if not body_stable:
-                        diagnostic.identity_fingerprint = target.fingerprint
-                        candidate_prior_fingerprints[row_index] = target.fingerprint
-                        diagnostic.read_evidence = target.read_evidence
-                        diagnostic.has_readable_body = bool(target.body and target.body.strip())
-                        diagnostic.state = "OBSERVED_UNVERIFIED"
-                        diagnostic.reason = "ROW_CONTENT_CHANGED_DURING_READ"
-                        counts.identity_verified += 1
-                        counts.uncertain_rows += 1
-                        counts.skipped_rows += 1
-                        counts.coverage_complete = False
-                        if target.body:
-                            counts.body_extracted += 1
-                        else:
-                            counts.body_unknown += 1
-                        display = DisplayObservation(
-                            target.body,
-                            "OBSERVATION_UNCERTAIN"
-                            if not target.body
-                            else "OBSERVED_UNVERIFIED",
-                            box["y"],
-                            read_evidence=target.read_evidence,
-                        )
-                        display_observations.append(display)
-                        await emit_row(
-                            diagnostic,
-                            target=target,
-                            display=display,
-                            fingerprint=target.fingerprint,
-                        )
-                        continue
-                else:
-                    self._record_scan_skip(stage, error)
-                    body, body_signals, read_evidence = await self._observe_display_body(root)
-                    diagnostic.read_evidence = read_evidence
-                    diagnostic.has_readable_body = bool(body)
-                    if body:
-                        counts.body_extracted += 1
-                        diagnostic.state = "OBSERVED_UNVERIFIED"
-                        diagnostic.reason = (
-                            "ROW_PROVENANCE_UNRESOLVED"
-                            if error.diagnostic_reason == "CANDIDATE_WRAPPER_AMBIGUOUS"
-                            else error.diagnostic_reason or error.reason
-                        )
-                        if error.diagnostic_reason == "CANDIDATE_WRAPPER_AMBIGUOUS":
-                            counts.coverage_complete = False
-                            counts.uncertain_rows += 1
-                            counts.skipped_rows += 1
-                            self._record_structure_reason("ROW_PROVENANCE_UNRESOLVED")
-                        display_observations.append(
-                            DisplayObservation(
-                                body,
-                                viewport_y=box["y"],
-                                read_evidence=read_evidence,
-                            )
-                        )
-                    else:
-                        counts.body_unknown += 1
-                        counts.skipped_rows += 1
-                        counts.uncertain_rows += 1
-                        if error.diagnostic_reason == "CANDIDATE_WRAPPER_AMBIGUOUS":
-                            counts.coverage_complete = False
-                            self._record_structure_reason("ROW_PROVENANCE_UNRESOLVED")
-                        if body_signals:
-                            diagnostic.state = "PENDING_HYDRATION"
-                            diagnostic.reason = "POST_BODY_PENDING"
-                        else:
-                            diagnostic.state, diagnostic.reason = _body_progress_state(
-                                read_evidence,
-                                has_readable_body=False,
-                            )
-                            if diagnostic.state == "PENDING_HYDRATION":
-                                diagnostic.state = "REJECTED"
-                                diagnostic.reason = error.diagnostic_reason or error.reason
-                        pending_signals.extend(body_signals)
-                        display_observations.append(
-                            DisplayObservation(
-                                None,
-                                "OBSERVATION_UNCERTAIN",
-                                box["y"],
-                                read_evidence=read_evidence,
-                            )
-                        )
-                    self.last_scan_timings.read_row_ms += round(
-                        (time.perf_counter() - read_started) * 1000
-                    )
-                    await emit_row(diagnostic, display=display_observations[-1])
-                    continue
-                if (
-                    error.diagnostic_reason != "CANDIDATE_WRAPPER_AMBIGUOUS"
-                    or not currently_visible
-                ):
-                    self.last_scan_timings.read_row_ms += round(
-                        (time.perf_counter() - read_started) * 1000
-                    )
-                    await emit_row(diagnostic, display=display_observations[-1])
-                    continue
-            self.last_scan_timings.read_row_ms += round((time.perf_counter() - read_started) * 1000)
-            diagnostic.identity_fingerprint = target.fingerprint
-            if candidate_prior_fingerprints.get(row_index) not in {None, target.fingerprint}:
-                diagnostic.observation_id = secrets.token_hex(8)
-                carried_row = False
-            candidate_prior_fingerprints[row_index] = target.fingerprint
-            diagnostic.read_evidence = target.read_evidence
-            diagnostic.state = "VERIFIED" if target.body_complete else "PARTIAL_BODY"
-            diagnostic.reason = (
-                "PROVENANCE_VERIFIED" if target.body_complete else "VISIBLE_TEXT_PROGRESS"
-            )
-            counts.identity_verified += 1
-            counts.verified += int(target.body_complete)
-            counts.partial_body_rows += int(not target.body_complete)
-            diagnostic.has_readable_body = bool(target.body and target.body.strip())
-            if target.body and target.body.strip():
-                body_was_cached = bool(
-                    prefer_new_fingerprints is not None
-                    and target.fingerprint in prefer_new_fingerprints
-                    and target.fingerprint in self._cached_home_bodies
-                )
-                counts.body_read += int(not body_was_cached and target.body_complete)
-                counts.body_extracted += 1
-                if target.body_complete:
-                    self._cached_home_bodies.setdefault(
-                        target.fingerprint,
-                        (target.body, target.body_truncated),
-                    )
-            else:
-                counts.body_unknown += 1
-                diagnostic.state, diagnostic.reason = _body_progress_state(
-                    target.read_evidence,
-                    has_readable_body=False,
-                )
-                if diagnostic.state == "DEFERRED_TEXT_BELOW":
-                    counts.deferred_below += 1
-                elif diagnostic.state == "DEFERRED_TEXT_ABOVE":
-                    counts.deferred_above += 1
-                elif diagnostic.state == "UNSUPPORTED_STRUCTURE":
-                    self._record_structure_reason("POST_BODY_STRUCTURE_UNSUPPORTED")
-                elif diagnostic.state == "PENDING_HYDRATION":
-                    _, body_signals, _ = await self._observe_display_body(root)
-                    pending_signals.extend(body_signals)
-                counts.skipped_rows += 1
-                counts.uncertain_rows += 1
-                diagnostic.identity_fingerprint = target.fingerprint
-                await emit_row(
-                    diagnostic,
-                    target=target,
-                    fingerprint=target.fingerprint,
-                )
-                continue
-            if not target.body_complete:
-                counts.skipped_rows += 1
-                counts.coverage_complete = False
-                await emit_row(
-                    diagnostic,
-                    target=target,
-                    fingerprint=target.fingerprint,
-                )
-                continue
-            if target.fingerprint in scanned_fingerprints or (
-                prefer_new_fingerprints is not None
-                and target.fingerprint in prefer_new_fingerprints
-            ):
-                self.feed_duplicates += 1
-                await emit_row(
-                    diagnostic,
-                    target=target,
-                    fingerprint=target.fingerprint,
-                )
-                continue
-            scanned_fingerprints.add(target.fingerprint)
-            targets.append(target)
-            await emit_row(
-                diagnostic,
-                target=target,
-                fingerprint=target.fingerprint,
-            )
-        if not candidate_rows:
-            permalink_targets, permalink_anchor = await self._visible_permalink_targets(
-                max_posts,
-                currently_visible=currently_visible,
-                prefer_new_fingerprints=prefer_new_fingerprints,
-                stage=stage,
-                on_row=on_row,
-            )
-            targets.extend(permalink_targets)
-            if scroll_anchor is None:
-                scroll_anchor = permalink_anchor
-            counts.observed_rows = max(
-                len(permalink_targets),
-                counts.visible_post_links,
-            )
-            counts.coverage_complete = not roots_truncated and counts.observed_rows <= max_posts
-        scanned_fingerprints.update(target.fingerprint for target in targets)
-        for identity in self._carried_viewport_candidate_identities:
-            if (
-                id(identity.dom_handle) in matched_previous_identity_handles
-                or identity.fingerprint in scanned_fingerprints
-            ):
-                continue
-            try:
-                still_connected = bool(
-                    await region.evaluate(
-                        "(region, node) => node.isConnected && region.contains(node)",
-                        identity.dom_handle,
-                    )
-                )
-            except PlaywrightError:
-                still_connected = False
-            if not still_connected:
-                continue
-            diagnostic = _CandidateDiagnostic(
-                row_index=len(diagnostics) + 1,
-                root_kind="CARRIED",
-                has_visible_time=False,
-                has_post_permalink=False,
-                has_profile_author=False,
-                has_readable_body=False,
-                state="DEFERRED_IDENTITY",
-                reason="POST_ROW_CUES_MISSING",
-                identity_fingerprint=identity.fingerprint,
-                observation_id=identity.observation_id,
-            )
-            diagnostics.append(diagnostic)
-            counts.observed_rows += 1
-            counts.skipped_rows += 1
-            counts.uncertain_rows += 1
-            counts.coverage_complete = False
-            await emit_row(diagnostic, fingerprint=identity.fingerprint)
-        self.last_candidate_diagnostics = tuple(diagnostics)
-        if (
-            counts.body_unknown
-            or counts.uncertain_rows
-            or counts.deferred_offscreen
-            or counts.partial_body_rows
-            or counts.structural_reasons.get("POST_ROOT_UNRESOLVED", 0) > 0
-            or any(
-                diagnostic.state != "VERIFIED"
-                for diagnostic in diagnostics
-                if diagnostic.state != "NON_POST"
-            )
-        ):
-            counts.coverage_complete = False
-        self.last_candidate_diagnostics = tuple(diagnostics)
-        self.refresh_viewport_body_coverage_counts()
-        self._set_scan_operation("FINALIZE")
-        signature = (
-            tuple(
-                (
-                    target.url,
-                    target.author,
-                    target.body,
-                    target.body_available,
-                    round(target.viewport_y, 1),
-                )
-                for target in targets
+        hooks = _ViewportScanHooks(
+            discover_roots=self._top_level_candidate_roots,
+            collect_structures=self._collect_structure_diagnostics,
+            scan_permalink_fallback=self._visible_permalink_targets,
+            read_card=self._read_card,
+            recover_ambiguous_visible_card=self._recover_ambiguous_visible_card,
+            read_visible_body_progress=self._read_visible_body_progress,
+            wait_for_pending_card=self._wait_for_pending_card,
+            record_scan_skip=self._record_scan_skip,
+            publish_diagnostics=lambda value: setattr(self, "last_candidate_diagnostics", value),
+            publish_display_observations=lambda value: setattr(
+                self, "last_display_observations", value
             ),
-            tuple(
-                (
-                    observation.body,
-                    observation.status,
-                    round(observation.viewport_y, 1),
-                )
-                for observation in display_observations
+            publish_can_wheel=lambda value: setattr(self, "last_viewport_can_wheel", value),
+            increment_feed_duplicates=lambda: setattr(
+                self, "feed_duplicates", self.feed_duplicates + 1
             ),
-            counts.observed_rows,
-            counts.coverage_complete,
-            counts.uncertain_rows,
+            body_stability_interval_ms=_BODY_STABILITY_INTERVAL_MS,
+            card_hydration_wait_ms=_CARD_HYDRATION_WAIT_MS,
         )
-        candidate_roots: list[Locator] = []
-        candidate_observation_ids: list[str] = []
-        candidate_identities: list[_TrackedRowIdentity] = []
-        for index, root, _, _, diagnostic, observation_id in candidate_rows[:max_posts]:
-            handle = candidate_dom_handles.get(index)
-            if handle is None:
-                continue
-            stable_id = diagnostic.observation_id or observation_id
-            candidate_roots.append(root)
-            candidate_observation_ids.append(stable_id)
-            candidate_identities.append(
-                _TrackedRowIdentity(
-                    handle,
-                    stable_id,
-                    diagnostic.identity_fingerprint,
-                    diagnostic.author_fingerprint,
-                    diagnostic.state == "VERIFIED",
-                )
-            )
-        retained_handles = {id(identity.dom_handle) for identity in candidate_identities}
-        for handle in candidate_dom_handles.values():
-            if id(handle) not in retained_handles:
-                await handle.dispose()
-        self._pending_viewport_candidate_identities = tuple(candidate_identities)
-        self._active_scan_candidate_handles = None
-        self._scan_failure_site = None
-        self._scan_stage = None
-        return _VisibleTargets(
-            tuple(targets),
-            scroll_anchor,
-            tuple(display_observations),
-            counts.observed_rows,
-            counts.coverage_complete,
-            signature,
-            tuple(candidate_roots),
-            tuple(pending_signals),
-            tuple(candidate_observation_ids),
-            tuple(candidate_identities),
+        request = _ViewportScanRequest(
+            max_posts=max_posts,
+            currently_visible=currently_visible,
+            prefer_new_fingerprints=prefer_new_fingerprints,
+            stage=stage,
+            viewport_index=self._scan_viewport_index,
+            carried_identities=self._carried_viewport_candidate_identities,
+            on_row=on_row,
         )
+        result = await self._viewport_scan.scan(
+            request,
+            counts=self.last_scan_counts,
+            timings=self.last_scan_timings,
+            hooks=hooks,
+        )
+        self._pending_viewport_candidate_identities = result.candidate_identities
+        return result
 
-    @staticmethod
     def _has_new_viewport_content(
         previous: tuple[object, ...] | None,
         current: tuple[object, ...],
