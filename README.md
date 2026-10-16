@@ -2,6 +2,8 @@
 
 A small Python package for local Threads account sessions and bounded, read-only Home / For You exploration.
 
+For bounded repeated read-only runs on Windows, see [Windows operations](docs/WINDOWS_OPERATIONS.md). This requires a logged-on desktop session and does not imply unattended production readiness.
+
 ## Setup and daily use
 
 Install the package and Chromium:
