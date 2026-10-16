@@ -642,6 +642,10 @@ class CheckpointStore:
     def __init__(self, data_root: Path) -> None:
         self._data_root = data_root
 
+    def profile_lock(self, account: BrowserAccount) -> ProcessLock:
+        """Use the same profile lock for CLI and direct Python workflow callers."""
+        return profile_lock(self._data_root, account)
+
     def load(self, account_id: UUID, policy_fingerprint: str) -> Checkpoint:
         if _SHA256.fullmatch(policy_fingerprint) is None:
             raise BrowserDataError("STATE_INVALID")
