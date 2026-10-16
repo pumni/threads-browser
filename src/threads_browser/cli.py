@@ -47,6 +47,11 @@ def _add_run_options(parser: argparse.ArgumentParser, *, legacy: bool) -> None:
         help="print identity-unverified observed text to an interactive terminal",
     )
     parser.add_argument(
+        "--detail",
+        action="store_true",
+        help="print an operational trace and extracted post text to an interactive terminal",
+    )
+    parser.add_argument(
         "--max-posts",
         required=legacy,
         type=int,
@@ -130,6 +135,7 @@ def _format_result(result: object) -> str:
     return (
         f"NURTURE status={result.status} "
         "source=HOME_FOR_YOU "
+        f"stop_reason={getattr(result, 'stop_reason', 'UNKNOWN')} "
         f"ui={result.ui_status} "
         f"home_sampled={result.home_sampled} "
         f"home_new={result.home_new} "
@@ -144,8 +150,14 @@ def _format_result(result: object) -> str:
         f"skipped_unverified={result.skipped_unverified} "
         f"checkpoint_runs={result.checkpoint_runs} "
         f"observed_rows={getattr(result, 'observed_rows', 0)} "
+        f"viewport_row_appearances={getattr(result, 'viewport_observations', getattr(result, 'observed_rows', 0))} "
         f"body_extracted={getattr(result, 'body_extracted', 0)} "
         f"provenance_verified={getattr(result, 'provenance_verified', 0)} "
+        f"unique_provenance_identities={getattr(result, 'unique_provenance_identities', getattr(result, 'provenance_verified', 0))} "
+        f"unique_verified_posts={getattr(result, 'unique_verified_posts', 0)} "
+        f"unique_deferred_posts={getattr(result, 'unique_deferred_posts', 0)} "
+        f"unresolved_gaps={getattr(result, 'unresolved_gaps', 0)} "
+        f"visible_text_segments={getattr(result, 'visible_text_segments', 0)} "
         f"classified={getattr(result, 'classified', 0)} "
         f"observation_unknown={getattr(result, 'observation_unknown', 0)} "
         f"unverified_relevant={getattr(result, 'unverified_relevant', 0)} "
@@ -195,12 +207,25 @@ async def _prompt_readiness_extension(stage: str, retry: int) -> bool:
 
 
 def _run_diagnostics_check(args: argparse.Namespace) -> bool:
-    if not (args.show_post_text or args.show_observed_text):
+    if not (args.detail or args.show_post_text or args.show_observed_text):
         return True
     if not _has_interactive_terminal():
-        error = "OBSERVED_TEXT_TTY_REQUIRED" if args.show_observed_text else "POST_TEXT_TTY_REQUIRED"
+        error = (
+            "DETAIL_TTY_REQUIRED"
+            if args.detail
+            else "OBSERVED_TEXT_TTY_REQUIRED"
+            if args.show_observed_text
+            else "POST_TEXT_TTY_REQUIRED"
+        )
         print(f"ERROR {error}", file=sys.stderr)
         return False
+    if args.detail:
+        print(
+            "WARNING DETAIL_LOCAL_ONLY extracted post text may remain in terminal "
+            "scrollback; do not capture or share this output in GitHub, PRs, chats, or CI logs.",
+            file=sys.stderr,
+        )
+        return True
     if args.show_post_text:
         print(
             "WARNING POST_TEXT_LOCAL_ONLY terminal scrollback may retain content; "
@@ -356,6 +381,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                             max_total_posts=args.max_total_posts,
                             show_post_text=args.show_post_text,
                             show_observed_text=args.show_observed_text,
+                            detail=args.detail,
                             readiness_prompt=(
                                 _prompt_readiness_extension
                                 if _has_interactive_terminal()
@@ -364,7 +390,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                         )
                     )
                 except UiReadError as error:
-                    print(f"STOP {error.code}", file=sys.stderr)
+                    if args.detail:
+                        print(
+                            f"[CHECKPOINT] status=NOT_SAVED reason={error.code}",
+                            file=sys.stderr,
+                        )
+                        print(f"[STOP] code={error.code}", file=sys.stderr)
+                    else:
+                        print(f"STOP {error.code}", file=sys.stderr)
                     if error.code == "LOGIN_REQUIRED":
                         print(f"Run 'tb login {account.alias}' to authenticate.", file=sys.stderr)
                     return 1

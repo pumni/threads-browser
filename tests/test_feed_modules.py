@@ -38,6 +38,10 @@ def test_url_provenance_is_strict_and_on_origin() -> None:
     )
     assert _post_url("/@alice/post/AbC_123?tracking=1") is None
     assert _post_url("https://example.com/@alice/post/AbC_123") is None
+    assert _post_url("/@Alice/post/AbC_123/") == (
+        "https://www.threads.com/@Alice/post/AbC_123",
+        "alice",
+    )
     assert _profile_author("/@Alice") == "alice"
     assert _same_home_origin("https://www.threads.com/")
     assert not _same_home_origin("https://example.com/")
