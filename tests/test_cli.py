@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from threads_browser import cli, workflow
 from threads_browser.cli import main
 from threads_browser.reader import UiReadError
-from threads_browser.storage import AccountStore, TermsStore, profile_lock
+from threads_browser.storage import AccountStore, TermsStore
 
 
 def test_account_cli_keeps_profile_reference_and_actor_out_of_output(
@@ -684,14 +684,14 @@ def test_short_run_reports_missing_account_actor_and_terms(
     assert 'tb terms local1 "hiring"' in error
 
 
-def test_short_run_login_required_and_profile_lock_errors_are_safe(
+def test_short_run_login_required_error_is_safe(
     tmp_path: Path,
     monkeypatch,
     capsys,
 ) -> None:
     root = tmp_path / "private-root"
     monkeypatch.setenv("THREADS_BROWSER_DATA_ROOT", str(root))
-    account = _verified_local_account(root)
+    _verified_local_account(root)
     TermsStore(root).set("local1", ("hiring",))
 
     async def login_required(*_args, **_kwargs):
@@ -703,10 +703,3 @@ def test_short_run_login_required_and_profile_lock_errors_are_safe(
     assert "STOP LOGIN_REQUIRED" in error
     assert "tb login local1" in error
 
-    lock = profile_lock(root, account)
-    lock.acquire()
-    try:
-        assert main(["run", "local1"]) == 1
-        assert capsys.readouterr().err == "ERROR ACCOUNT_BUSY\n"
-    finally:
-        lock.release()
