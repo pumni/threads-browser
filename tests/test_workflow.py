@@ -39,6 +39,7 @@ from threads_browser.storage import (
     BrowserAccount,
     BrowserDataError,
     CheckpointStore,
+    profile_lock,
 )
 from threads_browser.workflow import policy_fingerprint
 
@@ -3620,6 +3621,45 @@ def test_scroll_attempt_is_not_counted_without_observed_feed_movement() -> None:
         assert reader.scrolls == 0
 
     _run_offline_page(html, exercise)
+
+
+def test_public_browser_workflow_owns_profile_lock(tmp_path: Path, monkeypatch) -> None:
+    root = tmp_path / "data"
+    profile = tmp_path / "dedicated-profile"
+    profile.mkdir()
+    account = BrowserAccount(uuid4(), "offline", "offline.operator", profile)
+    launched = 0
+
+    def check_lock_before_browser():
+        nonlocal launched
+        launched += 1
+        with pytest.raises(BrowserDataError) as busy:
+            profile_lock(root, account).acquire()
+        assert busy.value.code == "ACCOUNT_BUSY"
+        raise UiReadError("BROWSER_SESSION_UNAVAILABLE")
+
+    monkeypatch.setattr(workflow, "async_playwright", check_lock_before_browser)
+    run = lambda: asyncio.run(
+        workflow.run_browser_nurture(
+            account, CheckpointStore(root), max_posts=1, terms=("hiring",)
+        )
+    )
+
+    with pytest.raises(UiReadError) as failed:
+        run()
+    assert failed.value.code == "BROWSER_SESSION_UNAVAILABLE"
+    assert launched == 1
+
+    # No browser may launch while another process has the account lock.
+    with profile_lock(root, account):
+        with pytest.raises(BrowserDataError) as busy:
+            run()
+        assert busy.value.code == "ACCOUNT_BUSY"
+    assert launched == 1
+
+    # The failed launch still released the lock.
+    with profile_lock(root, account):
+        pass
 
 
 def test_default_desktop_profile_is_rejected_before_browser_startup(
