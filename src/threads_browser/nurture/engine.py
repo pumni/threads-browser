@@ -23,7 +23,7 @@ from .diagnostics import (
     _print_url_structure_diagnostics,
     _print_visible_segments,
 )
-from .observation import RowObservationFacts
+from .observation import BodyRangeCoverageFacts, RowObservationFacts
 from .state import (
     CoverageLedger,
     DedupeLedger,
@@ -299,6 +299,8 @@ async def run_page_workflow(
         row_target_progress_ids: set[str] = set()
         emitted_verified_fingerprints: set[str] = set()
         completed_viewport_fingerprints: set[str] = set()
+        body_range_stranded = False
+        body_range_topology: tuple[str, ...] = ()
 
         async def observe_row(
             row: _HomeRowObservation,
@@ -317,6 +319,7 @@ async def run_page_workflow(
             nonlocal viewport_classified, viewport_irrelevant
             nonlocal viewport_observation_unknown, viewport_relevant
             nonlocal viewport_unverified_relevant, viewport_unknown
+            nonlocal body_range_stranded, body_range_topology
 
             diagnostic = row.diagnostic
             target = row.target
@@ -449,6 +452,25 @@ async def run_page_workflow(
                     ),
                 )
             )
+            if row_fingerprint is not None and evidence is not None:
+                row_range_stranded = coverage.observe_body_range(
+                    row_fingerprint,
+                    BodyRangeCoverageFacts(
+                        body_complete=bool(
+                            diagnostic.state == "VERIFIED"
+                            and target is not None
+                            and target.body_complete
+                        ),
+                        missing_range_count=evidence.missing_range_count,
+                        unrecoverable_range_count=evidence.unrecoverable_range_count,
+                        unrecoverable_range_signature=evidence.unrecoverable_range_signature,
+                    ),
+                )
+                body_range_stranded = bool(coverage.stranded_body_ranges)
+                if row_range_stranded:
+                    body_range_topology = evidence.missing_range_topology
+                elif not body_range_stranded:
+                    body_range_topology = ()
             stats.provenance_verified += int(coverage_outcome.identity_added)
             reader.last_scan_counts.new_verified_rows += int(coverage_outcome.body_completed)
             if coverage_outcome.body_completed and row_fingerprint is not None:
@@ -474,6 +496,8 @@ async def run_page_workflow(
                     f"body_text_nodes_present={metric_count(None if metrics is None else metrics.body_text_nodes_present)} "
                     f"render_rect_count={metric_count(None if metrics is None else metrics.render_rect_count)} "
                     f"visible_text_rect_count={metric_count(None if metrics is None else metrics.visible_text_rect_count)} "
+                    f"fully_contained_text_rect_count={metric_count(None if metrics is None else metrics.fully_contained_text_rect_count)} "
+                    f"intersect_only_text_rect_count={metric_count(None if metrics is None else metrics.intersect_only_text_rect_count)} "
                     f"deferred_above_rect_count={metric_count(None if metrics is None else metrics.deferred_above_rect_count)} "
                     f"deferred_below_rect_count={metric_count(None if metrics is None else metrics.deferred_below_rect_count)} "
                     f"closest_text_distance_px={'UNKNOWN' if metrics is None or metrics.closest_text_distance_px is None else f'{metrics.closest_text_distance_px:.1f}'} "
@@ -485,6 +509,8 @@ async def run_page_workflow(
                     f"expected_range_count={metric_count(None if metrics is None else metrics.expected_range_count)} "
                     f"visited_range_count={metric_count(None if metrics is None else metrics.visited_range_count)} "
                     f"missing_subrange_count={metric_count(None if metrics is None else metrics.missing_subrange_count)} "
+                    f"missing_range_topology={'UNKNOWN' if metrics is None else ','.join(metrics.missing_range_topology) or 'NONE'} "
+                    f"unrecoverable_range_count={metric_count(None if metrics is None else metrics.unrecoverable_range_count)} "
                     f"scroll_flags={','.join(diagnostic.scroll_reason_flags) or 'NONE'} "
                     f"state={diagnostic.state} reason={diagnostic.reason} "
                     f"observation={'EMITTED' if observation_emitted else 'RECORDED'} "
@@ -1070,13 +1096,22 @@ async def run_page_workflow(
                 coverage.read_in_progress
                 or coverage.unresolved_observations
                 or coverage.unrepresented_gaps
+                or body_range_stranded
             )
-            and not (stats.unverified_relevant and not stats.found_relevant)
-            and not only_unverified_observations()
+            and (body_range_stranded or not (stats.unverified_relevant and not stats.found_relevant))
+            and (body_range_stranded or not only_unverified_observations())
         ):
-            if reader.scroll_attempts < max_scrolls and await advance_feed():
+            if body_range_stranded:
+                exhaustion_reason = "BODY_RANGE_STRANDED"
+                print(
+                    "COVERAGE_STOP reason=BODY_RANGE_STRANDED "
+                    f"unresolved_gaps={coverage.unresolved_gap_count} "
+                    f"topology={','.join(body_range_topology) or 'UNKNOWN'}",
+                    flush=True,
+                )
+            elif reader.scroll_attempts < max_scrolls and await advance_feed():
                 continue
-            if reader.scroll_attempts >= max_scrolls:
+            elif reader.scroll_attempts >= max_scrolls:
                 exhaustion_reason = "SCROLL_BUDGET_EXHAUSTED_WITH_GAP"
                 print(
                     "COVERAGE_STOP reason=SCROLL_BUDGET_EXHAUSTED_WITH_GAP "
@@ -1084,7 +1119,11 @@ async def run_page_workflow(
                     flush=True,
                 )
             if detail:
-                _detail_stop("VIEWPORT_COVERAGE_INCOMPLETE")
+                _detail_stop(
+                    "BODY_RANGE_STRANDED"
+                    if body_range_stranded
+                    else "VIEWPORT_COVERAGE_INCOMPLETE"
+                )
             return NurtureResult(
                 status="VIEWPORT_COVERAGE_INCOMPLETE",
                 stop_reason=exhaustion_reason,

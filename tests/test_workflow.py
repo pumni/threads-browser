@@ -4000,6 +4000,65 @@ font: 16px/18px monospace; overflow-wrap: anywhere; }}
     _run_offline_page(feed_html, exercise)
 
 
+def test_partially_clipped_range_stays_missing_after_forward_wheels() -> None:
+    letters = "ABCDEFGHIJKLM"
+    spans = "".join(f"<span>{letter}</span>" for letter in letters)
+    feed_html = f"""<!doctype html><html><head><meta charset="utf-8"><style>
+html, body {{ margin: 0; }}
+article {{ position: relative; height: 320px; margin: 0; }}
+article p {{ position: absolute; top: 40px; left: 0; width: 200px;
+margin: 0; font: 16px/18px monospace; }}
+article p span {{ display: block; height: 18px; }}
+article p span:first-child {{ position: relative; left: -2px; }}
+#spacer {{ height: 2000px; }}
+</style></head><body><main><article><p>{spans}</p></article>
+<div id="spacer"></div></main></body></html>"""
+
+    async def exercise(page) -> None:
+        await page.set_viewport_size({"width": 1280, "height": 720})
+        reader = ThreadsHomeReader(page, "offline.operator")
+        root = page.locator("article")
+        root_handle = await root.element_handle()
+        assert root_handle is not None
+        try:
+            first = await reader._read_visible_body_progress(
+                root,
+                root_handle,
+                fingerprint="synthetic-clipped-range",
+            )
+            evidence = first.read_evidence
+            assert not first.complete
+            assert evidence.render_rect_count == 13
+            assert evidence.visible_text_rect_count == 13
+            assert evidence.fully_contained_text_rect_count == 12
+            assert evidence.intersect_only_text_rect_count == 1
+            assert evidence.missing_range_count == 1
+            assert "missing_horizontal_left" in evidence.missing_range_topology
+            assert evidence.unrecoverable_range_count == 1
+            assert evidence.unrecoverable_range_signature
+
+            for _ in range(3):
+                previous_scroll = await page.evaluate("window.scrollY")
+                await page.mouse.wheel(0, 288)
+                await page.wait_for_function(
+                    "previous => window.scrollY > previous",
+                    arg=previous_scroll,
+                )
+                current = await reader._read_visible_body_progress(
+                    root,
+                    root_handle,
+                    fingerprint="synthetic-clipped-range",
+                )
+                assert not current.complete
+                assert current.read_evidence.missing_range_count == 1
+
+            assert "missing_vertical_above" in current.read_evidence.missing_range_topology
+        finally:
+            await root_handle.dispose()
+
+    _run_offline_page(feed_html, exercise)
+
+
 @pytest.mark.parametrize(
     ("body", "body_top", "body_left", "font", "sequence", "scroll_to_complete"),
     [
@@ -4304,6 +4363,63 @@ article p {{ position: absolute; top: 600px; left: 0; width: 400px;
     output = capsys.readouterr().out
     assert "COVERAGE_STOP reason=SCROLL_BUDGET_EXHAUSTED_WITH_GAP" not in output
     assert body not in output
+
+
+def test_unrecoverable_body_range_stops_without_detail_or_checkpoint(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    spans = "".join(f"<span>{letter}</span>" for letter in "ABCDEFGHIJKLM")
+    feed_html = f"""<!doctype html><html><head><meta charset="utf-8"><style>
+html, body {{ margin: 0; }}
+nav {{ height: 36px; }}
+article {{ position: relative; height: 320px; margin: 0; }}
+article p {{ position: absolute; top: 40px; left: 0; width: 200px;
+margin: 0; font: 16px/18px monospace; }}
+article p span {{ display: block; height: 18px; }}
+article p span:first-child {{ position: relative; left: -2px; }}
+#spacer {{ height: 2000px; }}
+</style></head><body><nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main><article><a href="/@candidate/post/clipped-range"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>{spans}</p></article>
+<div id="spacer"></div></main></body></html>"""
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(tmp_path / "data").add("offline", actor, profile)
+    store = CheckpointStore(tmp_path / "data")
+
+    async def exercise(page) -> None:
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=1,
+            max_scrolls=12,
+            terms=("hiring",),
+            detail=True,
+        )
+        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
+        assert result.stop_reason == "BODY_RANGE_STRANDED"
+        assert result.scroll_attempts == result.scrolls == 0
+        assert result.detail_reads == 0
+        assert result.checkpoint_runs == 0
+        assert result.unresolved_gaps == 1
+        assert not result.viewport_coverage_complete
+
+    _run_offline_page(feed_html, exercise)
+    output = capsys.readouterr().out
+    assert "COVERAGE_STOP reason=BODY_RANGE_STRANDED" in output
+    assert "topology=missing_horizontal_left" in output
+    assert "[DETAIL]" not in output
+    assert "[CHECKPOINT] status=SAVED" not in output
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert checkpoint.completed_runs == 0
 
 
 def test_max_scrolls_12_stops_safely_with_new_incomplete_post(

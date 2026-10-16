@@ -9,9 +9,14 @@ from enum import StrEnum
 from hashlib import sha256
 
 from .observation import (
+    BodyRangeCoverageFacts,
+    BodyRangeCoverageState,
     RowCoverageState,
     RowObservationFacts,
     RowObservationOutcome,
+)
+from .observation import (
+    observe_body_range as reduce_body_range_observation,
 )
 from .observation import (
     observe_row as reduce_row_observation,
@@ -118,6 +123,8 @@ class CoverageLedger:
     unrepresented_gaps: set[str] = field(default_factory=set)
     hydration_pending: set[str] = field(default_factory=set)
     observed_body_identities: set[str] = field(default_factory=set)
+    stranded_body_ranges: set[str] = field(default_factory=set)
+    body_range_signatures: dict[str, str] = field(default_factory=dict, repr=False)
 
     def observe_row(self, facts: RowObservationFacts) -> RowObservationOutcome:
         fingerprint = facts.fingerprint
@@ -145,6 +152,8 @@ class CoverageLedger:
                 self.read_in_progress.discard(fingerprint)
             if next_state.body_complete:
                 self.fully_read.add(fingerprint)
+                self.stranded_body_ranges.discard(fingerprint)
+                self.body_range_signatures.pop(fingerprint, None)
 
         if observation_id is not None:
             if next_state.unresolved_observation:
@@ -163,6 +172,25 @@ class CoverageLedger:
         if outcome.body_observed:
             self.observed_body_identities.add(fingerprint or observation_id or facts.gap_id)
         return outcome
+
+    def observe_body_range(
+        self,
+        fingerprint: str,
+        facts: BodyRangeCoverageFacts,
+    ) -> bool:
+        previous = BodyRangeCoverageState(
+            stranded=fingerprint in self.stranded_body_ranges,
+            signature=self.body_range_signatures.get(fingerprint, ""),
+        )
+        outcome = reduce_body_range_observation(facts, previous)
+        if outcome.coverage.stranded:
+            self.stranded_body_ranges.add(fingerprint)
+            if outcome.coverage.signature:
+                self.body_range_signatures[fingerprint] = outcome.coverage.signature
+        else:
+            self.stranded_body_ranges.discard(fingerprint)
+            self.body_range_signatures.pop(fingerprint, None)
+        return outcome.coverage.stranded
 
     @property
     def unresolved_gap_count(self) -> int:

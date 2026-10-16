@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 _LOOKAHEAD_STATES = frozenset({"DEFERRED_OFFSCREEN", "DEFERRED_TEXT_BELOW"})
 
@@ -33,6 +33,48 @@ class RowObservationOutcome:
     body_completed: bool
     hydration_pending: bool | None
     body_observed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class BodyRangeCoverageState:
+    stranded: bool = False
+    signature: str = field(default="", repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class BodyRangeCoverageFacts:
+    body_complete: bool
+    missing_range_count: int | None
+    unrecoverable_range_count: int | None
+    unrecoverable_range_signature: str = field(default="", repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class BodyRangeCoverageOutcome:
+    coverage: BodyRangeCoverageState
+    newly_stranded: bool
+
+
+def observe_body_range(
+    facts: BodyRangeCoverageFacts,
+    previous: BodyRangeCoverageState,
+) -> BodyRangeCoverageOutcome:
+    """Keep an unrecoverable body gap until that same body is fully read."""
+
+    has_missing_ranges = facts.missing_range_count is None or facts.missing_range_count > 0
+    if facts.body_complete or not has_missing_ranges:
+        coverage = BodyRangeCoverageState()
+    elif previous.stranded or facts.unrecoverable_range_count:
+        coverage = BodyRangeCoverageState(
+            stranded=True,
+            signature=facts.unrecoverable_range_signature or previous.signature,
+        )
+    else:
+        coverage = BodyRangeCoverageState()
+    return BodyRangeCoverageOutcome(
+        coverage=coverage,
+        newly_stranded=coverage.stranded and not previous.stranded,
+    )
 
 
 def observe_row(

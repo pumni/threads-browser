@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from threads_browser.nurture.observation import (
+    BodyRangeCoverageFacts,
     RowCoverageState,
     RowObservationFacts,
     observe_row,
@@ -115,6 +116,60 @@ def test_complete_observation_resolves_only_its_own_post_gap() -> None:
     assert ledger.read_in_progress == {"post-b"}
     assert ledger.fully_read == {"post-a"}
     assert ledger.unresolved_gap_count == 1
+
+
+def test_stranded_body_range_stays_with_its_post_until_that_post_completes() -> None:
+    ledger = CoverageLedger()
+    ledger.observe_row(_facts("PARTIAL_BODY", has_body=True))
+    assert ledger.observe_body_range(
+        "post-a",
+        BodyRangeCoverageFacts(
+            body_complete=False,
+            missing_range_count=1,
+            unrecoverable_range_count=1,
+            unrecoverable_range_signature="synthetic-private-token",
+        ),
+    )
+
+    ledger.observe_row(
+        _facts(
+            "VERIFIED",
+            fingerprint="post-b",
+            observation_id="row-b",
+            has_body=True,
+            body_complete=True,
+        )
+    )
+    assert not ledger.observe_body_range(
+        "post-b",
+        BodyRangeCoverageFacts(
+            body_complete=True,
+            missing_range_count=0,
+            unrecoverable_range_count=0,
+        ),
+    )
+
+    assert ledger.read_in_progress == {"post-a"}
+    assert ledger.stranded_body_ranges == {"post-a"}
+    assert ledger.body_range_signatures == {
+        "post-a": "synthetic-private-token"
+    }
+    assert "synthetic-private-token" not in repr(ledger)
+    assert ledger.unresolved_gap_count == 1
+
+    ledger.observe_row(_facts("VERIFIED", has_body=True, body_complete=True))
+    assert not ledger.observe_body_range(
+        "post-a",
+        BodyRangeCoverageFacts(
+            body_complete=True,
+            missing_range_count=0,
+            unrecoverable_range_count=0,
+        ),
+    )
+    assert ledger.read_in_progress == set()
+    assert ledger.stranded_body_ranges == set()
+    assert ledger.body_range_signatures == {}
+    assert ledger.unresolved_gap_count == 0
 
 
 def test_below_viewport_reobservation_preserves_only_an_existing_gap() -> None:

@@ -28,6 +28,8 @@ class BodyReadEvidence:
     body_text_nodes_present: int | None = 0
     render_rect_count: int | None = 0
     visible_text_rect_count: int | None = 0
+    fully_contained_text_rect_count: int | None = None
+    intersect_only_text_rect_count: int | None = None
     deferred_above_rect_count: int | None = 0
     deferred_below_rect_count: int | None = 0
     closest_text_distance_px: float | None = None
@@ -45,6 +47,9 @@ class BodyReadEvidence:
     expected_range_count: int | None = None
     visited_range_count: int | None = None
     missing_range_count: int | None = None
+    missing_range_topology: tuple[str, ...] = ()
+    unrecoverable_range_count: int | None = None
+    unrecoverable_range_signature: str = field(default="", repr=False)
     scroller_scroll_top: float | None = field(default=None, repr=False)
     scroll_surface_key: str = field(default="", repr=False)
 

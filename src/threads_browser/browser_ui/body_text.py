@@ -24,6 +24,27 @@ _MAX_BODY_TEXT_NODES = 256
 _MAX_BODY_RANGE_CHECKS = 40_000
 _MAX_BODY_RANGE_DEPTH = 32
 _MAX_BODY_PROGRESS_POSTS = 200
+_RANGE_TOPOLOGY_CODES = frozenset(
+    {
+        "missing_vertical_above",
+        "missing_vertical_below",
+        "missing_horizontal_left",
+        "missing_horizontal_right",
+        "missing_inside_clip",
+        "missing_mixed",
+        "indivisible_codepoint",
+        "limit",
+    }
+)
+_UNRECOVERABLE_RANGE_CODES = frozenset(
+    {
+        "missing_vertical_above",
+        "missing_horizontal_left",
+        "missing_horizontal_right",
+        "missing_inside_clip",
+        "limit",
+    }
+)
 
 
 def _body_progress_state(
@@ -67,6 +88,10 @@ class _BodyTextProgress:
     order: int
     expected_ranges: list[tuple[int, int]] = field(default_factory=list, repr=False)
     visited_ranges: list[tuple[int, int]] = field(default_factory=list, repr=False)
+    range_evidence: list[tuple[int, int, tuple[str, ...]]] = field(
+        default_factory=list,
+        repr=False,
+    )
     fragments: list[_TextFragment] = field(default_factory=list, repr=False)
 
     def __repr__(self) -> str:
@@ -181,6 +206,38 @@ class BodyTextReader:
                 const hasBodyContainer = element =>
                     root.matches(args.body) || element.matches(args.body) ||
                     Boolean(element.parentElement?.closest(args.body));
+                const textClipFor = element => {
+                    const clip = clipFor(element);
+                    const style = getComputedStyle(element);
+                    if (style.display !== "inline" && style.display !== "contents" &&
+                        (style.overflowX !== "visible" ||
+                            style.overflowY !== "visible")) {
+                        const bounds = element.getBoundingClientRect();
+                        const left = bounds.left + element.clientLeft;
+                        const top = bounds.top + element.clientTop;
+                        if (style.overflowX !== "visible") {
+                            clip.left = Math.max(clip.left, left);
+                            clip.right = Math.min(clip.right, left + element.clientWidth);
+                        }
+                        if (style.overflowY !== "visible") {
+                            clip.top = Math.max(clip.top, top);
+                            clip.bottom = Math.min(clip.bottom, top + element.clientHeight);
+                        }
+                    }
+                    return clip;
+                };
+                const rangeTopology = (rects, clip) => {
+                    const directions = new Set();
+                    for (const rect of rects) {
+                        if (rect.left < clip.left) directions.add("missing_horizontal_left");
+                        if (rect.right > clip.right) directions.add("missing_horizontal_right");
+                        if (rect.top < clip.top) directions.add("missing_vertical_above");
+                        if (rect.bottom > clip.bottom) directions.add("missing_vertical_below");
+                    }
+                    if (!directions.size) directions.add("missing_inside_clip");
+                    if (directions.size > 1) directions.add("missing_mixed");
+                    return [...directions];
+                };
                 const nearestBlock = element => {
                     for (let current = element.parentElement; current;
                          current = current.parentElement) {
@@ -221,6 +278,8 @@ class BodyTextReader:
                 const blockIds = new WeakMap();
                 const renderRectKeys = new Set();
                 const visibleRectKeys = new Set();
+                const fullyContainedRectKeys = new Set();
+                const intersectOnlyRectKeys = new Set();
                 const aboveRectKeys = new Set();
                 const belowRectKeys = new Set();
                 let nextBlockId = 0;
@@ -251,7 +310,7 @@ class BodyTextReader:
                     totalLength += length;
                     const block = nearestBlock(node);
                     if (!blockIds.has(block)) blockIds.set(block, nextBlockId++);
-                    const clip = clipFor(parent);
+                    const clip = textClipFor(parent);
                     const metrics = scrollMetrics(root);
                     const expected = [];
                     const visible = [];
@@ -260,16 +319,22 @@ class BodyTextReader:
                     let deferredOther = 0;
                     let nearestBelow = null;
                     let frontier = null;
+                    const rangeEvidence = [];
+                    const recordRangeEvidence = (start, end, topology) => {
+                        rangeEvidence.push({start, end, topology});
+                    };
                     const range = document.createRange();
                     const inspect = (start, end, depth = 0) => {
                         if (depth >= args.maxRangeDepth) {
                             truncated = true;
                             limitReached = true;
+                            recordRangeEvidence(start, end, ["limit"]);
                             return;
                         }
                         if (rangeChecks++ >= args.maxRangeChecks) {
                             truncated = true;
                             limitReached = true;
+                            recordRangeEvidence(start, end, ["limit"]);
                             return;
                         }
                         range.setStart(node, start);
@@ -287,15 +352,20 @@ class BodyTextReader:
                             const visible = rect.right > clip.left &&
                                 rect.left < clip.right && rect.bottom > clip.top &&
                                 rect.top < clip.bottom;
+                            const fully = rect.left >= clip.left &&
+                                rect.right <= clip.right && rect.top >= clip.top &&
+                                rect.bottom <= clip.bottom;
                             renderRectKeys.add(key);
-                            if (visible) visibleRectKeys.add(key);
+                            if (visible) {
+                                visibleRectKeys.add(key);
+                                if (fully) fullyContainedRectKeys.add(key);
+                                else intersectOnlyRectKeys.add(key);
+                            }
                             else if (rect.bottom <= clip.top) aboveRectKeys.add(key);
                             else if (rect.top >= clip.bottom) belowRectKeys.add(key);
                             return {
                                 visible,
-                                fully: rect.left >= clip.left &&
-                                    rect.right <= clip.right && rect.top >= clip.top &&
-                                    rect.bottom <= clip.bottom,
+                                fully,
                             };
                         });
                         for (const rect of rects) {
@@ -333,30 +403,44 @@ class BodyTextReader:
                         if (states.every(state => !state.visible)) {
                             const above = rects.every(rect => rect.bottom <= clip.top);
                             const below = rects.every(rect => rect.top >= clip.bottom);
-                            if (above) deferredAbove++;
+                            if (above) {
+                                deferredAbove++;
+                                recordRangeEvidence(start, end, ["missing_vertical_above"]);
+                            }
                             else if (below) {
                                 deferredBelow++;
+                                recordRangeEvidence(start, end, ["missing_vertical_below"]);
                                 const distance = Math.max(0,
                                     Math.min(...rects.map(rect => rect.top)) - clip.bottom);
                                 nearestBelow = Math.min(nearestBelow ?? Infinity, distance);
-                            } else deferredOther++;
+                            } else {
+                                deferredOther++;
+                                recordRangeEvidence(start, end, rangeTopology(rects, clip));
+                            }
                             return;
                         }
                         if (end - start <= 1) {
                             deferredOther++;
+                            const topology = rangeTopology(rects, clip);
+                            recordRangeEvidence(start, end, [...new Set(topology)]);
                             return;
                         }
                         let middle = start + Math.floor((end - start) / 2);
+                        let indivisibleCodepoint = false;
                         if (middle > start && middle < end) {
                             const before = node.data.charCodeAt(middle - 1);
                             const after = node.data.charCodeAt(middle);
                             if (before >= 0xD800 && before <= 0xDBFF &&
                                 after >= 0xDC00 && after <= 0xDFFF) {
                                 middle++;
+                                indivisibleCodepoint = middle >= end;
                             }
                         }
                         if (middle <= start || middle >= end) {
                             deferredOther++;
+                            const topology = rangeTopology(rects, clip);
+                            if (indivisibleCodepoint) topology.push("indivisible_codepoint");
+                            recordRangeEvidence(start, end, [...new Set(topology)]);
                             return;
                         }
                         inspect(start, middle, depth + 1);
@@ -388,6 +472,7 @@ class BodyTextReader:
                         deferredOther,
                         nearestBelow,
                         frontier,
+                        rangeEvidence,
                     });
                     if (truncated) break;
                     if (nodes.length >= args.maxNodes) {
@@ -422,6 +507,8 @@ class BodyTextReader:
                     unsupportedTextNodesPresent,
                     renderRectCount: renderRectKeys.size,
                     visibleTextRectCount: visibleRectKeys.size,
+                    fullyContainedTextRectCount: fullyContainedRectKeys.size,
+                    intersectOnlyTextRectCount: intersectOnlyRectKeys.size,
                     deferredAboveRectCount: aboveRectKeys.size,
                     deferredBelowRectCount: belowRectKeys.size,
                     closestTextDistance,
@@ -458,6 +545,12 @@ class BodyTextReader:
             body_text_nodes_present=int(observation["bodyTextNodesPresent"]),
             render_rect_count=int(observation["renderRectCount"]),
             visible_text_rect_count=int(observation["visibleTextRectCount"]),
+            fully_contained_text_rect_count=int(
+                observation["fullyContainedTextRectCount"]
+            ),
+            intersect_only_text_rect_count=int(
+                observation["intersectOnlyTextRectCount"]
+            ),
             deferred_above_rect_count=int(observation["deferredAboveRectCount"]),
             deferred_below_rect_count=int(observation["deferredBelowRectCount"]),
             closest_text_distance_px=(
@@ -521,6 +614,18 @@ class BodyTextReader:
             current_progress_identities.add(identity)
             length = int(node["length"])
             block = int(node["block"])
+            range_evidence = [
+                (
+                    int(item["start"]),
+                    int(item["end"]),
+                    tuple(
+                        str(code)
+                        for code in item["topology"]
+                        if str(code) in _RANGE_TOPOLOGY_CODES
+                    ),
+                )
+                for item in node["rangeEvidence"]
+            ]
             expected = self._merge_ranges(
                 [(int(start), int(end)) for start, end in node["expected"]]
             )
@@ -554,6 +659,11 @@ class BodyTextReader:
                     for start, end in progress.visited_ranges
                     if start < length
                 ]
+                progress.range_evidence = [
+                    (start, min(end, length), topology)
+                    for start, end, topology in progress.range_evidence
+                    if start < length
+                ]
                 progress.fragments = [
                     _TextFragment(
                         fragment.start,
@@ -572,7 +682,18 @@ class BodyTextReader:
                 progress.length = length
             progress.block = block
             progress.order = order
-            progress.expected_ranges = expected
+            progress.expected_ranges = self._merge_ranges(
+                [*progress.expected_ranges, *expected]
+            )
+            progress.range_evidence = [
+                item
+                for item in progress.range_evidence
+                if not any(
+                    item[0] < expected_end and item[1] > expected_start
+                    for expected_start, expected_end in expected
+                )
+            ]
+            progress.range_evidence.extend(range_evidence)
 
             current_visible = sorted(
                 node["visible"],
@@ -654,12 +775,39 @@ class BodyTextReader:
         expected_range_count = 0
         visited_range_count = 0
         dom_replaced = False
+        missing_range_topology: set[str] = set()
+        unrecoverable_range_tokens: list[str] = []
         for identity, progress in progress_state.items():
             expected_range_count += len(progress.expected_ranges)
             visited_range_count += len(self._merge_ranges(progress.visited_ranges))
             for start, end in progress.expected_ranges:
                 missing_ranges = self._subtract_ranges(start, end, progress.visited_ranges)
                 missing_range_count += len(missing_ranges)
+                for missing_start, missing_end in missing_ranges:
+                    topology = {
+                        code
+                        for evidence_start, evidence_end, codes in progress.range_evidence
+                        if evidence_start < missing_end and evidence_end > missing_start
+                        for code in codes
+                    }
+                    if not topology:
+                        topology.add("missing_inside_clip")
+                    if len(
+                        topology
+                        & {
+                            "missing_vertical_above",
+                            "missing_vertical_below",
+                            "missing_horizontal_left",
+                            "missing_horizontal_right",
+                        }
+                    ) > 1:
+                        topology.add("missing_mixed")
+                    missing_range_topology.update(topology)
+                    if topology & _UNRECOVERABLE_RANGE_CODES:
+                        unrecoverable_range_tokens.append(
+                            f"{identity}:{missing_start}:{missing_end}:"
+                            f"{','.join(sorted(topology))}"
+                        )
                 if identity not in current_progress_identities and missing_ranges:
                     dom_replaced = True
 
@@ -695,6 +843,19 @@ class BodyTextReader:
             expected_range_count=expected_range_count,
             visited_range_count=visited_range_count,
             missing_range_count=missing_range_count,
+            missing_range_topology=tuple(sorted(missing_range_topology)),
+            unrecoverable_range_count=len(unrecoverable_range_tokens),
+            unrecoverable_range_signature=(
+                sha256(
+                    self._body_progress_salt
+                    + (
+                        f"{fingerprint or 'display'}:"
+                        + ";".join(sorted(unrecoverable_range_tokens))
+                    ).encode()
+                ).hexdigest()
+                if unrecoverable_range_tokens
+                else ""
+            ),
         )
         body_blocks: list[tuple[int, list[str]]] = []
         for _identity, progress in sorted(progress_state.items(), key=lambda item: item[1].order):
