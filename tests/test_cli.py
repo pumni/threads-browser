@@ -697,12 +697,15 @@ def test_short_run_login_required_and_profile_lock_errors_are_safe(
     async def login_required(*_args, **_kwargs):
         raise UiReadError("LOGIN_REQUIRED")
 
+    real_run_browser_nurture = workflow.run_browser_nurture
     monkeypatch.setattr(workflow, "run_browser_nurture", login_required)
     assert main(["run", "local1"]) == 1
     error = capsys.readouterr().err
     assert "STOP LOGIN_REQUIRED" in error
     assert "tb login local1" in error
 
+    # The real workflow, not the CLI adapter, now enforces the lock.
+    monkeypatch.setattr(workflow, "run_browser_nurture", real_run_browser_nurture)
     lock = profile_lock(root, account)
     lock.acquire()
     try:
