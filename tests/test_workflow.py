@@ -1360,7 +1360,7 @@ def test_feed_barrier_waits_through_body_hydration_and_dom_change(
     assert "READY stage=FEED_INITIAL state=BODY_EXTRACTED" in capsys.readouterr().out
 
 
-def test_readiness_timeouts_and_unverified_feed_candidates_do_not_checkpoint(
+def test_failed_selected_detail_blocks_checkpoint_but_unknown_rows_are_skipped(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -1449,9 +1449,10 @@ window.addEventListener("wheel", () => window.wheelCount++);</script></body></ht
             terms=("hiring",),
             readiness_prompt=provenance_prompt,
         )
-        assert result.status == "OBSERVATION_UNCERTAIN_ONLY"
+        assert result.status == "COMPLETE_WITH_SKIPS"
         assert result.observed_rows == 1
         assert result.detail_reads == result.scroll_attempts == 0
+        assert result.checkpoint_runs == 1
         assert await page.evaluate("window.wheelCount") == 0
         assert provenance_prompts == []
 
@@ -1463,7 +1464,7 @@ window.addEventListener("wheel", () => window.wheelCount++);</script></body></ht
         _run_offline_page(malformed_html, malformed_exercise)
     policy = policy_fingerprint(canonical_terms(("hiring",)))
     checkpoint = store.load(account.account_id, policy)
-    assert checkpoint.completed_runs == 0
+    assert checkpoint.completed_runs == 1
     assert checkpoint.home_sampled == 0
     assert checkpoint.scroll_attempts == 0
     assert checkpoint.scrolls == 0
@@ -1779,7 +1780,7 @@ def test_initial_feed_readiness_deadline_stops_without_checkpoint(
         assert checkpoint.scrolls == 0
 
 
-def test_mixed_candidate_coverage_stops_before_detail_or_checkpoint(
+def test_mixed_candidate_rows_do_not_block_a_verified_selected_post(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -1851,9 +1852,9 @@ window.addEventListener("wheel", event => {
                 max_posts=3,
                 terms=("hiring", "engineer"),
             )
-            assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
+            assert result.status == "COMPLETE_WITH_SKIPS"
             assert result.home_sampled == 1
-            assert result.detail_reads == 0
+            assert result.detail_reads == 1
             assert result.scroll_attempts == result.scrolls > 0
             assert not result.viewport_coverage_complete
             assert await page.evaluate("sessionStorage.getItem('wheel-target')") is not None
@@ -1861,11 +1862,11 @@ window.addEventListener("wheel", event => {
         _run_offline_page(html, exercise)
         policy = policy_fingerprint(canonical_terms(("hiring", "engineer")))
         checkpoint = store.load(account.account_id, policy)
-        assert checkpoint.completed_runs == 0
-        assert checkpoint.home_sampled == 0
-        assert checkpoint.seen_fingerprints == ()
-        assert checkpoint.detail_reads == 0
-        assert clean_detail_requests == 0
+        assert checkpoint.completed_runs == 1
+        assert checkpoint.home_sampled == 1
+        assert len(checkpoint.seen_fingerprints) == 1
+        assert checkpoint.detail_reads == 1
+        assert clean_detail_requests == 1
         assert rejected_detail_requests == 0
         output = capsys.readouterr().out
         assert "SKIPPED stage=FEED_INITIAL reason=CANDIDATE_NONCANONICAL count=1" in output
@@ -2203,7 +2204,7 @@ def test_workflow_skips_detail_when_no_home_candidate_is_actionable(
     assert detail_reads == detail_requests == 0
 
 
-def test_unresolved_post_root_keeps_coverage_incomplete_and_blocks_checkpoint(
+def test_unresolved_post_root_does_not_block_a_verified_selected_post(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -2228,6 +2229,21 @@ def test_unresolved_post_root_keeps_coverage_incomplete_and_blocks_checkpoint(
     store = CheckpointStore(tmp_path / "data")
 
     async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            post_path = urlsplit(route.request.url).path
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=(
+                    "<!doctype html><html><body><main><article>"
+                    f'<a href="{post_path}"><time>now</time></a>'
+                    '<a href="/@candidate">candidate</a>'
+                    f"<p>{clean_body}</p>"
+                    "</article></main></body></html>"
+                ),
+            )
+
+        await page.route("**/@candidate/post/clean-unresolved-peer", serve_detail)
         result = await workflow.run_page_workflow(
             page,
             account,
@@ -2236,18 +2252,18 @@ def test_unresolved_post_root_keeps_coverage_incomplete_and_blocks_checkpoint(
             max_scrolls=0,
             terms=("hiring",),
         )
-        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
+        assert result.status == "COMPLETE_WITH_SKIPS"
         assert not result.viewport_coverage_complete
-        assert result.detail_reads == 0
-        assert result.checkpoint_runs == 0
+        assert result.detail_reads == 1
+        assert result.checkpoint_runs == 1
 
     _run_offline_page(html, exercise)
     checkpoint = store.load(
         account.account_id,
         policy_fingerprint(canonical_terms(("hiring",))),
     )
-    assert checkpoint.completed_runs == 0
-    assert checkpoint.detail_reads == 0
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.detail_reads == 1
     output = capsys.readouterr().out
     assert "POST_ROOT_UNRESOLVED:1" in output
 
@@ -2300,7 +2316,7 @@ def test_ambiguous_pressable_row_recovers_only_its_timestamp_author_and_body() -
     _run_offline_page(html, exercise)
 
 
-def test_unresolved_ambiguous_row_is_one_gap_and_stops_before_scroll_or_checkpoint(
+def test_unresolved_ambiguous_row_does_not_block_a_verified_peer_checkpoint(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -2336,11 +2352,11 @@ def test_unresolved_ambiguous_row_is_one_gap_and_stops_before_scroll_or_checkpoi
             max_scrolls=4,
             terms=("hiring",),
         )
-        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
+        assert result.status == "COMPLETE_WITH_SKIPS"
         assert result.unresolved_gaps == 1
-        assert result.scroll_attempts == 0
+        assert result.home_sampled == 1
         assert result.detail_reads == 0
-        assert result.checkpoint_runs == 0
+        assert result.checkpoint_runs == 1
 
     _run_offline_page(html, exercise)
     output = capsys.readouterr().out
@@ -2350,7 +2366,8 @@ def test_unresolved_ambiguous_row_is_one_gap_and_stops_before_scroll_or_checkpoi
         account.account_id,
         policy_fingerprint(canonical_terms(("hiring",))),
     )
-    assert checkpoint.completed_runs == 0
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.home_sampled == 1
 
 
 def test_removed_ambiguous_row_gets_a_new_observation_identity() -> None:
@@ -3588,7 +3605,7 @@ def test_post_text_preview_escapes_unicode_format_characters(
     )
 
 
-def test_unverified_candidate_allows_wheel_but_blocks_detail_and_checkpoint(
+def test_unverified_candidate_does_not_block_later_verified_selection(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -3654,19 +3671,19 @@ window.addEventListener("wheel", event => {{
             max_total_posts=10,
             terms=("hiring", "engineer"),
         )
-        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
+        assert result.status == "COMPLETE_WITH_SKIPS"
         assert result.home_sampled == result.home_new == 1
         assert result.home_relevant == 1
         assert result.skipped_unverified == 1
         assert result.scroll_attempts == result.scrolls
         assert result.scroll_attempts > 0
-        assert result.detail_reads == result.checkpoint_runs == 0
+        assert result.detail_reads == result.checkpoint_runs == 1
         await _assert_bounded_wheel_gestures(page, result.scrolls)
         assert float(await page.evaluate("sessionStorage.getItem('wheel-delta')")) < 360
 
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
-    assert detail_requests == 0
+    assert detail_requests == 1
     assert (
         "SKIPPED stage=FEED_INITIAL reason=CANDIDATE_NONCANONICAL count=1 "
         "cause=POST_PATH_SHAPE_INVALID"
@@ -3682,8 +3699,10 @@ window.addEventListener("wheel", event => {{
         account.account_id,
         policy_fingerprint(canonical_terms(("hiring", "engineer"))),
     )
-    assert checkpoint.completed_runs == 0
-    assert checkpoint.home_sampled == 0
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.home_sampled == 1
+    assert checkpoint.detail_reads == 1
+    assert checkpoint.pending_read_fingerprints == ()
 
 
 def test_timestamp_permalink_accepts_safe_trailing_slash_and_ignores_bad_secondary(
@@ -3752,7 +3771,7 @@ def test_timestamp_permalink_accepts_safe_trailing_slash_and_ignores_bad_seconda
     assert checkpoint.detail_reads == 1
 
 
-def test_noncanonical_link_reasons_are_aggregate_and_privacy_safe(
+def test_noncanonical_link_reasons_are_aggregate_private_and_skipped(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -3815,11 +3834,12 @@ def test_noncanonical_link_reasons_are_aggregate_and_privacy_safe(
             terms=("hiring",),
             show_post_text=True,
         )
-        assert result.status == "UNVERIFIED_RELEVANCE_REQUIRES_VERIFICATION"
+        assert result.status == "COMPLETE_WITH_SKIPS"
         assert result.home_sampled == 0
         assert result.skipped_unverified == 8, result
         assert result.unverified_relevant > 0
-        assert result.detail_reads == result.checkpoint_runs == 0
+        assert result.detail_reads == 0
+        assert result.checkpoint_runs == 1
         assert not result.viewport_coverage_complete
 
     _run_offline_page(feed_html, exercise)
@@ -3843,7 +3863,9 @@ def test_noncanonical_link_reasons_are_aggregate_and_privacy_safe(
         account.account_id,
         policy_fingerprint(canonical_terms(("hiring",))),
     )
-    assert checkpoint.completed_runs == 0
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.home_sampled == 0
+    assert checkpoint.seen_fingerprints == ()
 
 
 def test_query_text_does_not_make_a_profile_link_look_like_a_post_path() -> None:
@@ -4365,12 +4387,17 @@ article p {{ position: absolute; top: 600px; left: 0; width: 400px;
     assert body not in output
 
 
-def test_unrecoverable_body_range_stops_without_detail_or_checkpoint(
+def test_partial_body_does_not_block_a_verified_selected_post(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     actor = "offline.operator"
     spans = "".join(f"<span>{letter}</span>" for letter in "ABCDEFGHIJKLM")
+    detail_url = "https://www.threads.com/@candidate/post/verified-after-partial"
+    eligible_body = "Synthetic hiring role fixture."
+    detail_html = f"""<!doctype html><html><body><main><article>
+<a href="/@candidate/post/verified-after-partial"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>{eligible_body}</p></article></main></body></html>"""
     feed_html = f"""<!doctype html><html><head><meta charset="utf-8"><style>
 html, body {{ margin: 0; }}
 nav {{ height: 36px; }}
@@ -4385,6 +4412,8 @@ article p span:first-child {{ position: relative; left: -2px; }}
 <a aria-label="Profile" href="/@{actor}">Profile</a></nav>
 <main><article><a href="/@candidate/post/clipped-range"><time>now</time></a>
 <a href="/@candidate">candidate</a><p>{spans}</p></article>
+<article><a href="/@candidate/post/verified-after-partial"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>{eligible_body}</p></article>
 <div id="spacer"></div></main></body></html>"""
     profile = tmp_path / "profile"
     profile.mkdir()
@@ -4392,37 +4421,48 @@ article p span:first-child {{ position: relative; left: -2px; }}
     store = CheckpointStore(tmp_path / "data")
 
     async def exercise(page) -> None:
+        await page.route(
+            detail_url,
+            lambda route: route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=detail_html,
+            ),
+        )
         result = await workflow.run_page_workflow(
             page,
             account,
             store,
-            max_posts=1,
-            max_scrolls=12,
+            max_posts=2,
+            max_scrolls=0,
             terms=("hiring",),
             detail=True,
         )
-        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
-        assert result.stop_reason == "BODY_RANGE_STRANDED"
+        assert result.status == "COMPLETE_WITH_SKIPS"
         assert result.scroll_attempts == result.scrolls == 0
-        assert result.detail_reads == 0
-        assert result.checkpoint_runs == 0
+        assert result.detail_reads == 1
+        assert result.checkpoint_runs == 1
         assert result.unresolved_gaps == 1
         assert not result.viewport_coverage_complete
 
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
-    assert "COVERAGE_STOP reason=BODY_RANGE_STRANDED" in output
-    assert "topology=missing_horizontal_left" in output
-    assert "[DETAIL]" not in output
-    assert "[CHECKPOINT] status=SAVED" not in output
+    assert "[DETAIL] post=1 status=VERIFIED" in output
+    assert "[BACK] post=1 status=RESTORED anchor=MATCHED" in output
+    assert "[CHECKPOINT] status=SAVED completed_runs=1" in output
+    assert "[CYCLE] status=COMPLETE_WITH_SKIPS" in output
     checkpoint = store.load(
         account.account_id,
         policy_fingerprint(canonical_terms(("hiring",))),
     )
-    assert checkpoint.completed_runs == 0
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.home_sampled == 1
+    assert checkpoint.detail_reads == 1
+    assert len(checkpoint.seen_fingerprints) == 1
+    assert checkpoint.pending_read_fingerprints == ()
 
 
-def test_max_scrolls_12_stops_safely_with_new_incomplete_post(
+def test_max_scrolls_12_checkpoints_with_a_new_incomplete_post(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -4451,6 +4491,21 @@ article.long p {{ margin: 0; font: 16px/24px monospace; overflow-wrap: anywhere;
     store = CheckpointStore(tmp_path / "data")
 
     async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            post_path = urlsplit(route.request.url).path
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=(
+                    "<!doctype html><html><body><main><article>"
+                    f'<a href="{post_path}"><time>now</time></a>'
+                    '<a href="/@candidate">candidate</a>'
+                    "<p>A synthetic weather update.</p>"
+                    "</article></main></body></html>"
+                ),
+            )
+
+        await page.route("**/@candidate/post/earlier-*", serve_detail)
         result = await workflow.run_page_workflow(
             page,
             account,
@@ -4459,12 +4514,12 @@ article.long p {{ margin: 0; font: 16px/24px monospace; overflow-wrap: anywhere;
             max_scrolls=12,
             terms=("hiring",),
         )
-        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
-        assert result.stop_reason == "SCROLL_BUDGET_EXHAUSTED_WITH_GAP"
+        assert result.status == "COMPLETE_WITH_SKIPS"
+        assert result.stop_reason == "MAX_SCROLLS"
         assert result.scroll_attempts == result.scrolls == 12
         assert result.home_sampled <= 10
-        assert result.detail_reads == 0
-        assert result.checkpoint_runs == 0
+        assert result.detail_reads == 1
+        assert result.checkpoint_runs == 1
         assert not result.viewport_coverage_complete
 
     _run_offline_page(feed_html, exercise)
@@ -4472,11 +4527,11 @@ article.long p {{ margin: 0; font: 16px/24px monospace; overflow-wrap: anywhere;
         account.account_id,
         policy_fingerprint(canonical_terms(("hiring",))),
     )
-    assert checkpoint.completed_runs == 0
-    assert checkpoint.home_sampled == 0
-    assert checkpoint.detail_reads == 0
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.home_sampled > 0
+    assert checkpoint.detail_reads == 1
+    assert checkpoint.pending_read_fingerprints == ()
     output = capsys.readouterr().out
-    assert "COVERAGE_STOP reason=SCROLL_BUDGET_EXHAUSTED_WITH_GAP" in output
     assert body not in output
 
 
@@ -4606,7 +4661,7 @@ window.addEventListener("wheel", event => {{
     assert "decision=IRRELEVANT source=DETAIL_BODY" in output
 
 
-def test_total_scan_budget_and_zero_verified_exhaustion_are_truthful(
+def test_total_scan_budget_checkpoints_verified_rows_and_zero_verified_still_fails(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -4670,11 +4725,11 @@ window.addEventListener("wheel", event => {{
             max_total_posts=2,
             terms=("hiring",),
         )
-        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
+        assert result.status == "COMPLETE_WITH_SKIPS"
         assert result.home_sampled <= 2
         assert result.detail_reads == 0
         assert result.scroll_attempts == result.scrolls <= 8
-        assert result.checkpoint_runs == 0
+        assert result.checkpoint_runs == 1
         assert not result.viewport_coverage_complete
         await _assert_bounded_wheel_gestures(page, result.scrolls)
 
@@ -4683,10 +4738,11 @@ window.addEventListener("wheel", event => {{
         valid_account.account_id,
         policy_fingerprint(canonical_terms(("hiring",))),
     )
-    assert valid_checkpoint.completed_runs == 0
-    assert valid_checkpoint.home_sampled == 0
+    assert valid_checkpoint.completed_runs == 1
+    assert valid_checkpoint.home_sampled == 1
+    assert len(valid_checkpoint.seen_fingerprints) == 1
     assert valid_checkpoint.detail_reads == 0
-    assert valid_checkpoint.scroll_attempts == 0
+    assert valid_checkpoint.scroll_attempts > 0
     valid_output = capsys.readouterr().out
     assert "OBSERVED stage=FEED_INITIAL state=OBSERVATION_UNCERTAIN" in valid_output
     assert "VIEWPORT_COVERAGE_INCOMPLETE viewport=" in valid_output
@@ -4844,7 +4900,7 @@ body {{ font-family: sans-serif; }}
     assert verified_body_second not in persisted
 
 
-def test_visible_card_without_permalink_is_observed_without_checkpoint(
+def test_visible_card_without_permalink_is_skipped_without_fingerprint(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -4889,12 +4945,13 @@ def test_visible_card_without_permalink_is_observed_without_checkpoint(
             terms=("hiring",),
             show_post_text=True,
         )
-        assert result.status == "UNVERIFIED_RELEVANCE_REQUIRES_VERIFICATION"
+        assert result.status == "COMPLETE_WITH_SKIPS"
         assert result.observed_rows == 1
         assert result.body_extracted == 1
         assert result.provenance_verified == 0
         assert result.unverified_relevant == 1
         assert result.detail_reads == result.scroll_attempts == 0
+        assert result.checkpoint_runs == 1
         assert await page.evaluate("sessionStorage.getItem('wheel-count')") is None
 
     _run_offline_page(feed_html, exercise)
@@ -4912,8 +4969,9 @@ def test_visible_card_without_permalink_is_observed_without_checkpoint(
         account.account_id,
         policy_fingerprint(canonical_terms(("hiring",))),
     )
-    assert checkpoint.completed_runs == 0
+    assert checkpoint.completed_runs == 1
     assert checkpoint.home_sampled == 0
+    assert checkpoint.seen_fingerprints == ()
 
 
 def test_delayed_permalink_hydration_recovers_before_unsupported_stop() -> None:
@@ -5140,11 +5198,12 @@ def test_progressive_body_fallback_emits_row_before_reading_next_with_y_jitter(
     assert checkpoint.home_sampled == 2
 
 
-def test_three_verified_rows_stream_around_rejected_candidate_without_checkpoint(
+def test_three_verified_rows_stream_around_rejected_candidate_and_checkpoint_selection(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     actor = "offline.operator"
+    detail_url = "https://www.threads.com/@candidate/post/second"
     verified = (
         ("first", "Synthetic weather note one."),
         ("second", "Synthetic hiring a backend engineer."),
@@ -5177,6 +5236,20 @@ nav {{ height: 36px; }} .card {{ height: 155px; }}
     store = CheckpointStore(data_root)
 
     async def exercise(page) -> None:
+        await page.route(
+            detail_url,
+            lambda route: route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=(
+                    "<!doctype html><html><body><main><article>"
+                    '<a href="/@candidate/post/second"><time>1h</time></a>'
+                    '<a href="/@candidate">candidate</a>'
+                    f"<p>{verified[1][1]}</p>"
+                    "</article></main></body></html>"
+                ),
+            ),
+        )
         result = await workflow.run_page_workflow(
             page,
             account,
@@ -5186,10 +5259,11 @@ nav {{ height: 36px; }} .card {{ height: 155px; }}
             terms=("hiring",),
             detail=True,
         )
-        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
+        assert result.status == "COMPLETE_WITH_SKIPS"
         assert result.home_sampled == 3
         assert result.provenance_verified == 3
-        assert result.detail_reads == 0
+        assert result.detail_reads == 1
+        assert result.checkpoint_runs == 1
         assert not result.viewport_coverage_complete
 
     _run_offline_page(feed_html, exercise)
@@ -5204,9 +5278,11 @@ nav {{ height: 36px; }} .card {{ height: 155px; }}
         account.account_id,
         policy_fingerprint(canonical_terms(("hiring",))),
     )
-    assert checkpoint.completed_runs == 0
-    assert checkpoint.home_sampled == 0
-    assert checkpoint.detail_reads == 0
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.home_sampled == 3
+    assert len(checkpoint.seen_fingerprints) == 3
+    assert checkpoint.detail_reads == 1
+    assert checkpoint.pending_read_fingerprints == ()
 
 
 def test_offscreen_nested_row_is_deferred_then_read_and_changed_back_anchor_stops(
@@ -5532,23 +5608,25 @@ nav {{ height: 36px; }}
             terms=("hiring",),
             detail=True,
         )
-        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
+        assert result.status == "COMPLETE_WITH_SKIPS"
         assert result.scroll_attempts == result.scrolls == 3
         assert not result.viewport_coverage_complete
         assert result.unresolved_gaps == 1
-        assert result.checkpoint_runs == 0
+        assert result.checkpoint_runs == 1
 
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
     assert "state=MOVED_NO_NEW_CONTENT" in output
     assert "status=STOPPED reason=READ_PROGRESS_STALLED" in output
     assert "[DETAIL]" not in output
-    assert "[CHECKPOINT] status=NOT_SAVED reason=VIEWPORT_COVERAGE_INCOMPLETE" in output
+    assert "[CHECKPOINT] status=SAVED completed_runs=1" in output
+    assert "[CYCLE] status=COMPLETE_WITH_SKIPS" in output
     checkpoint = store.load(
         account.account_id,
         policy_fingerprint(canonical_terms(("hiring",))),
     )
-    assert checkpoint.completed_runs == 0
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.home_sampled == 1
 
 
 def test_pending_pressable_waits_for_missing_permalink_and_rescans() -> None:
@@ -5619,7 +5697,7 @@ nav {{ height: 32px; }} .card {{ height: 150px; }}
     _run_offline_page(feed_html, exercise)
 
 
-def test_unresolved_hydrating_pressable_reports_partial_without_detail_or_checkpoint(
+def test_unresolved_hydrating_pressable_is_skipped_after_verified_selection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -5650,6 +5728,20 @@ nav {{ height: 32px; }} .card {{ height: 150px; }}
     store = CheckpointStore(data_root)
 
     async def exercise(page) -> None:
+        await page.route(
+            "**/@candidate/post/verified-1",
+            lambda route: route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=(
+                    "<!doctype html><html><body><main><article>"
+                    '<a href="/@candidate/post/verified-1"><time>1h</time></a>'
+                    '<a href="/@candidate">candidate</a>'
+                    "<p>Hiring a synthetic fixture engineer 1.</p>"
+                    "</article></main></body></html>"
+                ),
+            ),
+        )
         result = await workflow.run_page_workflow(
             page,
             account,
@@ -5660,9 +5752,10 @@ nav {{ height: 32px; }} .card {{ height: 150px; }}
             terms=("hiring", "engineer"),
             detail=True,
         )
-        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
+        assert result.status == "COMPLETE_WITH_SKIPS"
         assert result.home_sampled == result.provenance_verified == 3
-        assert result.detail_reads == result.scroll_attempts == 0
+        assert result.detail_reads == result.checkpoint_runs == 1
+        assert result.scrolls == 0
         assert not result.viewport_coverage_complete
 
     _run_offline_page(feed_html, exercise)
@@ -5670,7 +5763,8 @@ nav {{ height: 32px; }} .card {{ height: 150px; }}
     assert "state=PENDING_HYDRATION reason=POST_PERMALINK_PENDING" in output
     assert "verified_body_extracted=3" in output
     assert "scan=PARTIAL wheel=ALLOWED" in output
-    assert "[CHECKPOINT] status=NOT_SAVED reason=VIEWPORT_COVERAGE_INCOMPLETE" in output
+    assert "[CHECKPOINT] status=SAVED completed_runs=1" in output
+    assert "[CYCLE] status=COMPLETE_WITH_SKIPS" in output
     assert f"| {unverified_body}" in output
     assert "status=OBSERVED_UNVERIFIED" in output
     assert "@candidate" not in output
@@ -5679,8 +5773,9 @@ nav {{ height: 32px; }} .card {{ height: 150px; }}
         account.account_id,
         policy_fingerprint(canonical_terms(("hiring", "engineer"))),
     )
-    assert checkpoint.completed_runs == 0
-    assert checkpoint.home_sampled == checkpoint.detail_reads == 0
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.home_sampled == 3
+    assert checkpoint.detail_reads == 1
 
 
 def test_observed_unverified_row_does_not_block_a_measured_native_wheel(
@@ -5722,10 +5817,11 @@ window.addEventListener("wheel", () => window.nativeWheelCount++);
             terms=("hiring", "engineer"),
             detail=True,
         )
-        assert result.status == "UNVERIFIED_RELEVANCE_REQUIRES_VERIFICATION"
+        assert result.status == "COMPLETE_WITH_SKIPS"
         assert result.scroll_attempts == result.scrolls == 1
         assert result.unverified_relevant == 1
         assert result.detail_reads == 0
+        assert result.checkpoint_runs == 1
         assert not result.viewport_coverage_complete
         assert await page.evaluate("window.nativeWheelCount") >= 2
 
@@ -5735,12 +5831,12 @@ window.addEventListener("wheel", () => window.nativeWheelCount++);
     assert "status=ADVANCED observed=1 delta_px=" in output
     assert "[DETAIL]" not in output
     assert "[BACK]" not in output
-    assert "SEARCH_INCOMPLETE reason=UNVERIFIED_RELEVANCE" in output
+    assert "SEARCH_INCOMPLETE reason=UNVERIFIED_RELEVANCE" not in output
     checkpoint = store.load(
         account.account_id,
         policy_fingerprint(canonical_terms(("hiring", "engineer"))),
     )
-    assert checkpoint.completed_runs == 0
+    assert checkpoint.completed_runs == 1
     assert checkpoint.detail_reads == 0
 
 
@@ -5935,7 +6031,7 @@ feed.scrollTop = feed.scrollHeight;
     assert checkpoint.detail_reads == 1
 
 
-def test_unmarked_rows_keep_display_and_provenance_evidence_separate(
+def test_unverified_display_row_does_not_block_verified_selected_detail(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -6007,43 +6103,44 @@ def test_unmarked_rows_keep_display_and_provenance_evidence_separate(
             show_post_text=True,
             show_observed_text=True,
         )
-        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
+        assert result.status == "COMPLETE_WITH_SKIPS"
         assert result.observed_rows == 3
         assert result.body_extracted == 3
         assert result.provenance_verified == 2
         assert result.unverified_relevant == 1
-        assert result.detail_reads == result.checkpoint_runs == 0
+        assert result.detail_reads == 1
+        assert result.checkpoint_runs == 1
         assert not result.viewport_coverage_complete
 
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
-    assert detail_requests == 0
+    assert detail_requests == 1
     assert "OBSERVED stage=FEED_INITIAL state=OBSERVATION_UNCERTAIN verified=2" in output
     assert "VIEWPORT_COVERAGE_INCOMPLETE" in output
-    assert "[DETAIL]" not in output
-    assert "[BACK]" not in output
+    assert "[DETAIL] post=2 status=VERIFIED" in output
+    assert "[BACK] post=2 status=RESTORED anchor=MATCHED" in output
     assert output.count(f"| {unverified_body}") == 1
     assert output.count(f"| {verified_body}") == 1
-    assert output.count(f"| {selected_body}") == 1
+    assert output.count(f"| {selected_body}") == 2
     assert quoted_body not in output
     assert "status=OBSERVED_UNVERIFIED decision=RELEVANT_UNVERIFIED" in output
     checkpoint = store.load(
         account.account_id,
         policy_fingerprint(canonical_terms(("đang tìm việc", "hiring"))),
     )
-    assert checkpoint.completed_runs == 0
-    assert checkpoint.home_sampled == 0
-    assert checkpoint.detail_reads == 0
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.home_sampled == 2
+    assert checkpoint.detail_reads == 1
     checkpoint_path = (
         data_root
         / "nurture"
         / "checkpoints"
         / f"{account.account_id}-{checkpoint.policy_fingerprint}.json"
     )
-    assert not checkpoint_path.exists()
+    assert checkpoint_path.exists()
 
 
-def test_two_row_cap_reports_incomplete_viewport_without_wheel_or_checkpoint(
+def test_two_row_cap_completes_with_skips_without_wheel(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -6079,10 +6176,11 @@ window.addEventListener("wheel", () => window.wheelCount++);</script>
             max_total_posts=40,
             terms=("hiring",),
         )
-        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
+        assert result.status == "COMPLETE_WITH_SKIPS"
         assert result.observed_rows == 4
         assert not result.viewport_coverage_complete
         assert result.detail_reads == result.scroll_attempts == 0
+        assert result.checkpoint_runs == 1
         assert await page.evaluate("window.wheelCount") == 0
 
     _run_offline_page(feed_html, exercise)
@@ -6094,7 +6192,8 @@ window.addEventListener("wheel", () => window.wheelCount++);</script>
         account.account_id,
         policy_fingerprint(canonical_terms(("hiring",))),
     )
-    assert checkpoint.completed_runs == checkpoint.home_sampled == 0
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.home_sampled == 0
 
 
 def test_unmarked_row_body_hydration_is_rescanned_without_early_ready(
@@ -6126,14 +6225,14 @@ def test_unmarked_row_body_hydration_is_rescanned_without_early_ready(
             max_scrolls=0,
             terms=("hiring",),
         )
-        assert result.status == "OBSERVED_UNVERIFIED_ONLY", (
+        assert result.status == "COMPLETE_WITH_SKIPS", (
             f"status={result.status} unresolved_gaps={result.unresolved_gaps} "
             f"scroll_attempts={result.scroll_attempts} scrolls={result.scrolls}"
         )
         assert result.body_extracted == 1
         assert result.provenance_verified == 0
         assert result.detail_reads == 0
-        assert result.checkpoint_runs == 0
+        assert result.checkpoint_runs == 1
 
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
@@ -6141,7 +6240,7 @@ def test_unmarked_row_body_hydration_is_rescanned_without_early_ready(
     assert "READY stage=FEED_INITIAL" not in output
     assert body not in output
     policy = policy_fingerprint(canonical_terms(("hiring",)))
-    assert store.load(account.account_id, policy).completed_runs == 0
+    assert store.load(account.account_id, policy).completed_runs == 1
 
 
 def test_final_feed_gate_failure_cannot_print_ready(
@@ -6214,11 +6313,11 @@ def test_unverified_keyword_mismatch_never_becomes_a_verified_match(
             max_scrolls=0,
             terms=("hiring",),
         )
-        assert result.status == "OBSERVED_UNVERIFIED_ONLY"
+        assert result.status == "COMPLETE_WITH_SKIPS"
         assert result.unverified_relevant == 0
         assert result.home_sampled == 0
         assert result.detail_reads == 0
-        assert result.checkpoint_runs == 0
+        assert result.checkpoint_runs == 1
 
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
@@ -6228,10 +6327,10 @@ def test_unverified_keyword_mismatch_never_becomes_a_verified_match(
         account.account_id,
         policy_fingerprint(canonical_terms(("hiring",))),
     )
-    assert checkpoint.completed_runs == 0
+    assert checkpoint.completed_runs == 1
 
 
-def test_unmarked_rows_use_one_overlapping_wheel_and_dedupe_without_checkpoint(
+def test_unmarked_rows_use_one_overlapping_wheel_and_checkpoint_skips(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -6280,25 +6379,26 @@ window.addEventListener("click", event => {{
             max_total_posts=20,
             terms=("hiring",),
         )
-        assert result.status == "OBSERVED_UNVERIFIED_ONLY"
+        assert result.status == "COMPLETE_WITH_SKIPS"
         assert result.observed_rows == 5
         assert result.body_extracted == result.classified == 3
         assert result.provenance_verified == result.detail_reads == 0
         assert result.scroll_attempts == result.scrolls == 1
-        assert result.checkpoint_runs == 0
+        assert result.checkpoint_runs == 1
         assert await page.evaluate("window.wheelCount") > result.scroll_attempts
         assert await page.evaluate("window.rowClickCount") == 0
 
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
     assert "SCROLL attempt=1 observed=1 delta_band=SMALL" in output
-    assert "SEARCH_BUDGET_EXHAUSTED reason=VIEWPORT_COVERAGE_INCOMPLETE viewports=2" in output
+    assert "SEARCH_BUDGET_EXHAUSTED reason=MAX_SCROLLS viewports=2" in output
     assert all(value not in output for value in (*bodies, quoted))
     checkpoint = store.load(
         account.account_id,
         policy_fingerprint(canonical_terms(("hiring",))),
     )
-    assert checkpoint.completed_runs == checkpoint.home_sampled == 0
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.home_sampled == 0
 
 
 def test_explicit_observed_text_preview_contains_only_scoped_unverified_body(
@@ -6337,10 +6437,10 @@ def test_explicit_observed_text_preview_contains_only_scoped_unverified_body(
             terms=("hiring",),
             show_observed_text=True,
         )
-        assert result.status == "UNVERIFIED_RELEVANCE_REQUIRES_VERIFICATION"
+        assert result.status == "COMPLETE_WITH_SKIPS"
         assert result.unverified_relevant == 1
         assert result.provenance_verified == result.detail_reads == 0
-        assert result.checkpoint_runs == 0
+        assert result.checkpoint_runs == 1
 
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
@@ -6351,7 +6451,7 @@ def test_explicit_observed_text_preview_contains_only_scoped_unverified_body(
     assert "POST TEXT BEGIN" not in output
 
 
-def test_unverified_relevance_prevents_completed_checkpoint_with_verified_rows(
+def test_unverified_relevance_is_skipped_while_verified_rows_checkpoint(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -6383,21 +6483,25 @@ def test_unverified_relevance_prevents_completed_checkpoint_with_verified_rows(
             max_scrolls=0,
             terms=("looking for work",),
         )
-        assert result.status == "UNVERIFIED_RELEVANCE_REQUIRES_VERIFICATION"
+        assert result.status == "COMPLETE_WITH_SKIPS"
         assert result.home_sampled == result.home_irrelevant == 1
         assert result.unverified_relevant == 1
-        assert result.detail_reads == result.checkpoint_runs == 0
+        assert result.detail_reads == 0
+        assert result.checkpoint_runs == 1
 
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
-    assert "SEARCH_INCOMPLETE reason=UNVERIFIED_RELEVANCE" in output
+    assert "SEARCH_INCOMPLETE reason=UNVERIFIED_RELEVANCE" not in output
     assert verified_body not in output
     assert observed_body not in output
     checkpoint = store.load(
         account.account_id,
         policy_fingerprint(canonical_terms(("looking for work",))),
     )
-    assert checkpoint.completed_runs == 0
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.home_sampled == 1
+    assert checkpoint.home_irrelevant == 1
+    assert len(checkpoint.seen_fingerprints) == 1
 
 
 def test_nested_scrollport_excludes_future_rows_and_uses_its_own_coordinates() -> None:
@@ -6616,7 +6720,7 @@ nav {{ height: 36px; }}
             terms=("hiring",),
             detail=True,
         )
-        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
+        assert result.status == "COMPLETE_WITH_SKIPS"
         assert result.stop_reason == "READ_PROGRESS_STALLED"
         assert result.scroll_attempts == result.scrolls == 3
         assert not result.viewport_coverage_complete
@@ -6632,7 +6736,8 @@ nav {{ height: 36px; }}
         account.account_id,
         policy_fingerprint(canonical_terms(("hiring",))),
     )
-    assert checkpoint.completed_runs == 0
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.home_sampled == 1
     assert checkpoint.detail_reads == 0
 
 

@@ -158,7 +158,6 @@ async def run_page_workflow(
     viewport_number = 0
     exhaustion_reason = "MAX_SCROLLS"
     pending_scroll_baseline: dict[str, object] | None = None
-    unverified_observation_cap_exceeded = False
     actionability_rejected_codes: set[str] = set()
 
     def reliability_metrics() -> dict[str, int]:
@@ -272,13 +271,6 @@ async def run_page_workflow(
             dedupe.pending.append(selected.fingerprint)
             dedupe.pending_set.add(selected.fingerprint)
 
-    def only_unverified_observations() -> bool:
-        return (
-            not dedupe.seen_this_run
-            and not unverified_observation_cap_exceeded
-            and bool(stats.observed_rows or stats.body_extracted)
-        )
-
     while True:
         remaining = max_total_posts - len(dedupe.seen_this_run)
         if remaining <= 0:
@@ -299,8 +291,6 @@ async def run_page_workflow(
         row_target_progress_ids: set[str] = set()
         emitted_verified_fingerprints: set[str] = set()
         completed_viewport_fingerprints: set[str] = set()
-        body_range_stranded = False
-        body_range_topology: tuple[str, ...] = ()
 
         async def observe_row(
             row: _HomeRowObservation,
@@ -319,7 +309,6 @@ async def run_page_workflow(
             nonlocal viewport_classified, viewport_irrelevant
             nonlocal viewport_observation_unknown, viewport_relevant
             nonlocal viewport_unverified_relevant, viewport_unknown
-            nonlocal body_range_stranded, body_range_topology
 
             diagnostic = row.diagnostic
             target = row.target
@@ -453,7 +442,7 @@ async def run_page_workflow(
                 )
             )
             if row_fingerprint is not None and evidence is not None:
-                row_range_stranded = coverage.observe_body_range(
+                coverage.observe_body_range(
                     row_fingerprint,
                     BodyRangeCoverageFacts(
                         body_complete=bool(
@@ -466,11 +455,6 @@ async def run_page_workflow(
                         unrecoverable_range_signature=evidence.unrecoverable_range_signature,
                     ),
                 )
-                body_range_stranded = bool(coverage.stranded_body_ranges)
-                if row_range_stranded:
-                    body_range_topology = evidence.missing_range_topology
-                elif not body_range_stranded:
-                    body_range_topology = ()
             stats.provenance_verified += int(coverage_outcome.identity_added)
             reader.last_scan_counts.new_verified_rows += int(coverage_outcome.body_completed)
             if coverage_outcome.body_completed and row_fingerprint is not None:
@@ -822,10 +806,6 @@ async def run_page_workflow(
             raise error from None
         state.transition(WorkflowPhase.OBSERVING)
         scan_counts = reader.last_scan_counts
-        unverified_observation_cap_exceeded = (
-            unverified_observation_cap_exceeded
-            or scan_counts.observed_rows > min(max_posts, remaining)
-        )
         if detail:
             print(
                 f"[VIEWPORT {viewport_number}] observed={scan_counts.observed_rows} "
@@ -1059,112 +1039,6 @@ async def run_page_workflow(
                     f"scan={'PARTIAL' if reader.last_viewport_can_wheel else 'NOT_COMMITTED'} "
                     f"wheel={'ALLOWED' if reader.last_viewport_can_wheel else 'BLOCKED'}"
                 )
-            if not reader.last_viewport_can_wheel and not only_unverified_observations():
-                if detail:
-                    _detail_stop("VIEWPORT_COVERAGE_INCOMPLETE")
-                return NurtureResult(
-                    status="VIEWPORT_COVERAGE_INCOMPLETE",
-                    stop_reason=exhaustion_reason,
-                    home_sampled=len(dedupe.seen_this_run),
-                    home_new=len(dedupe.new_fingerprints),
-                    home_relevant=stats.relevant,
-                    home_irrelevant=stats.irrelevant,
-                    home_unknown=stats.unknown,
-                    duplicates=stats.duplicates,
-                    detail_reads=0,
-                    scroll_attempts=reader.scroll_attempts,
-                    scrolls=reader.scrolls,
-                    checkpoint_runs=checkpoint.completed_runs,
-                    home_relevant_ratio=(
-                        None
-                        if not dedupe.seen_this_run
-                        else stats.relevant / len(dedupe.seen_this_run)
-                    ),
-                    skipped_unverified=reader.skipped_unverified,
-                    observed_rows=stats.observed_rows,
-                    body_extracted=stats.body_extracted,
-                    provenance_verified=stats.provenance_verified,
-                    classified=stats.classified,
-                    observation_unknown=stats.observation_unknown,
-                    unverified_relevant=stats.unverified_relevant,
-                    skipped_rows=stats.skipped_rows,
-                    viewport_coverage_complete=False,
-                    **reliability_metrics(),
-                )
-        if (
-            (
-                coverage.read_in_progress
-                or coverage.unresolved_observations
-                or coverage.unrepresented_gaps
-                or body_range_stranded
-            )
-            and (body_range_stranded or not (stats.unverified_relevant and not stats.found_relevant))
-            and (body_range_stranded or not only_unverified_observations())
-        ):
-            if body_range_stranded:
-                exhaustion_reason = "BODY_RANGE_STRANDED"
-                print(
-                    "COVERAGE_STOP reason=BODY_RANGE_STRANDED "
-                    f"unresolved_gaps={coverage.unresolved_gap_count} "
-                    f"topology={','.join(body_range_topology) or 'UNKNOWN'}",
-                    flush=True,
-                )
-            elif reader.scroll_attempts < max_scrolls and await advance_feed():
-                continue
-            elif reader.scroll_attempts >= max_scrolls:
-                exhaustion_reason = "SCROLL_BUDGET_EXHAUSTED_WITH_GAP"
-                print(
-                    "COVERAGE_STOP reason=SCROLL_BUDGET_EXHAUSTED_WITH_GAP "
-                    f"unresolved_gaps={coverage.unresolved_gap_count}",
-                    flush=True,
-                )
-            if detail:
-                _detail_stop(
-                    "BODY_RANGE_STRANDED"
-                    if body_range_stranded
-                    else "VIEWPORT_COVERAGE_INCOMPLETE"
-                )
-            return NurtureResult(
-                status="VIEWPORT_COVERAGE_INCOMPLETE",
-                stop_reason=exhaustion_reason,
-                home_sampled=len(dedupe.seen_this_run),
-                home_new=len(dedupe.new_fingerprints),
-                home_relevant=stats.relevant,
-                home_irrelevant=stats.irrelevant,
-                home_unknown=stats.unknown,
-                duplicates=stats.duplicates,
-                detail_reads=0,
-                scroll_attempts=reader.scroll_attempts,
-                scrolls=reader.scrolls,
-                checkpoint_runs=checkpoint.completed_runs,
-                home_relevant_ratio=(
-                    None if not dedupe.seen_this_run else stats.relevant / len(dedupe.seen_this_run)
-                ),
-                skipped_unverified=reader.skipped_unverified,
-                observed_rows=stats.observed_rows,
-                body_extracted=stats.body_extracted,
-                provenance_verified=stats.provenance_verified,
-                classified=stats.classified,
-                observation_unknown=stats.observation_unknown,
-                unverified_relevant=stats.unverified_relevant,
-                skipped_rows=stats.skipped_rows,
-                viewport_coverage_complete=False,
-                **reliability_metrics(),
-            )
-        if not stats.viewport_coverage_complete:
-            can_continue_observing = bool(
-                scan_counts.coverage_complete
-                or reader.last_viewport_can_wheel
-                or reader.last_viewport_deferred_only
-            )
-            if (
-                can_continue_observing
-                and reader.scroll_attempts < max_scrolls
-                and await advance_feed()
-            ):
-                continue
-            exhaustion_reason = reader.last_scroll_stop_reason or "VIEWPORT_COVERAGE_INCOMPLETE"
-            break
         if viewport_relevant_targets:
             viewport_relevant_targets.sort(
                 key=lambda target: target.fingerprint in dedupe.previously_seen
@@ -1209,11 +1083,7 @@ async def run_page_workflow(
                 await select_verified_fallback(viewport_fallback_targets)
             break
         if reader.scroll_attempts >= max_scrolls:
-            exhaustion_reason = (
-                "SCROLL_BUDGET_EXHAUSTED_WITH_GAP"
-                if coverage.has_unresolved_gaps
-                else "MAX_SCROLLS"
-            )
+            exhaustion_reason = "MAX_SCROLLS"
             await select_verified_fallback(viewport_fallback_targets)
             break
         if not await advance_feed():
@@ -1222,56 +1092,7 @@ async def run_page_workflow(
                 await select_verified_fallback(viewport_fallback_targets)
             break
 
-    if exhaustion_reason == "SCROLL_BUDGET_EXHAUSTED_WITH_GAP":
-        print(
-            "COVERAGE_STOP reason=SCROLL_BUDGET_EXHAUSTED_WITH_GAP "
-            f"unresolved_gaps={coverage.unresolved_gap_count}",
-            flush=True,
-        )
-
     detail_reads = 0
-    unverified_relevance_only = bool(
-        selected is None
-        and stats.unverified_relevant
-        and not stats.found_relevant
-        and reader.skipped_unverified == 0
-        and stats.unsettled_unverified_relevance == 0
-        and not coverage.hydration_pending
-    )
-    if (
-        not stats.viewport_coverage_complete or coverage.has_unresolved_gaps
-    ) and not unverified_relevance_only and not only_unverified_observations():
-        if detail:
-            _detail_stop("VIEWPORT_COVERAGE_INCOMPLETE")
-        else:
-            print("CHECKPOINT status=NOT_SAVED reason=VIEWPORT_COVERAGE_INCOMPLETE")
-        return NurtureResult(
-            status="VIEWPORT_COVERAGE_INCOMPLETE",
-            stop_reason=exhaustion_reason,
-            home_sampled=len(dedupe.seen_this_run),
-            home_new=len(dedupe.new_fingerprints),
-            home_relevant=stats.relevant,
-            home_irrelevant=stats.irrelevant,
-            home_unknown=stats.unknown,
-            duplicates=stats.duplicates,
-            detail_reads=0,
-            scroll_attempts=reader.scroll_attempts,
-            scrolls=reader.scrolls,
-            checkpoint_runs=checkpoint.completed_runs,
-            home_relevant_ratio=None
-            if not dedupe.seen_this_run
-            else stats.relevant / len(dedupe.seen_this_run),
-            skipped_unverified=reader.skipped_unverified,
-            observed_rows=stats.observed_rows,
-            body_extracted=stats.body_extracted,
-            provenance_verified=stats.provenance_verified,
-            classified=stats.classified,
-            observation_unknown=stats.observation_unknown,
-            unverified_relevant=stats.unverified_relevant,
-            skipped_rows=stats.skipped_rows,
-            viewport_coverage_complete=False,
-            **reliability_metrics(),
-        )
     if selected is None and not stats.found_relevant:
         if exhaustion_reason in {"FEED_END_REACHED", "FEED_NOT_SCROLLABLE"}:
             print(f"SEARCH_STOP reason={exhaustion_reason} viewports={viewport_number}")
@@ -1370,7 +1191,12 @@ async def run_page_workflow(
         dedupe.pending.remove(selected.fingerprint)
         dedupe.pending_set.remove(selected.fingerprint)
         status = "COMPLETE"
-    elif selected is None and stats.unverified_relevant and not stats.found_relevant:
+    elif (
+        selected is None
+        and stats.unverified_relevant
+        and not stats.found_relevant
+        and not coverage.has_skips
+    ):
         print("SEARCH_INCOMPLETE reason=UNVERIFIED_RELEVANCE")
         if detail:
             _detail_stop("UNVERIFIED_RELEVANCE_REQUIRES_VERIFICATION")
@@ -1433,7 +1259,7 @@ async def run_page_workflow(
             viewport_coverage_complete=stats.viewport_coverage_complete,
             **reliability_metrics(),
         )
-    elif len(dedupe.seen_this_run) == 0:
+    elif len(dedupe.seen_this_run) == 0 and not coverage.has_skips:
         if show_post_text and stats.previewed_bodies == 0:
             print(
                 "POST_TEXT status=NONE "
@@ -1540,6 +1366,9 @@ async def run_page_workflow(
         status = "VERIFIED_IRRELEVANT"
     else:
         status = "NO_RELEVANT_POST_IN_BUDGET"
+
+    if coverage.has_skips:
+        status = "COMPLETE_WITH_SKIPS"
 
     if len(dedupe.pending) > _MAX_SEEN:
         raise BrowserDataError("STATE_INVALID")

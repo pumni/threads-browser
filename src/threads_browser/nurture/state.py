@@ -120,6 +120,7 @@ class CoverageLedger:
     read_in_progress: set[str] = field(default_factory=set)
     unique_deferred: set[str] = field(default_factory=set)
     unresolved_observations: set[str] = field(default_factory=set)
+    skipped_partial: set[str] = field(default_factory=set)
     unrepresented_gaps: set[str] = field(default_factory=set)
     hydration_pending: set[str] = field(default_factory=set)
     observed_body_identities: set[str] = field(default_factory=set)
@@ -152,16 +153,22 @@ class CoverageLedger:
                 self.read_in_progress.discard(fingerprint)
             if next_state.body_complete:
                 self.fully_read.add(fingerprint)
+                self.skipped_partial.discard(fingerprint)
                 self.stranded_body_ranges.discard(fingerprint)
                 self.body_range_signatures.pop(fingerprint, None)
+            elif next_state.read_in_progress:
+                self.skipped_partial.add(fingerprint)
 
         if observation_id is not None:
             if next_state.unresolved_observation:
                 self.unresolved_observations.add(observation_id)
+                self.skipped_partial.add(observation_id)
             else:
                 self.unresolved_observations.discard(observation_id)
+                self.skipped_partial.discard(observation_id)
         elif next_state.unresolved_observation:
             self.unrepresented_gaps.add(facts.gap_id)
+            self.skipped_partial.add(facts.gap_id)
 
         hydration_id = observation_id or facts.gap_id
         if outcome.hydration_pending is True:
@@ -203,6 +210,10 @@ class CoverageLedger:
     @property
     def has_unresolved_gaps(self) -> bool:
         return bool(self.unresolved_gap_count)
+
+    @property
+    def has_skips(self) -> bool:
+        return bool(self.skipped_partial or self.unrepresented_gaps)
 
     def reliability_metrics(
         self,
