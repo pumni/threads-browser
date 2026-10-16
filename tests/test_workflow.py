@@ -3161,6 +3161,8 @@ def test_overlapping_scan_completes_coverage_before_detail_and_checkpoint(
         "--headed",
         "--max-posts",
         "4",
+        "--max-scrolls",
+        "12",
         "--term",
         "hiring",
         "--term",
@@ -4236,6 +4238,130 @@ article p {{ width: 400px; margin: 0; font: 16px/24px monospace; overflow-wrap: 
         assert ledger.unresolved_gap_count == 0
 
     _run_offline_page(feed_html, exercise)
+
+
+def test_max_scrolls_12_recovers_body_after_next_scroll_and_checkpoints(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    detail_url = "https://www.threads.com/@candidate/post/recover-after-scroll"
+    body = "Synthetic hiring fixture fragment. " * 10
+    feed_html = f"""<!doctype html><html><head><meta charset="utf-8"><style>
+html, body {{ margin: 0; }}
+nav {{ height: 36px; }}
+article {{ position: relative; height: 1100px; margin: 0; }}
+article .identity {{ position: absolute; top: 300px; left: 0; }}
+article p {{ position: absolute; top: 600px; left: 0; width: 400px;
+  margin: 0; font: 16px/24px monospace; overflow-wrap: anywhere; }}
+</style></head><body><nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main><article><div class="identity">
+<a href="/@candidate/post/recover-after-scroll"><time>now</time></a>
+<a href="/@candidate">candidate</a></div><p>{body}</p></article></main></body></html>"""
+    detail_html = f"""<!doctype html><html><body><main><article>
+<a href="/@candidate/post/recover-after-scroll"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>{body}</p></article></main></body></html>"""
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(tmp_path / "data").add("offline", actor, profile)
+    store = CheckpointStore(tmp_path / "data")
+
+    async def exercise(page) -> None:
+        await page.route(
+            detail_url,
+            lambda route: route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=detail_html,
+            ),
+        )
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=1,
+            max_scrolls=12,
+            terms=("hiring",),
+        )
+        assert result.status == "COMPLETE"
+        assert result.home_sampled == 1
+        assert result.home_relevant == 1
+        assert result.detail_reads == 1
+        assert result.scroll_attempts == result.scrolls == 1
+        assert result.viewport_coverage_complete
+
+    _run_offline_page(feed_html, exercise)
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.home_sampled == 1
+    assert checkpoint.detail_reads == 1
+    assert checkpoint.pending_read_fingerprints == ()
+    output = capsys.readouterr().out
+    assert "COVERAGE_STOP reason=SCROLL_BUDGET_EXHAUSTED_WITH_GAP" not in output
+    assert body not in output
+
+
+def test_max_scrolls_12_stops_safely_with_new_incomplete_post(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    body = "Hiring synthetic backend engineer fixture. " * 900
+    earlier_posts = "".join(
+        f'''<article><a href="/@candidate/post/earlier-{index}"><time>{index}h</time></a>
+<a href="/@candidate">candidate</a><p>A synthetic weather update.</p></article>'''
+        for index in range(10)
+    )
+    feed_html = f"""<!doctype html><html><head><meta charset="utf-8"><style>
+html, body {{ margin: 0; }}
+nav {{ height: 36px; }}
+article {{ box-sizing: border-box; height: 400px; margin: 0; }}
+article.long {{ height: auto; width: 320px; }}
+article.long p {{ margin: 0; font: 16px/24px monospace; overflow-wrap: anywhere; }}
+</style></head><body><nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main>{earlier_posts}<article class="long">
+<a href="/@candidate/post/new-long"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>{body}</p></article></main></body></html>"""
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(tmp_path / "data").add("offline", actor, profile)
+    store = CheckpointStore(tmp_path / "data")
+
+    async def exercise(page) -> None:
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=3,
+            max_scrolls=12,
+            terms=("hiring",),
+        )
+        assert result.status == "VIEWPORT_COVERAGE_INCOMPLETE"
+        assert result.stop_reason == "SCROLL_BUDGET_EXHAUSTED_WITH_GAP"
+        assert result.scroll_attempts == result.scrolls == 12
+        assert result.home_sampled <= 10
+        assert result.detail_reads == 0
+        assert result.checkpoint_runs == 0
+        assert not result.viewport_coverage_complete
+
+    _run_offline_page(feed_html, exercise)
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert checkpoint.completed_runs == 0
+    assert checkpoint.home_sampled == 0
+    assert checkpoint.detail_reads == 0
+    output = capsys.readouterr().out
+    assert "COVERAGE_STOP reason=SCROLL_BUDGET_EXHAUSTED_WITH_GAP" in output
+    assert body not in output
 
 
 def test_body_text_changing_during_the_home_read_stays_unverified() -> None:

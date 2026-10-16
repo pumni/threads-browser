@@ -643,12 +643,12 @@ def test_one_time_run_terms_override_without_changing_saved_terms(
 
     TermsStore(root).set("local1", ("saved term",))
     assert main(
-        ["run", "local1", "--term", "remote", "-t", "engineer", "--max-scrolls", "3"]
+        ["run", "local1", "--term", "remote", "-t", "engineer", "--max-scrolls", "12"]
     ) == 0
     capsys.readouterr()
     assert calls["terms"] == ("remote", "engineer")
     assert calls["max_posts"] == 20
-    assert calls["max_scrolls"] == 3
+    assert calls["max_scrolls"] == 12
     assert calls["max_total_posts"] == 40
     assert TermsStore(root).get("local1") == ("saved term",)
 
