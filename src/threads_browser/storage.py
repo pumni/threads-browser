@@ -642,6 +642,11 @@ class CheckpointStore:
     def __init__(self, data_root: Path) -> None:
         self._data_root = data_root
 
+    @property
+    def data_root(self) -> Path:
+        """Data root shared by this checkpoint store and its profile locks."""
+        return self._data_root
+
     def load(self, account_id: UUID, policy_fingerprint: str) -> Checkpoint:
         if _SHA256.fullmatch(policy_fingerprint) is None:
             raise BrowserDataError("STATE_INVALID")
