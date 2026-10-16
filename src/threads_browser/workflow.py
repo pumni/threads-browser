@@ -127,6 +127,8 @@ async def run_browser_nurture(
     if detail and not _detail_terminal_ready():
         raise UiReadError("DETAIL_TTY_REQUIRED")
     ensure_safe_browser_profile(account.profile_directory)
+    lock = checkpoint_store.profile_lock(account)
+    lock.acquire()
     try:
         async with async_playwright() as playwright:
             try:
@@ -199,3 +201,5 @@ async def run_browser_nurture(
             context_closed=None,
         )
         raise UiReadError("INTERNAL_OPERATION_ERROR") from None
+    finally:
+        lock.release()
