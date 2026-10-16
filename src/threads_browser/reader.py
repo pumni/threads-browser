@@ -26,12 +26,16 @@ from playwright.async_api import (
 )
 
 from .browser_ui.body_text import (
-    _MAX_BODY_CODEPOINTS,
+    _MAX_BODY_CODEPOINTS,  # noqa: F401 - retained reader-module compatibility name
     BodyTextReader,
     _body_progress_state,
-    _canonicalize_body,
-    _canonicalize_body_block,
+    _canonicalize_body,  # noqa: F401 - retained reader-module compatibility name
+    _canonicalize_body_block,  # noqa: F401 - retained reader-module compatibility name
     _VisibleBodyRead,
+)
+from .browser_ui.card_provenance import (
+    CardProvenanceReader,
+    _CardDeferredOffscreen,
 )
 from .browser_ui.detail import DetailNavigator
 from .browser_ui.feed_rows import (
@@ -39,7 +43,7 @@ from .browser_ui.feed_rows import (
     _BODY_TEXT_SELECTOR,
     _FEED_ROOT_SELECTOR,
     _MAX_CARD_ANCESTORS,
-    _MAX_CARD_LINKS,
+    _MAX_CARD_LINKS,  # noqa: F401 - retained reader-module compatibility name
     _MAX_STRUCTURE_ELEMENTS,
     _QUOTE_SELECTOR,
     FeedRowScanner,
@@ -88,7 +92,7 @@ from .feed.urls import (
     _post_url_rejection_reason,
     _post_url_structure,
     _profile_author,
-    _rejected_post_link_blocks_candidate,
+    _rejected_post_link_blocks_candidate,  # noqa: F401 - retained reader-module compatibility name
     _same_home_origin,
 )
 
@@ -126,13 +130,6 @@ _PROFILE_NAME = re.compile(r"^(?:profile|your profile|account)$", re.IGNORECASE)
 _MORE_NAME = re.compile(r"^(?:more|see more|read more)$", re.IGNORECASE)
 _ReadinessResult = TypeVar("_ReadinessResult")
 
-
-@dataclass(frozen=True, slots=True)
-class _CardDeferredOffscreen(Exception):
-    def __init__(self, fingerprint: str, reason: str) -> None:
-        self.fingerprint = fingerprint
-        self.reason = reason
-        super().__init__()
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,6 +237,11 @@ class ThreadsHomeReader:
         self.feed_duplicates = 0
         self.last_scan_counts = _FeedScanCounts()
         self._feed_rows = FeedRowScanner(page)
+        self._card_provenance = CardProvenanceReader(
+            self._feed_rows,
+            self._body_text,
+            self._loading_observer,
+        )
         self.last_candidate_diagnostics: tuple[_CandidateDiagnostic, ...] = ()
         self.last_display_observations: tuple[DisplayObservation, ...] = ()
         self.last_scan_timings = _FeedScanTimings()
@@ -263,7 +265,6 @@ class ThreadsHomeReader:
         self._last_viewport_candidate_identities: tuple[_TrackedRowIdentity, ...] = ()
         self._carried_viewport_candidate_identities: tuple[_TrackedRowIdentity, ...] = ()
         self._pending_viewport_candidate_identities: tuple[_TrackedRowIdentity, ...] = ()
-        self._cached_home_bodies: dict[str, tuple[str, bool]] = {}
         self._detail_return_anchor: str | None = None
         self._detail_return_target: PostTarget | None = None
         self._home_session = HomeSession(
@@ -276,6 +277,14 @@ class ThreadsHomeReader:
         self._reported_render_rescans: set[tuple[str, float | None]] = set()
         self._skipped_candidate_identities: set[str] = set()
         self._reported_candidate_skips: dict[tuple[str, str], set[str]] = {}
+
+    @property
+    def _cached_home_bodies(self) -> dict[str, tuple[str, bool]]:
+        return self._card_provenance.cached_home_bodies
+
+    @_cached_home_bodies.setter
+    def _cached_home_bodies(self, value: dict[str, tuple[str, bool]]) -> None:
+        self._card_provenance.cached_home_bodies = value
 
     def _mark_ui_transition(self) -> None:
         self._last_ui_transition_at = time.monotonic()
@@ -2248,10 +2257,7 @@ class ThreadsHomeReader:
         return identities[matched_index]
 
     async def _same_dom_element(self, root: Locator, handle: JSHandle) -> bool:
-        try:
-            return bool(await root.evaluate("(node, expected) => node === expected", handle))
-        except PlaywrightError:
-            return False
+        return await self._card_provenance._same_dom_element(root, handle)
 
     async def _discard_pending_viewport_candidates(self) -> None:
         retained = {id(identity.dom_handle) for identity in self._last_viewport_candidate_identities}
@@ -3960,236 +3966,20 @@ class ThreadsHomeReader:
         cached_body_fingerprints: set[str] | None,
         allow_hydration_retry: bool = True,
     ) -> tuple[PostTarget, bool]:
-        """Recover only when one visible timestamp permalink maps to one inner row."""
-        if (
-            not await root.is_visible()
-            or not await self._is_in_visible_scrollports(root)
-            or not await self._same_dom_element(root, root_handle)
-        ):
-            raise _CardNotReady(root, reason_code="POST_ROOT_DOM_IDENTITY_CHANGED")
-
-        links = root.locator("a")
-        link_count = await links.count()
-        if link_count > _MAX_CARD_LINKS:
-            raise _UnverifiedFeedCandidate(
-                "POST_PROVENANCE_UNVERIFIED",
-                "CANDIDATE_AMBIGUOUS",
-                (),
-                diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
-            )
-        timestamp_candidates: list[tuple[str, str, Locator, JSHandle]] = []
-        rejected_post_links: list[tuple[str, bool, str]] = []
-        hydration_signals: list[_CardWaitSignal] = []
-        try:
-            for index in range(link_count):
-                link = links.nth(index)
-                if not await self._belongs_to_card(link, root, root_handle):
-                    continue
-                if await self._is_outside_content_landmark(link) or not await link.is_visible():
-                    continue
-                if not await self._is_in_visible_scrollports(link):
-                    continue
-                href = await link.get_attribute("href")
-                if href is None or not _post_url_hint(href):
-                    continue
-                times = link.locator("time")
-                has_timestamp = await times.count() > 0
-                visible_timestamp = any(
-                    [await times.nth(time_index).is_visible() for time_index in range(await times.count())]
-                )
-                parsed = _post_url(href)
-                if parsed is None:
-                    rejected_post_links.append(
-                        (href, has_timestamp, _post_url_rejection_reason(href))
-                    )
-                    if not hydration_signals:
-                        hydration_signals.append(_CardWaitSignal(link, "retry"))
-                    continue
-                if visible_timestamp:
-                    handle = await link.element_handle()
-                    if handle is not None:
-                        timestamp_candidates.append((parsed[0], parsed[1], link, handle))
-                else:
-                    hydration_signals.append(_CardWaitSignal(link, "retry"))
-
-            blocking_invalid = next(
-                (
-                    item
-                    for item in rejected_post_links
-                    if _rejected_post_link_blocks_candidate(
-                        timestamp_link=item[1], reason=item[2]
-                    )
-                ),
-                None,
-            )
-            if blocking_invalid is not None:
-                _, _, reason = blocking_invalid
-                raise _UnverifiedFeedCandidate(
-                    "POST_PROVENANCE_UNVERIFIED",
-                    "CANDIDATE_NONCANONICAL",
-                    (),
-                    diagnostic_reason=reason,
-                )
-            if len(timestamp_candidates) > 1:
-                raise _UnverifiedFeedCandidate(
-                    "POST_PROVENANCE_UNVERIFIED",
-                    "CANDIDATE_AMBIGUOUS",
-                    (),
-                    diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
-                )
-            if not timestamp_candidates:
-                if not hydration_signals:
-                    raise _UnverifiedFeedCandidate(
-                        "POST_PROVENANCE_UNVERIFIED",
-                        "CANDIDATE_AMBIGUOUS",
-                        (),
-                        diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
-                    )
-                if allow_hydration_retry:
-                    await self._wait_for_verified_feed(
-                        self._readiness_deadline(_READINESS_TIMEOUT_MS),
-                        timeout_code="HOME_UI_UNVERIFIED",
-                    )
-                    changed = await self._wait_for_pending_card(
-                        _CardNotReady(signals=tuple(hydration_signals)),
-                        self._readiness_deadline(_CARD_HYDRATION_WAIT_MS),
-                        max_wait_ms=_CARD_HYDRATION_WAIT_MS,
-                    )
-                    if changed:
-                        if not await self._same_dom_element(root, root_handle):
-                            raise _CardNotReady(
-                                root,
-                                reason_code="POST_ROOT_DOM_IDENTITY_CHANGED",
-                            )
-                        return await self._recover_ambiguous_visible_card(
-                            root,
-                            root_handle,
-                            viewport_y=viewport_y,
-                            cached_body_fingerprints=cached_body_fingerprints,
-                            allow_hydration_retry=False,
-                        )
-                raise _UnverifiedFeedCandidate(
-                    "POST_PROVENANCE_UNVERIFIED",
-                    "CANDIDATE_AMBIGUOUS",
-                    (),
-                    diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
-                )
-
-            expected_url, expected_author, permalink, permalink_handle = timestamp_candidates[0]
-            pending_signals: list[_CardWaitSignal] = []
-            ancestor = permalink.locator("xpath=..")
-            for _ in range(_MAX_CARD_ANCESTORS):
-                if not await self._same_dom_element(root, root_handle):
-                    raise _CardNotReady(root, reason_code="POST_ROOT_DOM_IDENTITY_CHANGED")
-                if await ancestor.count() == 0:
-                    break
-                candidate_handle = await ancestor.element_handle()
-                if candidate_handle is None:
-                    break
-                try:
-                    contained = bool(
-                        await root_handle.evaluate(
-                            "(outer, node) => outer === node || outer.contains(node)",
-                            candidate_handle,
-                        )
-                    )
-                    is_outer = bool(
-                        await root_handle.evaluate(
-                            "(outer, node) => outer === node",
-                            candidate_handle,
-                        )
-                    )
-                    if not contained or is_outer:
-                        break
-                    semantic = bool(
-                        await candidate_handle.evaluate(
-                            "node => node.matches('article, [role=\"article\"], "
-                            "[data-pressable-container=\"true\"]')"
-                        )
-                    )
-                    if await ancestor.is_visible() and await self._is_in_visible_scrollports(ancestor):
-                        try:
-                            target, body_stable = await self._read_stable_visible_card(
-                                ancestor,
-                                viewport_y=viewport_y,
-                                cached_body_fingerprints=cached_body_fingerprints,
-                                expected_root_handle=candidate_handle,
-                                isolated_scope=not semantic,
-                            )
-                        except _CardNotReady as pending:
-                            if pending.reason_code == "POST_ROOT_DOM_IDENTITY_CHANGED":
-                                raise _CardNotReady(
-                                    root,
-                                    reason_code="POST_ROOT_DOM_IDENTITY_CHANGED",
-                                ) from None
-                            pending_signals.extend(pending.signals)
-                        except (_CardDeferredOffscreen, _UnverifiedFeedCandidate):
-                            pass
-                        else:
-                            same_permalink = bool(
-                                await candidate_handle.evaluate(
-                                    "(candidate, expected) => candidate.contains(expected)",
-                                    permalink_handle,
-                                )
-                            )
-                            if (
-                                same_permalink
-                                and target.url == expected_url
-                                and target.author == expected_author
-                                and target.currently_visible
-                                and await self._same_dom_element(root, root_handle)
-                            ):
-                                return target, body_stable
-                finally:
-                    await candidate_handle.dispose()
-                ancestor = ancestor.locator("xpath=..")
-
-            if allow_hydration_retry:
-                pending_signals.append(_CardWaitSignal(permalink, "retry"))
-                visible_signals_list: list[_CardWaitSignal] = []
-                for signal in pending_signals:
-                    if await self._is_in_visible_scrollports(signal.locator):
-                        visible_signals_list.append(signal)
-                visible_signals = tuple(visible_signals_list)
-                if visible_signals:
-                    await self._wait_for_verified_feed(
-                        self._readiness_deadline(_READINESS_TIMEOUT_MS),
-                        timeout_code="HOME_UI_UNVERIFIED",
-                    )
-                    changed = await self._wait_for_pending_card(
-                        _CardNotReady(signals=visible_signals),
-                        self._readiness_deadline(_CARD_HYDRATION_WAIT_MS),
-                        max_wait_ms=_CARD_HYDRATION_WAIT_MS,
-                    )
-                    if changed:
-                        if not await self._same_dom_element(root, root_handle):
-                            raise _CardNotReady(
-                                root,
-                                reason_code="POST_ROOT_DOM_IDENTITY_CHANGED",
-                            )
-                        if not await permalink_handle.evaluate(
-                            "node => node.isConnected"
-                        ):
-                            raise _CardNotReady(
-                                root,
-                                reason_code="POST_ROOT_DOM_IDENTITY_CHANGED",
-                            )
-                        return await self._recover_ambiguous_visible_card(
-                            root,
-                            root_handle,
-                            viewport_y=viewport_y,
-                            cached_body_fingerprints=cached_body_fingerprints,
-                            allow_hydration_retry=False,
-                        )
-            raise _UnverifiedFeedCandidate(
-                "POST_PROVENANCE_UNVERIFIED",
-                "CANDIDATE_AMBIGUOUS",
-                (expected_url,),
-                diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
-            )
-        finally:
-            for _, _, _, handle in timestamp_candidates:
-                await handle.dispose()
+        """Compatibility delegate to bounded card provenance recovery."""
+        return await self._card_provenance.recover_ambiguous_visible_card(
+            root,
+            root_handle,
+            viewport_y=viewport_y,
+            cached_body_fingerprints=cached_body_fingerprints,
+            allow_hydration_retry=allow_hydration_retry,
+            read_stable_card=self._read_stable_visible_card,
+            wait_for_verified_feed=self._wait_for_verified_feed,
+            readiness_deadline=self._readiness_deadline,
+            wait_for_pending_card=self._wait_for_pending_card,
+            readiness_timeout_ms=_READINESS_TIMEOUT_MS,
+            card_hydration_wait_ms=_CARD_HYDRATION_WAIT_MS,
+        )
 
     async def _visible_permalink_targets(
         self,
@@ -4515,108 +4305,12 @@ class ThreadsHomeReader:
         require_body: bool,
         isolated_scope: bool = False,
     ) -> tuple[str | None, bool, bool, tuple[_CardWaitSignal, ...]]:
-        buttons = root.get_by_role("button", name=_MORE_NAME)
-        body_truncated = False
-        for index in range(min(await buttons.count(), _MAX_CARD_LINKS)):
-            button = buttons.nth(index)
-            if await self._belongs_to_card(
-                button,
-                root,
-                root_handle,
-                isolated_scope=isolated_scope,
-            ) and await button.is_visible():
-                body_truncated = True
-                break
-
-        candidates = root.locator(_BODY_TEXT_SELECTOR)
-        bodies: list[str] = []
-        empty_candidates: list[Locator] = []
-        count = min(await candidates.count(), _MAX_STRUCTURE_ELEMENTS)
-        for index in range(count):
-            candidate = candidates.nth(index)
-            if not await self._safe_body_candidate(
-                candidate,
-                root,
-                root_handle,
-                isolated_scope=isolated_scope,
-            ):
-                continue
-            if not await candidate.is_visible():
-                continue
-            if await candidate.evaluate(
-                "node => node.tagName !== 'P' && Boolean(node.querySelector('p'))"
-            ):
-                continue
-            has_body_candidate_ancestor = await candidate.evaluate(
-                """(node, args) => {
-                    let current = node.parentElement;
-                    while (current && current !== args.root) {
-                        if (
-                            current.matches(args.body)
-                            && !current.querySelector(args.excluded)
-                            && !current.querySelector(args.roots)
-                        ) return true;
-                        current = current.parentElement;
-                    }
-                    return current !== args.root;
-                }""",
-                {
-                    "root": root_handle,
-                    "body": _BODY_TEXT_SELECTOR,
-                    "excluded": _BODY_EXCLUSION_SELECTOR,
-                    "roots": _FEED_ROOT_SELECTOR,
-                },
-            )
-            if has_body_candidate_ancestor:
-                continue
-            text = _canonicalize_body_block(await candidate.inner_text())
-            if not text:
-                empty_candidates.append(candidate)
-                continue
-            bodies.append(text)
-
-        if not bodies:
-            if require_body:
-                empty_signals = tuple(
-                    _CardWaitSignal(
-                        candidate,
-                        "nonempty_text",
-                        "DETAIL_BODY_UNVERIFIED",
-                    )
-                    for candidate in empty_candidates
-                )
-                if empty_signals:
-                    raise _CardNotReady(
-                        signals=empty_signals,
-                        timeout_code="DETAIL_BODY_UNVERIFIED",
-                        reason_code="POST_BODY_PENDING",
-                    )
-                raise _CardNotReady(
-                    candidates.first,
-                    nonempty_text=True,
-                    timeout_code="DETAIL_BODY_UNVERIFIED",
-                    reason_code="POST_BODY_PENDING",
-                )
-            return (
-                None,
-                False,
-                body_truncated,
-                tuple(
-                    _CardWaitSignal(candidate, "nonempty_text") for candidate in empty_candidates
-                ),
-            )
-        body = _canonicalize_body("\n".join(bodies))
-        if len(body) > _MAX_BODY_CODEPOINTS:
-            if require_body:
-                raise _CardNotReady(
-                    candidates.first,
-                    nonempty_text=True,
-                    timeout_code="DETAIL_BODY_UNVERIFIED",
-                )
-            return None, True, body_truncated, ()
-        if body.rstrip().endswith(("…", "...")):
-            body_truncated = True
-        return body, True, body_truncated, ()
+        return await self._card_provenance.extract_card_body(
+            root,
+            root_handle,
+            require_body=require_body,
+            isolated_scope=isolated_scope,
+        )
 
     async def _observe_display_body(
         self,
@@ -4679,246 +4373,26 @@ class ThreadsHomeReader:
         expected_root_handle: JSHandle | None = None,
         isolated_scope: bool = False,
     ) -> PostTarget:
-        if self._scan_stage is not None:
-            self._set_scan_operation("READ_CARD")
-        if not await root.is_visible():
-            raise _CardNotReady(root)
-        root_handle = await root.element_handle()
-        if root_handle is None:
-            raise _CardNotReady(root)
-        if expected_root_handle is not None and not await self._same_dom_element(
-            root, expected_root_handle
-        ):
-            await root_handle.dispose()
-            raise _CardNotReady(root, reason_code="POST_ROOT_DOM_IDENTITY_CHANGED")
-        post_links: list[tuple[str, str, Locator, bool]] = []
-        rejected_post_links: list[tuple[str, bool, str]] = []
-        authors: set[str] = set()
-        links = root.locator("a")
-        link_count = await links.count()
-        if link_count > _MAX_CARD_LINKS:
-            raise _UnverifiedFeedCandidate(
-                "POST_PROVENANCE_UNVERIFIED",
-                "CANDIDATE_AMBIGUOUS",
-                (),
-                diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
-            )
-        for index in range(link_count):
-            link = links.nth(index)
-            if not await self._belongs_to_card(
-                link,
-                root,
-                root_handle,
-                isolated_scope=isolated_scope,
-            ):
-                continue
-            if await self._is_outside_content_landmark(link) or not await link.is_visible():
-                continue
-            href = await link.get_attribute("href")
-            if href is None:
-                continue
-            timestamp_link = await link.locator("time").count() > 0
-            parsed_post = _post_url(href)
-            if parsed_post is not None:
-                post_links.append((parsed_post[0], parsed_post[1], link, timestamp_link))
-                continue
-            if _post_url_hint(href):
-                rejected_post_links.append((href, timestamp_link, _post_url_rejection_reason(href)))
-                continue
-            author = _profile_author(href)
-            if author is not None:
-                authors.add(author)
-        blocking_invalid = next(
-            (
-                item
-                for item in rejected_post_links
-                if _rejected_post_link_blocks_candidate(
-                    timestamp_link=item[1], reason=item[2]
-                )
-            ),
-            None,
-        )
-        if blocking_invalid is not None:
-            href, _, reason = blocking_invalid
-            raise _UnverifiedFeedCandidate(
-                "POST_PROVENANCE_UNVERIFIED",
-                "CANDIDATE_NONCANONICAL",
-                (href,),
-                diagnostic_reason=reason,
-            )
-        unique_urls = {item[0] for item in post_links}
-        unique_permalink_links = {(item[0], item[1]) for item in post_links}
-        if len(unique_urls) > 1 or len(unique_permalink_links) > 1 or len(authors) > 1:
-            raise _UnverifiedFeedCandidate(
-                "POST_PROVENANCE_UNVERIFIED",
-                "CANDIDATE_AMBIGUOUS",
-                tuple(unique_urls or authors),
-                diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
-            )
-        if not post_links and rejected_post_links:
-            href, _, reason = rejected_post_links[0]
-            raise _UnverifiedFeedCandidate(
-                "POST_PROVENANCE_UNVERIFIED",
-                "CANDIDATE_NONCANONICAL",
-                (href,),
-                diagnostic_reason=reason,
-            )
-        if not post_links:
-            raise _CardNotReady(
-                root.locator('a[href*="/post/"]').first,
-                reason_code="POST_PERMALINK_PENDING",
-            )
-        if not authors:
-            raise _CardNotReady(
-                self._expected_profile_link_signal(root, post_links[0][1]),
-                reason_code="POST_AUTHOR_PENDING",
-            )
-        if len(unique_urls) != 1 or len(unique_permalink_links) != 1:
-            raise _UnverifiedFeedCandidate(
-                "POST_PROVENANCE_UNVERIFIED",
-                "CANDIDATE_AMBIGUOUS",
-                tuple(unique_urls),
-                diagnostic_reason="CANDIDATE_WRAPPER_AMBIGUOUS",
-            )
-        timestamp_links = [item for item in post_links if item[3]]
-        url, permalink_author, link, _ = timestamp_links[0] if timestamp_links else post_links[0]
-        author = next(iter(authors))
-        if author != permalink_author:
-            raise _UnverifiedFeedCandidate(
-                "POST_AUTHOR_UNVERIFIED",
-                "CANDIDATE_AUTHOR_CONFLICT",
-                (url,),
-                diagnostic_reason="CANDIDATE_AUTHOR_MISMATCH",
-            )
-
-        fingerprint = sha256(f"{url}\n{author}".encode()).hexdigest()
-        body_truncated = False
-        cached_body = (
-            self._cached_home_bodies.get(fingerprint)
-            if not require_body
-            and cached_body_fingerprints is not None
-            and fingerprint in cached_body_fingerprints
-            else None
-        )
-        if cached_body is not None and not currently_visible:
-            return PostTarget(
-                url,
-                author,
-                cached_body[0],
-                fingerprint,
-                link,
-                body_available=bool(cached_body[0].strip()),
-                body_truncated=cached_body[1],
-                read_evidence=BodyReadEvidence(
-                    state="NOT_SAMPLED_CACHE",
-                    body_text_nodes_present=None,
-                    render_rect_count=None,
-                    visible_text_rect_count=None,
-                    deferred_above_rect_count=None,
-                    deferred_below_rect_count=None,
-                    root_intersects=None,
-                    root_position_band="NOT_SAMPLED",
-                    scroll_surface_key="NOT_SAMPLED",
-                ),
-                viewport_y=viewport_y,
-            )
-        permalink_visible = True
-        visible_body: _VisibleBodyRead | None = None
-        if currently_visible:
-            if visible_text_progress:
-                buttons = root.get_by_role("button", name=_MORE_NAME)
-                for index in range(min(await buttons.count(), _MAX_CARD_LINKS)):
-                    button = buttons.nth(index)
-                    if await self._belongs_to_card(
-                        button,
-                        root,
-                        root_handle,
-                        isolated_scope=isolated_scope,
-                    ) and await button.is_visible():
-                        body_truncated = True
-                        break
-                if self._scan_stage is not None:
-                    self._set_scan_operation("READ_BODY")
-                visible_body = await self._read_visible_body_progress(
-                    root,
-                    root_handle,
-                    fingerprint=fingerprint,
-                    isolated_scope=isolated_scope,
-                )
-            else:
-                has_body_candidate, body_fully_visited = await self._visible_body_candidate_state(
-                    root,
-                    fingerprint=fingerprint,
-                )
-                if has_body_candidate and not body_fully_visited:
-                    raise _CardDeferredOffscreen(
-                        fingerprint,
-                        "POST_BODY_PARTIALLY_VISIBLE",
-                    )
-            permalink_visible = await self._is_in_visible_scrollports(link)
-            if not permalink_visible and not visible_text_progress and not has_body_candidate:
-                raise _CardDeferredOffscreen(
-                    fingerprint,
-                    "POST_PERMALINK_OUTSIDE_VISIBLE_SCROLLPORT",
-                )
-
-        if visible_text_progress and visible_body is not None:
-            body = visible_body.body
-            body_available = bool(body and body.strip())
-            body_complete = visible_body.complete and body_available
-            body_consistent = visible_body.consistent
-            body_segments = visible_body.segments
-            body_truncated = body_truncated or visible_body.truncated
-        else:
-            if self._scan_stage is not None:
-                self._set_scan_operation("READ_BODY")
-            body, body_available, body_truncated, body_signals = await self._extract_card_body(
-                root,
-                root_handle,
-                require_body=require_body,
-                isolated_scope=isolated_scope,
-            )
-            if not body_available and body_signals:
-                raise _CardNotReady(
-                    signals=body_signals,
-                    reason_code="POST_BODY_PENDING",
-                )
-            body_complete = body_available
-            body_consistent = True
-            body_segments = ()
-        if body and body.rstrip().endswith(("…", "...")):
-            body_truncated = True
-        if expected_root_handle is not None and not await self._same_dom_element(
-            root, expected_root_handle
-        ):
-            await root_handle.dispose()
-            raise _CardNotReady(root, reason_code="POST_ROOT_DOM_IDENTITY_CHANGED")
-        return PostTarget(
-            url,
-            author,
-            body,
-            fingerprint,
-            link,
-            body_available=body_available,
-            body_truncated=body_truncated,
-            body_complete=body_complete,
-            body_consistent=body_consistent,
-            visible_segments=body_segments,
-            read_evidence=(None if visible_body is None else visible_body.read_evidence),
-            currently_visible=(
-                currently_visible
-                and permalink_visible
-                and (visible_body is None or visible_body.read_evidence.root_intersects)
-            ),
+        return await self._card_provenance.read_card(
+            root,
+            currently_visible=currently_visible,
             viewport_y=viewport_y,
+            require_body=require_body,
+            cached_body_fingerprints=cached_body_fingerprints,
+            visible_text_progress=visible_text_progress,
+            expected_root_handle=expected_root_handle,
+            isolated_scope=isolated_scope,
+            read_visible_body_progress=self._read_visible_body_progress,
+            scan_operation=(
+                self._set_scan_operation if self._scan_stage is not None else None
+            ),
         )
 
     async def _wait_for_stable_card_dom(self, root: Locator) -> bool:
-        """Wait for a bounded quiet interval after a hydration signal."""
-        return await self._loading_observer.wait_for_card_quiet(
+        return await self._card_provenance.wait_for_stable_card_dom(
             root,
-            dwell_ms=min(_BODY_STABILITY_INTERVAL_MS, _CARD_HYDRATION_WAIT_MS),
-            timeout_ms=_CARD_HYDRATION_WAIT_MS,
+            body_stability_interval_ms=_BODY_STABILITY_INTERVAL_MS,
+            card_hydration_wait_ms=_CARD_HYDRATION_WAIT_MS,
         )
 
     async def _read_stable_visible_card(
@@ -4931,67 +4405,21 @@ class ThreadsHomeReader:
         allow_hydration_retry: bool = False,
         isolated_scope: bool = False,
     ) -> tuple[PostTarget, bool]:
-        """Require the same row identity and body across a bounded dwell."""
-        if expected_root_handle is None:
-            expected_root_handle = await root.element_handle()
-        if expected_root_handle is None:
-            raise _CardNotReady(root)
-        target = await self._read_card(
+        return await self._card_provenance.read_stable_visible_card(
             root,
-            currently_visible=True,
             viewport_y=viewport_y,
             cached_body_fingerprints=cached_body_fingerprints,
-            visible_text_progress=True,
             expected_root_handle=expected_root_handle,
+            allow_hydration_retry=allow_hydration_retry,
             isolated_scope=isolated_scope,
+            read_card=self._read_card,
+            wait_for_stable_dom=self._wait_for_stable_card_dom,
+            scan_operation=(
+                self._set_scan_operation if self._scan_stage is not None else None
+            ),
+            body_stability_interval_ms=_BODY_STABILITY_INTERVAL_MS,
+            card_hydration_wait_ms=_CARD_HYDRATION_WAIT_MS,
         )
-        for attempt in range(2):
-            # Measure stability between completed samples. DOM extraction can
-            # take longer than the interval on a busy feed, so compare actual
-            # content and retry once after hydration settles if it changed.
-            if self._scan_stage is not None:
-                self._set_scan_operation("STABILITY_CHECK")
-            await asyncio.sleep(max(1, _BODY_STABILITY_INTERVAL_MS) / 1000)
-            settled = await self._read_card(
-                root,
-                currently_visible=True,
-                viewport_y=viewport_y,
-                cached_body_fingerprints=cached_body_fingerprints,
-                visible_text_progress=True,
-                expected_root_handle=expected_root_handle,
-                isolated_scope=isolated_scope,
-            )
-            body_same = (
-                _canonicalize_body(target.body or "") == _canonicalize_body(settled.body or "")
-                and target.body_complete == settled.body_complete
-                and target.body_truncated == settled.body_truncated
-            )
-            identity_same = target.url == settled.url and target.author == settled.author
-            if body_same and identity_same and settled.body_consistent:
-                segments = tuple(
-                    {
-                        segment.segment_id: segment
-                        for segment in target.visible_segments + settled.visible_segments
-                    }.values()
-                )
-                return replace(settled, visible_segments=segments), True
-            if (
-                allow_hydration_retry
-                and attempt == 0
-                and await self._wait_for_stable_card_dom(root)
-            ):
-                target = await self._read_card(
-                    root,
-                    currently_visible=True,
-                    viewport_y=viewport_y,
-                    cached_body_fingerprints=cached_body_fingerprints,
-                    visible_text_progress=True,
-                    expected_root_handle=expected_root_handle,
-                    isolated_scope=isolated_scope,
-                )
-                continue
-            return settled, False
-        raise AssertionError("bounded card stability retry exhausted")
 
     async def _visible_body_candidate_state(
         self,
@@ -4999,7 +4427,6 @@ class ThreadsHomeReader:
         *,
         fingerprint: str | None = None,
     ) -> tuple[bool, bool]:
-        return await self._body_text._visible_body_candidate_state(
-            root,
-            fingerprint=fingerprint,
+        return await self._card_provenance.visible_body_candidate_state(
+            root, fingerprint=fingerprint
         )

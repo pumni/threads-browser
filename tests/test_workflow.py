@@ -18,7 +18,11 @@ from playwright.async_api import async_playwright as real_async_playwright
 from threads_browser import reader as reader_module
 from threads_browser import workflow
 from threads_browser.browser_ui import body_text as body_text_module
+from threads_browser.browser_ui.body_text import BodyTextReader
+from threads_browser.browser_ui.card_provenance import CardProvenanceReader
+from threads_browser.browser_ui.feed_rows import FeedRowScanner, UnverifiedFeedCandidate
 from threads_browser.browser_ui.geometry import with_scrollport_geometry
+from threads_browser.browser_ui.loading import LoadingObserver
 from threads_browser.browser_ui.scrolling import (
     MAX_WHEEL_STEP_PX,
     NativeWheelScrollEngine,
@@ -2664,6 +2668,59 @@ def test_ambiguous_pressable_row_recovers_only_its_timestamp_author_and_body() -
             "ROW_PROVENANCE_UNRESOLVED"
         )
         assert reader.last_candidate_diagnostics[0].reason == "PROVENANCE_VERIFIED"
+
+    _run_offline_page(html, exercise)
+
+
+def test_card_provenance_component_verifies_canonical_url_author_and_body() -> None:
+    html = """<!doctype html><html><body><main><article>
+<a id="permalink" href="/@candidate/post/card-proof"><time>now</time></a>
+<a id="author" href="/@candidate">candidate</a>
+<p>Hiring a backend engineer</p>
+</article></main></body></html>"""
+
+    async def exercise(page) -> None:
+        body_text = BodyTextReader(page)
+        card_reader = CardProvenanceReader(
+            FeedRowScanner(page),
+            body_text,
+            LoadingObserver(page),
+        )
+
+        async def unused_visible_body_progress(*args, **kwargs):
+            raise AssertionError("body progress is not used for an offscreen read")
+
+        root = page.locator("article")
+        target = await card_reader.read_card(
+            root,
+            read_visible_body_progress=unused_visible_body_progress,
+        )
+        assert target.url.endswith("/@candidate/post/card-proof")
+        assert target.author == "candidate"
+        assert target.body == "Hiring a backend engineer"
+
+        await page.locator("#author").evaluate(
+            "node => node.setAttribute('href', '/@different_author')"
+        )
+        with pytest.raises(UnverifiedFeedCandidate) as author_error:
+            await card_reader.read_card(
+                root,
+                read_visible_body_progress=unused_visible_body_progress,
+            )
+        assert author_error.value.reason == "CANDIDATE_AUTHOR_CONFLICT"
+
+        await page.locator("#author").evaluate(
+            "node => node.setAttribute('href', '/@candidate')"
+        )
+        await page.locator("#permalink").evaluate(
+            "node => node.setAttribute('href', '/@candidate/post/card-proof?source=bad')"
+        )
+        with pytest.raises(UnverifiedFeedCandidate) as url_error:
+            await card_reader.read_card(
+                root,
+                read_visible_body_progress=unused_visible_body_progress,
+            )
+        assert url_error.value.reason == "CANDIDATE_NONCANONICAL"
 
     _run_offline_page(html, exercise)
 
