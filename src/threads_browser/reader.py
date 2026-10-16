@@ -1081,6 +1081,7 @@ class ThreadsHomeReader:
         window = 0
         final_code = timeout_code
         dom_change_retried = False
+        detail_ui_retried = False
         failure_operation = operation or self._failure_operation
         while True:
             deadline = self._readiness_deadline(_READINESS_TIMEOUT_MS)
@@ -1099,11 +1100,25 @@ class ThreadsHomeReader:
                     raise UiReadError("BROWSER_SESSION_UNAVAILABLE") from None
                 if (
                     failure.error_class == "DOM_DETACHED"
-                    and failure_operation in {"SCAN_ROW", "SETTLE"}
+                    and failure_operation in {"SCAN_ROW", "SETTLE", "DETAIL"}
                 ):
-                    if dom_change_retried:
+                    if failure_operation == "DETAIL" and detail_ui_retried:
+                        raise UiReadError("DETAIL_ROOT_UNVERIFIED") from None
+                    if failure_operation != "DETAIL" and dom_change_retried:
                         raise UiReadError("DOM_CHANGED_DURING_SCAN") from None
-                    dom_change_retried = True
+                    if failure_operation == "DETAIL":
+                        detail_ui_retried = True
+                    else:
+                        dom_change_retried = True
+                    window += 1
+                    print(f"WAITING stage={stage} retry={window}")
+                    continue
+                if (
+                    failure_operation == "DETAIL"
+                    and not detail_ui_retried
+                    and _same_home_origin(self._page.url)
+                ):
+                    detail_ui_retried = True
                     window += 1
                     print(f"WAITING stage={stage} retry={window}")
                     continue
@@ -4253,6 +4268,21 @@ class ThreadsHomeReader:
             fingerprint=fingerprint,
             scan_counts=self.last_scan_counts,
             isolated_scope=isolated_scope,
+        )
+
+    async def _read_detail_body(
+        self,
+        root: Locator,
+        fingerprint: str,
+    ) -> _VisibleBodyRead:
+        root_handle = await root.element_handle()
+        if root_handle is None:
+            raise _CardNotReady(root, reason_code="POST_ROOT_DOM_IDENTITY_CHANGED")
+        detail_fingerprint = sha256(f"detail:{fingerprint}".encode()).hexdigest()
+        return await self._read_visible_body_progress(
+            root,
+            root_handle,
+            fingerprint=detail_fingerprint,
         )
 
     async def _read_card(

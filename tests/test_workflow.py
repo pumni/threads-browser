@@ -172,20 +172,16 @@ def test_offline_chromium_cli_reads_once_and_resumes_without_double_counting(
   <p>{new_relevant_body}</p>
 </article></body>""",
     )
-    old_detail_html = f"""<!doctype html><html><body>
-<article>
-  <a href="/@candidate/post/one"><time>1h</time></a>
+    old_detail_html = f"""<!doctype html><html><body><main>
+<div data-pressable-container="true">
   <a href="/@candidate">@candidate</a>
   <p>{old_relevant_body}</p>
-</article>
-</body></html>"""
-    new_detail_html = f"""<!doctype html><html><body>
-<article>
-  <a href="/@candidate/post/two"><time>now</time></a>
+  </div></main></body></html>"""
+    new_detail_html = f"""<!doctype html><html><body><main>
+<div data-pressable-container="true">
   <a href="/@candidate">@candidate</a>
   <p>{new_relevant_body}</p>
-</article>
-</body></html>"""
+  </div></main></body></html>"""
     account_root = tmp_path / "data"
     profile = tmp_path / "synthetic-profile"
     profile.mkdir()
@@ -347,10 +343,15 @@ document.querySelector('a[href*="native-cycle"]').addEventListener("click", () =
 }});
 </script></body></html>"""
     detail_html = f"""<!doctype html><html><head><meta charset="utf-8"></head>
-<body><main><article>
-<a href="/@candidate/post/native-cycle"><time>now</time></a>
-<a href="/@candidate">@candidate</a><p>{expanded_body}</p>
-</article></main></body></html>"""
+<body><main><div data-pressable-container="true">
+<header><a href="/@candidate">@candidate</a></header>
+<div class="post-body"><p>{expanded_body}</p></div>
+<blockquote><div data-pressable-container="true">
+<a href="/@quoted">@quoted</a><p>Quoted synthetic job text.</p>
+</div></blockquote>
+</div>
+<article><a href="/@replier">@replier</a><p>A synthetic reply.</p></article>
+</main></body></html>"""
     data_root = tmp_path / "data"
     profile = tmp_path / "synthetic-profile"
     profile.mkdir()
@@ -574,6 +575,248 @@ def test_non_article_permalink_cards_sample_and_verify_detail() -> None:
     _run_offline_page(feed_html, exercise)
 
 
+@pytest.mark.parametrize(
+    ("detail_fragment", "expected_code"),
+    [
+        (
+            (
+                '<div data-pressable-container="true"><a href="/@candidate">candidate</a>'
+                '<a href="/@other">other</a><p>{body}</p></div>'
+            ),
+            "DETAIL_PROVENANCE_UNVERIFIED",
+        ),
+        (
+            (
+                '<div data-pressable-container="true"><a href="/@candidate">candidate</a>'
+                '<a href="/@candidate/post/detail-evidence?view=1">rejected</a>'
+                '<p>{body}</p></div>'
+            ),
+            "DETAIL_PROVENANCE_UNVERIFIED",
+        ),
+        (
+            (
+                '<div data-pressable-container="true"><a href="/@candidate">candidate</a>'
+                '<p>A different synthetic body.</p></div>'
+            ),
+            "DETAIL_BODY_UNVERIFIED",
+        ),
+        (
+            '<div data-pressable-container="true"><p>{body}</p></div>',
+            "DETAIL_PROVENANCE_UNVERIFIED",
+        ),
+        (
+            (
+                '<div data-pressable-container="true"><a href="/@candidate">candidate</a>'
+                '<p>{body}</p></div><div data-pressable-container="true">'
+                '<a href="/@candidate">candidate</a><p>{body}</p></div>'
+            ),
+            "DETAIL_ROOT_AMBIGUOUS",
+        ),
+    ],
+    ids=("multiple-authors", "rejected-post-link", "changed-body", "missing-author", "duplicate-roots"),
+)
+def test_detail_provenance_failures_do_not_save_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    detail_fragment: str,
+    expected_code: str,
+) -> None:
+    actor = "offline.operator"
+    target_url = "https://www.threads.com/@candidate/post/detail-evidence"
+    body = "Hiring a synthetic target body."
+    feed_html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main><article><a href="/@candidate/post/detail-evidence"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>{body}</p></article></main></body></html>"""
+    detail_html = (
+        '<!doctype html><html><body><main>'
+        + detail_fragment.replace("{body}", body)
+        + "</main></body></html>"
+    )
+    data_root = tmp_path / "data"
+    profile = tmp_path / "synthetic-profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+    monkeypatch.setattr(reader_module, "_READINESS_TIMEOUT_MS", 1_500)
+    monkeypatch.setattr(reader_module, "_DETAIL_TIMEOUT_MS", 1_000)
+
+    async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            await route.fulfill(status=200, content_type="text/html", body=detail_html)
+
+        await page.route(target_url, serve_detail)
+        with pytest.raises(UiReadError) as caught:
+            await workflow.run_page_workflow(
+                page,
+                account,
+                store,
+                max_posts=1,
+                max_scrolls=0,
+                terms=("hiring",),
+                detail=True,
+            )
+        assert caught.value.code == expected_code
+        assert page.url == target_url
+
+    _run_offline_page(feed_html, exercise)
+    policy = policy_fingerprint(canonical_terms(("hiring",)))
+    checkpoint = store.load(account.account_id, policy)
+    assert checkpoint.completed_runs == 0
+    assert checkpoint.detail_reads == 0
+    output = capsys.readouterr().out
+    diagnostics = "\n".join(
+        line for line in output.splitlines() if line.startswith("[DETAIL_STATE]")
+    )
+    assert "route_verified=true" in diagnostics
+    assert all(value not in diagnostics for value in (target_url, actor, body, str(profile)))
+
+
+def test_stable_detail_without_primary_identity_stops_without_retry_or_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    target_url = "https://www.threads.com/@candidate/post/stable-empty"
+    body = "Hiring a synthetic target body."
+    feed_html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main><article><a href="/@candidate/post/stable-empty"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>{body}</p></article></main></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "synthetic-profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+    readiness_prompts: list[tuple[str, int]] = []
+    detail_requests = 0
+    monkeypatch.setattr(reader_module, "_READINESS_TIMEOUT_MS", 1_500)
+    monkeypatch.setattr(reader_module, "_DETAIL_TIMEOUT_MS", 1_000)
+
+    async def readiness_prompt(stage: str, retry: int) -> bool:
+        readiness_prompts.append((stage, retry))
+        return False
+
+    async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            nonlocal detail_requests
+            detail_requests += 1
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=(
+                    "<!doctype html><html><body>"
+                    '<main style="min-height: 1px"></main></body></html>'
+                ),
+            )
+
+        await page.route(target_url, serve_detail)
+        with pytest.raises(UiReadError) as caught:
+            await workflow.run_page_workflow(
+                page,
+                account,
+                store,
+                max_posts=1,
+                max_scrolls=0,
+                terms=("hiring",),
+                detail=True,
+                readiness_prompt=readiness_prompt,
+            )
+        assert caught.value.code == "DETAIL_ROOT_UNVERIFIED"
+        assert page.url == target_url
+        assert detail_requests == 1
+
+    _run_offline_page(feed_html, exercise)
+    policy = policy_fingerprint(canonical_terms(("hiring",)))
+    checkpoint = store.load(account.account_id, policy)
+    assert checkpoint.completed_runs == checkpoint.detail_reads == 0
+    assert readiness_prompts == []
+    output = capsys.readouterr().out
+    assert "terminal_reason=ROOT_ABSENT" in output
+    assert "WAITING stage=DETAIL retry=" not in output
+    diagnostics = "\n".join(
+        line for line in output.splitlines() if line.startswith("[DETAIL_STATE]")
+    )
+    assert all(value not in diagnostics for value in (target_url, actor, body, str(profile)))
+
+
+def test_q_stops_pending_detail_without_back_or_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    target_url = "https://www.threads.com/@candidate/post/pending-identity"
+    body = "Hiring a synthetic target body."
+    feed_html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main><article><a href="/@candidate/post/pending-identity"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>{body}</p></article></main></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "synthetic-profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+    readiness_prompts: list[tuple[str, int]] = []
+    detail_requests = 0
+    monkeypatch.setattr(reader_module, "_READINESS_TIMEOUT_MS", 400)
+    monkeypatch.setattr(reader_module, "_DETAIL_TIMEOUT_MS", 1_000)
+    monkeypatch.setattr(reader_module, "_RENDER_SETTLE_INTERVAL_MS", 20)
+
+    async def readiness_prompt(stage: str, retry: int) -> bool:
+        readiness_prompts.append((stage, retry))
+        return False
+
+    async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            nonlocal detail_requests
+            detail_requests += 1
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=(
+                    '<!doctype html><html><body><main aria-busy="true" '
+                    'style="min-height: 1px">Loading</main></body></html>'
+                ),
+            )
+
+        await page.route(target_url, serve_detail)
+        with pytest.raises(UiReadError) as caught:
+            await workflow.run_page_workflow(
+                page,
+                account,
+                store,
+                max_posts=1,
+                max_scrolls=0,
+                terms=("hiring",),
+                detail=True,
+                readiness_prompt=readiness_prompt,
+            )
+        assert caught.value.code == "DETAIL_ROOT_UNVERIFIED"
+        assert page.url == target_url
+        assert detail_requests == 1
+
+    _run_offline_page(feed_html, exercise)
+    policy = policy_fingerprint(canonical_terms(("hiring",)))
+    checkpoint = store.load(account.account_id, policy)
+    assert checkpoint.completed_runs == checkpoint.detail_reads == 0
+    assert readiness_prompts == [("DETAIL", 2)]
+    output = capsys.readouterr().out
+    assert "hydration_pending=true" in output
+    diagnostics = "\n".join(
+        line for line in output.splitlines() if line.startswith("[DETAIL_STATE]")
+    )
+    assert all(value not in diagnostics for value in (target_url, actor, body, str(profile)))
+
+
 def test_delayed_home_feed_after_profile_return_is_sampled() -> None:
     actor = "offline.operator"
     feed_html = f"""<!doctype html><html><head><style>
@@ -685,13 +928,15 @@ window.addEventListener("wheel", event => {{
                 await route.fulfill(
                     status=200,
                     content_type="text/html",
-                    body=f"""<!doctype html><html><body><main><div id="detail">
-<a href="/@candidate/post/recovery-detail"><time>1h</time></a>
-<a href="/@candidate">@candidate</a><script>
-setTimeout(() => document.querySelector("#detail").insertAdjacentHTML(
-  "beforeend", '<p>{detail_body}</p>'
-), 750);
-</script></div></main></body></html>""",
+                    body=f"""<!doctype html><html><body><main aria-busy="true">
+<div data-pressable-container="true" id="detail"></div></main><script>
+setTimeout(() => {{
+  const detail = document.querySelector("#detail");
+  detail.innerHTML = '<header><a href="/@candidate">@candidate</a></header>' +
+    '<div><p>{detail_body}</p></div>';
+  document.querySelector("main").removeAttribute("aria-busy");
+}}, 750);
+</script></body></html>""",
                 )
 
             await page.route(detail_url, serve_detail)
@@ -972,10 +1217,10 @@ def test_empty_scan_rescans_new_feed_but_changed_back_anchor_stops_without_check
   <a href="/@candidate/post/seed"><time>2h</time></a>
   <a href="/@candidate">@candidate</a><p>A weather update</p>
 </article></main></body></html>"""
-    detail_html = f"""<!doctype html><html><body><article>
+    detail_html = f"""<!doctype html><html><body><main><article>
 <a href="/@candidate/post/late-feed"><time>now</time></a>
 <a href="/@candidate">@candidate</a><p>{body}</p>
-</article></body></html>"""
+</article></main></body></html>"""
     state = {"scan": False, "empty_once": False, "injected": False}
 
     with tempfile.TemporaryDirectory(prefix="threads-browser-render-race-") as root:
@@ -2240,10 +2485,10 @@ def test_transient_row_detachment_is_retried_after_session_reverification(
             await route.fulfill(
                 status=200,
                 content_type="text/html",
-                body="""<!doctype html><html><body><article>
+                body="""<!doctype html><html><body><main><article>
 <a href="/@candidate/post/detached-row"><time>now</time></a>
 <a href="/@candidate">candidate</a><p>A synthetic weather update</p>
-</article></body></html>""",
+</article></main></body></html>""",
             )
 
         await page.route("**/post/detached-row", serve_detail)
@@ -2425,10 +2670,10 @@ def test_detail_body_mismatch_fails_closed_without_checkpoint(tmp_path: Path) ->
             await route.fulfill(
                 status=200,
                 content_type="text/html",
-                body=f"""<!doctype html><html><body><article>
+                body=f"""<!doctype html><html><body><main><article>
 <a href="/@candidate/post/body-mismatch"><time>now</time></a>
 <a href="/@candidate">@candidate</a><p>{wrong_detail_body}</p>
-</article></body></html>""",
+ </article></main></body></html>""",
             )
 
         await page.route(target_url, serve_wrong_detail)
@@ -2475,22 +2720,27 @@ def test_overlapping_scan_completes_coverage_before_detail_and_checkpoint(
         ("first", relevant_body),
     )
 
-    def render_feed(posts: tuple[tuple[str, str], ...]) -> str:
+    def render_feed(
+        posts: tuple[tuple[str, str], ...],
+        *,
+        detail: bool = False,
+    ) -> str:
         cards = "".join(
             f'''<article><a href="/@candidate/post/{slug}"><time>1h</time></a>
 <a href="/@candidate">@candidate</a><p>{body}</p></article>'''
             for slug, body in posts
         )
+        content = f"<main>{cards}</main>" if detail else cards
         return f"""<!doctype html><html><head>
 <style>article {{ height: 360px; }}</style></head><body>
 <nav aria-label="Main" role="navigation">
   <a aria-current="page" aria-label="For you" href="/">For you</a>
   <a aria-label="Profile" href="/@{actor}">Profile</a>
-</nav>{cards}</body></html>"""
+</nav>{content}</body></html>"""
 
     detail_pages = {
-        pending_url: render_feed((("pending", relevant_body),)),
-        first_url: render_feed((("first", relevant_body),)),
+        pending_url: render_feed((("pending", relevant_body),), detail=True),
+        first_url: render_feed((("first", relevant_body),), detail=True),
     }
     account_root = tmp_path / "data"
     profile = tmp_path / "synthetic-profile"
@@ -2509,8 +2759,8 @@ def test_overlapping_scan_completes_coverage_before_detail_and_checkpoint(
             home_requests += 1
             posts = first_feed if home_requests == 1 else resumed_feed
             html = render_feed(posts)
-        elif url in detail_pages:
-            html = detail_pages[url]
+        elif url.rstrip("/") in detail_pages:
+            html = detail_pages[url.rstrip("/")]
         elif _is_offline_profile_url(url):
             html = "<!doctype html><html><body><h1>Local profile</h1></body></html>"
         else:
@@ -2865,10 +3115,10 @@ window.addEventListener("wheel", event => {{
   window.scrollBy(0, event.deltaY);
 }}, {{ passive: false }});
 </script></body></html>"""
-    detail_html = f"""<!doctype html><html><body><article>
+    detail_html = f"""<!doctype html><html><body><main><article>
 <a href="/@candidate/post/intermediate"><time>2h</time></a>
 <a href="/@candidate">@candidate</a><p>{detail_body}</p>
-</article></body></html>"""
+</article></main></body></html>"""
     data_root = tmp_path / "data"
     profile = tmp_path / "profile"
     profile.mkdir()
@@ -3519,10 +3769,10 @@ window.addEventListener("wheel", event => {{
             await route.fulfill(
                 status=200,
                 content_type="text/html",
-                body=f"""<!doctype html><html><body><article>
+                body=f"""<!doctype html><html><body><main><article>
 <a href="/@candidate/post/{post_id}"><time>now</time></a>
 <a href="/@candidate">@candidate</a><p>{detail_body}</p>
-</article></body></html>""",
+</article></main></body></html>""",
             )
 
         await page.route("**/@candidate/post/**", serve_verified_detail)
@@ -3725,14 +3975,14 @@ body {{ font-family: sans-serif; }}
   <button type="button">Reply</button>
 </div>
 </body></html>"""
-    detail_html = f"""<!doctype html><html><head><meta charset="utf-8"></head><body>
+    detail_html = f"""<!doctype html><html><head><meta charset="utf-8"></head><body><main>
 <div data-pressable-container="true">
   <a href="/@candidate/post/job-seeking"><time>1h</time></a>
   <a href="/@candidate">@candidate</a>
   <span dir="auto">{verified_body_first}</span>
   <div dir="auto">{verified_body_second}</div>
 </div>
-</body></html>"""
+</main></body></html>"""
     data_root = tmp_path / "data"
     profile = tmp_path / "profile"
     profile.mkdir()
@@ -3948,10 +4198,10 @@ nav {{ height: 40px; }}
 <div id="non-post" data-pressable-container="true"><button>Open filters</button></div>
 <div class="spacer"></div></body></html>"""
     detail_body = f"{bodies[1]} with its expanded synthetic fixture detail."
-    detail_html = f"""<!doctype html><html><body><article>
+    detail_html = f"""<!doctype html><html><body><main><article>
 <a href="/@candidate/post/relevant"><time>2h</time></a>
 <a href="/@candidate">@candidate</a><span dir="auto">{detail_body}</span>
-</article></body></html>"""
+</article></main></body></html>"""
     data_root = tmp_path / "data"
     profile = tmp_path / "profile"
     profile.mkdir()
@@ -4035,10 +4285,10 @@ def test_progressive_body_fallback_emits_row_before_reading_next_with_y_jitter(
         "</body>",
         "<script>setTimeout(() => document.documentElement.classList.add('settled'), 2200);</script></body>",
     )
-    detail_html = f"""<!doctype html><html><body><article>
+    detail_html = f"""<!doctype html><html><body><main><article>
 <a href="/@candidate/post/progressive-first"><time>now</time></a>
 <a href="/@candidate">@candidate</a><p>{first_body}</p>
-</article></body></html>"""
+</article></main></body></html>"""
     data_root = tmp_path / "data"
     profile = tmp_path / "synthetic-profile"
     profile.mkdir()
@@ -4180,10 +4430,10 @@ article {{ box-sizing: border-box; height: 680px; padding-top: 430px; }}
 <a href="/@candidate/post/nested-long"><time>now</time></a>
 <a href="/@candidate">candidate</a><span dir="auto">{body}</span>
 </article></main></body></html>"""
-    detail_html = f"""<!doctype html><html><body><article>
+    detail_html = f"""<!doctype html><html><body><main><article>
 <a href="/@candidate/post/nested-long"><time>now</time></a>
 <a href="/@candidate">candidate</a><p>{body}</p>
-</article></body></html>"""
+</article></main></body></html>"""
     data_root = tmp_path / "data"
     profile = tmp_path / "profile"
     profile.mkdir()
@@ -4847,10 +5097,10 @@ const feed = document.querySelector('#feed');
 feed.scrollTop = feed.scrollHeight;
 </script></body></html>"""
     detail_body = f"{body} with a verified synthetic detail expansion."
-    detail_html = f"""<!doctype html><html><body><article>
+    detail_html = f"""<!doctype html><html><body><main><article>
 <a href="/@candidate/post/at-end"><time>now</time></a>
 <a href="/@candidate">@candidate</a><span dir="auto">{detail_body}</span>
-</article></body></html>"""
+</article></main></body></html>"""
     data_root = tmp_path / "data"
     profile = tmp_path / "profile"
     profile.mkdir()
@@ -5640,10 +5890,10 @@ feed.addEventListener('scroll', () => sessionStorage.setItem(
   'synthetic-scrolltop', String(feed.scrollTop)
 ), {{ passive: true }});
 </script></body></html>"""
-    detail_html = f"""<!doctype html><html><body><article>
+    detail_html = f"""<!doctype html><html><body><main><article>
 <a href="/@candidate/post/loaded"><time>now</time></a>
 <a href="/@candidate">candidate</a><p>{loaded_body}</p>
-</article></body></html>"""
+</article></main></body></html>"""
     data_root = tmp_path / "data"
     profile = tmp_path / "profile"
     profile.mkdir()
