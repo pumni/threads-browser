@@ -15,7 +15,6 @@ from .storage import (
     BrowserDataError,
     CheckpointStore,
     TermsStore,
-    profile_lock,
     resolve_data_root,
 )
 
@@ -365,42 +364,40 @@ def main(argv: Sequence[str] | None = None) -> int:
                     file=sys.stderr,
                 )
                 return 1
-            lock = profile_lock(data_root, account)
-            with lock:
-                from .reader import UiReadError
-                from .workflow import run_browser_nurture
+            from .reader import UiReadError
+            from .workflow import run_browser_nurture
 
-                try:
-                    result = asyncio.run(
-                        run_browser_nurture(
-                            account,
-                            CheckpointStore(data_root),
-                            max_posts=args.max_posts,
-                            terms=terms,
-                            max_scrolls=args.max_scrolls,
-                            max_total_posts=args.max_total_posts,
-                            show_post_text=args.show_post_text,
-                            show_observed_text=args.show_observed_text,
-                            detail=args.detail,
-                            readiness_prompt=(
-                                _prompt_readiness_extension
-                                if _has_interactive_terminal()
-                                else None
-                            ),
-                        )
+            try:
+                result = asyncio.run(
+                    run_browser_nurture(
+                        account,
+                        CheckpointStore(data_root),
+                        max_posts=args.max_posts,
+                        terms=terms,
+                        max_scrolls=args.max_scrolls,
+                        max_total_posts=args.max_total_posts,
+                        show_post_text=args.show_post_text,
+                        show_observed_text=args.show_observed_text,
+                        detail=args.detail,
+                        readiness_prompt=(
+                            _prompt_readiness_extension
+                            if _has_interactive_terminal()
+                            else None
+                        ),
                     )
-                except UiReadError as error:
-                    if args.detail:
-                        print(
-                            f"[CHECKPOINT] status=NOT_SAVED reason={error.code}",
-                            file=sys.stderr,
-                        )
-                        print(f"[STOP] code={error.code}", file=sys.stderr)
-                    else:
-                        print(f"STOP {error.code}", file=sys.stderr)
-                    if error.code == "LOGIN_REQUIRED":
-                        print(f"Run 'tb login {account.alias}' to authenticate.", file=sys.stderr)
-                    return 1
+                )
+            except UiReadError as error:
+                if args.detail:
+                    print(
+                        f"[CHECKPOINT] status=NOT_SAVED reason={error.code}",
+                        file=sys.stderr,
+                    )
+                    print(f"[STOP] code={error.code}", file=sys.stderr)
+                else:
+                    print(f"STOP {error.code}", file=sys.stderr)
+                if error.code == "LOGIN_REQUIRED":
+                    print(f"Run 'tb login {account.alias}' to authenticate.", file=sys.stderr)
+                return 1
             print(_format_result(result))
             return 0
     except BrowserDataError as error:
