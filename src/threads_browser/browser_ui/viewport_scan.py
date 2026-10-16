@@ -93,7 +93,6 @@ class _ViewportScanRequest:
     prefer_new_fingerprints: set[str] | None
     stage: str
     viewport_index: int | None
-    carried_identities: tuple[_TrackedRowIdentity, ...]
     on_row: Callable[[_HomeRowObservation], Awaitable[None]] | None = None
 
 
@@ -102,7 +101,8 @@ class _ViewportScanHooks:
     """Reader compatibility operations needed during a scan, without reader state."""
 
     discover_roots: Callable[
-        [Locator, dict[str, int]], Awaitable[tuple[list[Locator], bool]]
+        [Locator, dict[str, int]],
+        Awaitable[tuple[list[Locator], bool, tuple[_TrackedRowIdentity, ...]]],
     ]
     collect_structures: Callable[
         [Locator, list[Locator], dict[str, int]],
@@ -140,6 +140,7 @@ class _ViewportScanState:
     hooks: _ViewportScanHooks
     counts: _FeedScanCounts
     stage: str | None = None
+    carried_identities: tuple[_TrackedRowIdentity, ...] = ()
     timings: _FeedScanTimings = field(default_factory=_FeedScanTimings)
     operation: str = "DISCOVER_ROOTS"
     candidate_index: int | None = None
@@ -412,7 +413,7 @@ class ViewportScanCoordinator:
         self, root: Locator
     ) -> _TrackedRowIdentity | None:
         state = self._require_state()
-        identities = state.request.carried_identities
+        identities = state.carried_identities
         if not identities:
             return None
         matched_index = await root.evaluate(
@@ -516,7 +517,7 @@ class ViewportScanCoordinator:
 
     async def _top_level_candidate_roots(
         self, region: Locator, viewport: dict[str, int]
-    ) -> tuple[list[Locator], bool]:
+    ) -> tuple[list[Locator], bool, tuple[_TrackedRowIdentity, ...]]:
         return await self._require_state().hooks.discover_roots(region, viewport)
 
     async def _collect_structure_diagnostics(
@@ -660,7 +661,7 @@ class ViewportScanCoordinator:
 
     @property
     def _carried_viewport_candidate_identities(self) -> tuple[_TrackedRowIdentity, ...]:
-        return self._require_state().request.carried_identities
+        return self._require_state().carried_identities
 
     @staticmethod
     def _readiness_deadline(timeout_ms: int) -> float:
@@ -732,7 +733,10 @@ class ViewportScanCoordinator:
         self.last_viewport_can_wheel = False
         discover_started = time.perf_counter()
         region = await self._content_region()
-        roots, roots_truncated = await self._top_level_candidate_roots(region, viewport)
+        roots, roots_truncated, state.carried_identities = await self._top_level_candidate_roots(
+            region,
+            viewport,
+        )
         counts.roots_truncated = roots_truncated
         counts.unrepresented_root_count = int(roots_truncated)
         self._set_scan_operation("STRUCTURE")

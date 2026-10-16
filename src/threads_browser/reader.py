@@ -2221,8 +2221,15 @@ class ThreadsHomeReader:
         await self._dispose_active_scan_candidate_handles()
         await self._discard_pending_viewport_candidates()
 
+        async def discover_roots(
+            region: Locator,
+            viewport: dict[str, int],
+        ) -> tuple[list[Locator], bool, tuple[_TrackedRowIdentity, ...]]:
+            roots, roots_truncated = await self._top_level_candidate_roots(region, viewport)
+            return roots, roots_truncated, self._carried_viewport_candidate_identities
+
         hooks = _ViewportScanHooks(
-            discover_roots=self._top_level_candidate_roots,
+            discover_roots=discover_roots,
             collect_structures=self._collect_structure_diagnostics,
             scan_permalink_fallback=self._visible_permalink_targets,
             read_card=self._read_card,
@@ -2247,7 +2254,6 @@ class ThreadsHomeReader:
             prefer_new_fingerprints=prefer_new_fingerprints,
             stage=stage,
             viewport_index=self._scan_viewport_index,
-            carried_identities=self._carried_viewport_candidate_identities,
             on_row=on_row,
         )
         result = await self._viewport_scan.scan(
@@ -2259,6 +2265,7 @@ class ThreadsHomeReader:
         self._pending_viewport_candidate_identities = result.candidate_identities
         return result
 
+    @staticmethod
     def _has_new_viewport_content(
         previous: tuple[object, ...] | None,
         current: tuple[object, ...],
