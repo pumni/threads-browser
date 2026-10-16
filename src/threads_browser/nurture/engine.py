@@ -34,6 +34,16 @@ from .state import (
 )
 
 _MAX_SEEN = 5_000
+_DETAIL_READ_FAILURES = frozenset(
+    {
+        "DETAIL_RENDER_PENDING",
+        "DETAIL_RENDER_UNAVAILABLE",
+        "DETAIL_ROOT_UNVERIFIED",
+        "DETAIL_ROOT_AMBIGUOUS",
+        "DETAIL_BODY_UNVERIFIED",
+        "DETAIL_PROVENANCE_UNVERIFIED",
+    }
+)
 
 
 def _reader_playwright_error(
@@ -258,12 +268,24 @@ async def run_page_workflow(
 
     async def select_verified_fallback(targets: list[PostTarget]) -> None:
         nonlocal selected
-        if stats.found_relevant or stats.unverified_relevant or dedupe.pending_set or not targets:
+        if stats.found_relevant or stats.unverified_relevant or not targets:
             return
-        ordered = sorted(
-            targets,
-            key=lambda target: target.fingerprint in dedupe.previously_seen,
-        )
+        pending_order = {fingerprint: index for index, fingerprint in enumerate(dedupe.pending)}
+        pending_targets = [
+            target for target in targets if target.fingerprint in dedupe.pending_set
+        ]
+        if dedupe.pending_set:
+            if not pending_targets:
+                return
+            ordered = sorted(
+                pending_targets,
+                key=lambda target: pending_order[target.fingerprint],
+            )
+        else:
+            ordered = sorted(
+                targets,
+                key=lambda target: target.fingerprint in dedupe.previously_seen,
+            )
         selected = await first_actionable(ordered)
         if selected is None:
             return
@@ -1093,6 +1115,7 @@ async def run_page_workflow(
             break
 
     detail_reads = 0
+    detail_retry_pending = False
     if selected is None and not stats.found_relevant:
         if exhaustion_reason in {"FEED_END_REACHED", "FEED_NOT_SCROLLABLE"}:
             print(f"SEARCH_STOP reason={exhaustion_reason} viewports={viewport_number}")
@@ -1131,11 +1154,26 @@ async def run_page_workflow(
                     operation="DETAIL",
                 )
             )
-            state.stop(error.code)
+            if error.code not in _DETAIL_READ_FAILURES or not getattr(
+                reader,
+                "detail_route_verified",
+                False,
+            ):
+                state.stop(error.code)
+                if detail:
+                    print(
+                        f"[DETAIL] post={selected_number} "
+                        f"status=FAILED code={error.code}"
+                    )
+                    _detail_stop(error.code)
+                raise error from None
+            detail_retry_pending = True
             if detail:
-                print(f"[DETAIL] post={selected_number} status=FAILED")
-            raise error from None
-        if detail:
+                print(
+                    f"[DETAIL] post={selected_number} status=UNAVAILABLE "
+                    f"code={error.code} retry=PENDING"
+                )
+        if not detail_retry_pending and detail:
             home_body = " ".join((selected.body or "").split())
             expanded_body = " ".join((detail_target.body or "").split())
             extent = (
@@ -1157,7 +1195,8 @@ async def run_page_workflow(
                 extent,
                 detail_target.body,
             )
-        print("DETAIL_VERIFIED status=PROVENANCE_VERIFIED")
+        if not detail_retry_pending:
+            print("DETAIL_VERIFIED status=PROVENANCE_VERIFIED")
         if detail:
             print(f"[BACK] post={selected_number} status=REQUESTED")
         state.transition(WorkflowPhase.BACK)
@@ -1186,11 +1225,17 @@ async def run_page_workflow(
                 )
             raise error from None
         if detail:
-            print(f"[BACK] post={selected_number} status=RESTORED anchor=MATCHED")
-        detail_reads = 1
-        dedupe.pending.remove(selected.fingerprint)
-        dedupe.pending_set.remove(selected.fingerprint)
-        status = "COMPLETE"
+            print(
+                f"[BACK] post={selected_number} status=RESTORED "
+                "anchor=IDENTITY_VERIFIED"
+            )
+        if detail_retry_pending:
+            status = "DETAIL_RETRY_PENDING"
+        else:
+            detail_reads = 1
+            dedupe.pending.remove(selected.fingerprint)
+            dedupe.pending_set.remove(selected.fingerprint)
+            status = "COMPLETE"
     elif (
         selected is None
         and stats.unverified_relevant
@@ -1316,7 +1361,9 @@ async def run_page_workflow(
             viewport_coverage_complete=stats.viewport_coverage_complete,
             **reliability_metrics(),
         )
-    elif dedupe.pending_set or (stats.found_relevant and exhaustion_reason == "FEED_END_REACHED"):
+    elif not detail_retry_pending and (
+        dedupe.pending_set or (stats.found_relevant and exhaustion_reason == "FEED_END_REACHED")
+    ):
         incomplete_status = (
             "FEED_END_REACHED"
             if exhaustion_reason == "FEED_END_REACHED"
@@ -1367,7 +1414,9 @@ async def run_page_workflow(
     else:
         status = "NO_RELEVANT_POST_IN_BUDGET"
 
-    if coverage.has_skips:
+    if detail_retry_pending:
+        status = "DETAIL_RETRY_PENDING"
+    elif coverage.has_skips:
         status = "COMPLETE_WITH_SKIPS"
 
     if len(dedupe.pending) > _MAX_SEEN:
@@ -1415,7 +1464,7 @@ async def run_page_workflow(
     state.stop(status)
     return NurtureResult(
         status=status,
-        stop_reason=exhaustion_reason,
+        stop_reason="DETAIL_RETRY_PENDING" if detail_retry_pending else exhaustion_reason,
         home_sampled=len(dedupe.seen_this_run),
         home_new=len(dedupe.new_fingerprints),
         home_relevant=stats.relevant,

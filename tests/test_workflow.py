@@ -419,7 +419,7 @@ document.querySelector('a[href*="native-cycle"]').addEventListener("click", () =
     assert "[SELECT] post=1 decision=RELEVANT reason=RELEVANT_NEW" in output
     assert "[DETAIL] post=1 status=VERIFIED provenance=VERIFIED extent=EXPANDED" in output
     assert "<<< DETAIL_BODY BEGIN status=VERIFIED decision=RELEVANT extent=EXPANDED >>>" in output
-    assert "[BACK] post=1 status=RESTORED anchor=MATCHED" in output
+    assert "[BACK] post=1 status=RESTORED anchor=IDENTITY_VERIFIED" in output
     assert "[CHECKPOINT] status=SAVED completed_runs=1" in output
     assert "[CYCLE] status=COMPLETE" in output
     assert output.count(f"| {truncated_body}") == 1
@@ -576,6 +576,133 @@ def test_non_article_permalink_cards_sample_and_verify_detail() -> None:
     _run_offline_page(feed_html, exercise)
 
 
+def test_detail_without_landmark_or_identity_links_uses_unique_matching_body(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    target_url = "https://www.threads.com/@candidate/post/body-only-detail"
+    body = "Hiring a synthetic backend engineer."
+    feed_html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main><article>
+<a href="/@candidate/post/body-only-detail"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>{body}</p>
+</article></main></body></html>"""
+    detail_html = (
+        "<!doctype html><html><body><div><p>Hiring a synthetic</p>"
+        "<p>backend engineer.</p></div></body></html>"
+    )
+    data_root = tmp_path / "data"
+    profile = tmp_path / "synthetic-profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+
+    async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            await route.fulfill(status=200, content_type="text/html", body=detail_html)
+
+        await page.route(target_url, serve_detail)
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=1,
+            max_scrolls=0,
+            terms=("hiring",),
+            detail=True,
+        )
+        assert result.status == "COMPLETE"
+        assert result.detail_reads == 1
+        assert page.url == HOME_URL
+
+    _run_offline_page(feed_html, exercise)
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.detail_reads == 1
+    assert checkpoint.pending_read_fingerprints == ()
+    output = capsys.readouterr().out
+    assert "main_regions_count=0" in output
+    assert "matching_roots=1" in output
+    assert "terminal_reason=DETAIL_VERIFIED" in output
+
+
+def test_back_accepts_selected_post_after_vertical_layout_shift(
+    tmp_path: Path,
+) -> None:
+    actor = "offline.operator"
+    target_url = "https://www.threads.com/@candidate/post/back-layout-shift"
+    body = "Hiring a synthetic designer."
+    feed_html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main><article>
+<a id="selected" href="/@candidate/post/back-layout-shift"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>{body}</p>
+</article></main><script>
+const selected = document.querySelector("#selected");
+selected.addEventListener("click", () => {{
+  sessionStorage.setItem("return-anchor-y", String(
+    document.querySelector("article").getBoundingClientRect().y
+  ));
+}});
+window.addEventListener("pageshow", () => {{
+  if (sessionStorage.getItem("return-anchor-y") === null) return;
+  const spacer = document.createElement("div");
+  spacer.id = "return-layout-shift";
+  spacer.style.height = "120px";
+  document.querySelector("main").prepend(spacer);
+  const before = Number(sessionStorage.getItem("return-anchor-y"));
+  const after = document.querySelector("article").getBoundingClientRect().y;
+  sessionStorage.setItem("return-anchor-drift", String(after - before));
+  sessionStorage.removeItem("return-anchor-y");
+}});
+</script></body></html>"""
+    detail_html = f"""<!doctype html><html><body><main><article>
+<a href="/@candidate">candidate</a><p>{body}</p>
+</article></main></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "synthetic-profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+
+    async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            await route.fulfill(status=200, content_type="text/html", body=detail_html)
+
+        await page.route(target_url, serve_detail)
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=1,
+            max_scrolls=0,
+            terms=("hiring",),
+            detail=True,
+        )
+        drift = await page.evaluate("Number(sessionStorage.getItem('return-anchor-drift'))")
+        assert drift > 48
+        assert result.status == "COMPLETE"
+        assert result.detail_reads == 1
+        assert page.url == HOME_URL
+
+    _run_offline_page(feed_html, exercise)
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.detail_reads == 1
+
+
 @pytest.mark.parametrize(
     ("detail_fragment", "expected_code"),
     [
@@ -602,10 +729,6 @@ def test_non_article_permalink_cards_sample_and_verify_detail() -> None:
             "DETAIL_BODY_UNVERIFIED",
         ),
         (
-            '<div data-pressable-container="true"><p>{body}</p></div>',
-            "DETAIL_PROVENANCE_UNVERIFIED",
-        ),
-        (
             (
                 '<div data-pressable-container="true"><a href="/@candidate">candidate</a>'
                 '<p>{body}</p></div><div data-pressable-container="true">'
@@ -614,9 +737,9 @@ def test_non_article_permalink_cards_sample_and_verify_detail() -> None:
             "DETAIL_ROOT_AMBIGUOUS",
         ),
     ],
-    ids=("multiple-authors", "rejected-post-link", "changed-body", "missing-author", "duplicate-roots"),
+    ids=("multiple-authors", "rejected-post-link", "changed-body", "duplicate-roots"),
 )
-def test_detail_provenance_failures_do_not_save_checkpoint(
+def test_detail_verification_failures_return_home_and_keep_retry_pending(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -650,25 +773,29 @@ def test_detail_provenance_failures_do_not_save_checkpoint(
             await route.fulfill(status=200, content_type="text/html", body=detail_html)
 
         await page.route(target_url, serve_detail)
-        with pytest.raises(UiReadError) as caught:
-            await workflow.run_page_workflow(
-                page,
-                account,
-                store,
-                max_posts=1,
-                max_scrolls=0,
-                terms=("hiring",),
-                detail=True,
-            )
-        assert caught.value.code == expected_code
-        assert page.url == target_url
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=1,
+            max_scrolls=0,
+            terms=("hiring",),
+            detail=True,
+        )
+        assert result.status == "DETAIL_RETRY_PENDING"
+        assert result.detail_reads == 0
+        assert page.url == HOME_URL
 
     _run_offline_page(feed_html, exercise)
     policy = policy_fingerprint(canonical_terms(("hiring",)))
     checkpoint = store.load(account.account_id, policy)
-    assert checkpoint.completed_runs == 0
+    assert checkpoint.completed_runs == 1
     assert checkpoint.detail_reads == 0
+    assert len(checkpoint.pending_read_fingerprints) == 1
     output = capsys.readouterr().out
+    assert f"status=UNAVAILABLE code={expected_code} retry=PENDING" in output
+    assert "[BACK] post=1 status=RESTORED anchor=IDENTITY_VERIFIED" in output
+    assert "DETAIL_VERIFIED status=PROVENANCE_VERIFIED" not in output
     diagnostics = "\n".join(
         line for line in output.splitlines() if line.startswith("[DETAIL_STATE]")
     )
@@ -676,7 +803,7 @@ def test_detail_provenance_failures_do_not_save_checkpoint(
     assert all(value not in diagnostics for value in (target_url, actor, body, str(profile)))
 
 
-def test_stable_detail_without_primary_identity_stops_without_retry_or_checkpoint(
+def test_empty_detail_is_reported_unavailable_and_home_progress_is_saved(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -695,14 +822,9 @@ def test_stable_detail_without_primary_identity_stops_without_retry_or_checkpoin
     profile.mkdir()
     account = AccountStore(data_root).add("offline", actor, profile)
     store = CheckpointStore(data_root)
-    readiness_prompts: list[tuple[str, int]] = []
     detail_requests = 0
     monkeypatch.setattr(reader_module, "_READINESS_TIMEOUT_MS", 1_500)
     monkeypatch.setattr(reader_module, "_DETAIL_TIMEOUT_MS", 1_000)
-
-    async def readiness_prompt(stage: str, retry: int) -> bool:
-        readiness_prompts.append((stage, retry))
-        return False
 
     async def exercise(page) -> None:
         async def serve_detail(route: Route) -> None:
@@ -718,33 +840,121 @@ def test_stable_detail_without_primary_identity_stops_without_retry_or_checkpoin
             )
 
         await page.route(target_url, serve_detail)
-        with pytest.raises(UiReadError) as caught:
-            await workflow.run_page_workflow(
-                page,
-                account,
-                store,
-                max_posts=1,
-                max_scrolls=0,
-                terms=("hiring",),
-                detail=True,
-                readiness_prompt=readiness_prompt,
-            )
-        assert caught.value.code == "DETAIL_ROOT_UNVERIFIED"
-        assert page.url == target_url
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=1,
+            max_scrolls=0,
+            terms=("hiring",),
+            detail=True,
+        )
+        assert result.status == "DETAIL_RETRY_PENDING"
+        assert result.detail_reads == 0
+        assert page.url == HOME_URL
         assert detail_requests == 1
 
     _run_offline_page(feed_html, exercise)
     policy = policy_fingerprint(canonical_terms(("hiring",)))
     checkpoint = store.load(account.account_id, policy)
-    assert checkpoint.completed_runs == checkpoint.detail_reads == 0
-    assert readiness_prompts == []
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.detail_reads == 0
+    assert len(checkpoint.pending_read_fingerprints) == 1
     output = capsys.readouterr().out
-    assert "terminal_reason=ROOT_ABSENT" in output
-    assert "WAITING stage=DETAIL retry=" not in output
+    assert "terminal_reason=RENDER_UNAVAILABLE" in output
+    assert "status=UNAVAILABLE code=DETAIL_RENDER_UNAVAILABLE retry=PENDING" in output
+    assert "WAITING stage=DETAIL retry=1" in output
     diagnostics = "\n".join(
         line for line in output.splitlines() if line.startswith("[DETAIL_STATE]")
     )
     assert all(value not in diagnostics for value in (target_url, actor, body, str(profile)))
+
+
+def test_failed_fallback_detail_is_retried_on_the_next_cycle(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    target_url = "https://www.threads.com/@candidate/post/fallback-retry"
+    body = "A synthetic weather update."
+    feed_html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main><article>
+<a href="/@candidate/post/fallback-retry"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>{body}</p>
+</article></main></body></html>"""
+    valid_detail = f"""<!doctype html><html><body><main><article>
+<a href="/@candidate">candidate</a><p>{body}</p>
+</article></main></body></html>"""
+    empty_detail = "<!doctype html><html><body><main style='min-height: 1px'></main></body></html>"
+    data_root = tmp_path / "data"
+    profile = tmp_path / "synthetic-profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+    detail_attempts = 0
+
+    async def serve_detail(route: Route) -> None:
+        nonlocal detail_attempts
+        detail_attempts += 1
+        await route.fulfill(
+            status=200,
+            content_type="text/html",
+            body=empty_detail if detail_attempts == 1 else valid_detail,
+        )
+
+    async def first_cycle(page) -> None:
+        await page.route(target_url, serve_detail)
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=1,
+            max_scrolls=0,
+            terms=("hiring",),
+            detail=True,
+        )
+        assert result.status == "DETAIL_RETRY_PENDING"
+        assert result.detail_reads == 0
+        assert page.url == HOME_URL
+
+    async def second_cycle(page) -> None:
+        await page.route(target_url, serve_detail)
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=1,
+            max_scrolls=0,
+            terms=("hiring",),
+            detail=True,
+        )
+        assert result.status == "COMPLETE"
+        assert result.detail_reads == 1
+        assert page.url == HOME_URL
+
+    _run_offline_page(feed_html, first_cycle)
+    first_checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert first_checkpoint.completed_runs == 1
+    assert first_checkpoint.detail_reads == 0
+    assert len(first_checkpoint.pending_read_fingerprints) == 1
+    assert "decision=VERIFIED_FALLBACK" in capsys.readouterr().out
+
+    _run_offline_page(feed_html, second_cycle)
+    second_checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert second_checkpoint.completed_runs == 2
+    assert second_checkpoint.detail_reads == 1
+    assert second_checkpoint.pending_read_fingerprints == ()
+    assert detail_attempts == 2
+    assert "decision=VERIFIED_FALLBACK" in capsys.readouterr().out
 
 
 def test_q_stops_pending_detail_without_back_or_checkpoint(
@@ -801,7 +1011,7 @@ def test_q_stops_pending_detail_without_back_or_checkpoint(
                 detail=True,
                 readiness_prompt=readiness_prompt,
             )
-        assert caught.value.code == "DETAIL_ROOT_UNVERIFIED"
+        assert caught.value.code == "OPERATOR_CANCELLED"
         assert page.url == target_url
         assert detail_requests == 1
 
@@ -812,6 +1022,8 @@ def test_q_stops_pending_detail_without_back_or_checkpoint(
     assert readiness_prompts == [("DETAIL", 2)]
     output = capsys.readouterr().out
     assert "hydration_pending=true" in output
+    assert "[BACK] post=1 status=REQUESTED" not in output
+    assert "[CHECKPOINT] status=SAVED" not in output
     diagnostics = "\n".join(
         line for line in output.splitlines() if line.startswith("[DETAIL_STATE]")
     )
@@ -1360,7 +1572,7 @@ def test_feed_barrier_waits_through_body_hydration_and_dom_change(
     assert "READY stage=FEED_INITIAL state=BODY_EXTRACTED" in capsys.readouterr().out
 
 
-def test_failed_selected_detail_blocks_checkpoint_but_unknown_rows_are_skipped(
+def test_failed_selected_detail_saves_home_and_keeps_retry_pending(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -1398,15 +1610,16 @@ window.addEventListener("wheel", event => {{
             )
 
         await page.route(target_url, serve_detail)
-        with pytest.raises(UiReadError) as caught:
-            await workflow.run_page_workflow(
-                page,
-                account,
-                store,
-                max_posts=2,
-                terms=("hiring", "engineer"),
-            )
-        assert caught.value.code == "DETAIL_BODY_UNVERIFIED"
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=2,
+            terms=("hiring", "engineer"),
+        )
+        assert result.status == "DETAIL_RETRY_PENDING"
+        assert result.detail_reads == 0
+        assert page.url == HOME_URL
 
     monkeypatch.setattr(reader_module, "_READINESS_TIMEOUT_MS", 5_000)
     monkeypatch.setattr(reader_module, "_DETAIL_TIMEOUT_MS", 1_000)
@@ -1419,8 +1632,10 @@ window.addEventListener("wheel", event => {{
         store = CheckpointStore(data_root)
         _run_offline_page(feed_html, timeout_exercise)
         policy = policy_fingerprint(canonical_terms(("hiring", "engineer")))
-        assert store.load(account.account_id, policy).completed_runs == 0
+        checkpoint = store.load(account.account_id, policy)
+        assert checkpoint.completed_runs == 1
         assert store.load(account.account_id, policy).detail_reads == 0
+        assert len(checkpoint.pending_read_fingerprints) == 1
 
     malformed_html = f"""<!doctype html><html><body>
 <nav aria-label="Main" role="navigation">
@@ -1875,7 +2090,7 @@ window.addEventListener("wheel", event => {
         assert "malformed candidate" not in output
 
 
-def test_detail_author_provenance_mismatch_stops_without_retry(
+def test_detail_author_provenance_mismatch_returns_home_with_retry_pending(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -1933,34 +2148,35 @@ window.addEventListener("wheel", event => {{
                 )
 
             await page.route(target_url, serve_mismatched_detail)
-            with pytest.raises(UiReadError) as caught:
-                await workflow.run_page_workflow(
-                    page,
-                    account,
-                    store,
-                    max_posts=1,
-                    max_scrolls=0,
-                    terms=("hiring",),
-                    readiness_prompt=readiness_prompt,
-                )
+            result = await workflow.run_page_workflow(
+                page,
+                account,
+                store,
+                max_posts=1,
+                max_scrolls=0,
+                terms=("hiring",),
+                readiness_prompt=readiness_prompt,
+            )
             state = await page.evaluate(
                 "() => ({wheel: sessionStorage.getItem('wheelCount'), scrollY: window.scrollY, "
                 "scrollHeight: document.documentElement.scrollHeight})"
             )
-            assert caught.value.code == "POST_AUTHOR_UNVERIFIED", state
+            assert result.status == "DETAIL_RETRY_PENDING", state
+            assert result.detail_reads == 0
+            assert result.checkpoint_runs == 1
+            assert page.url == HOME_URL
             assert await page.evaluate("sessionStorage.getItem('wheelCount')") == "0"
 
         _run_offline_page(html, exercise)
         policy = policy_fingerprint(canonical_terms(("hiring",)))
         checkpoint = store.load(account.account_id, policy)
-        assert checkpoint.completed_runs == 0
+        assert checkpoint.completed_runs == 1
         assert checkpoint.detail_reads == 0
+        assert len(checkpoint.pending_read_fingerprints) == 1
         assert detail_requests == 1
         assert readiness_prompts == []
         output = capsys.readouterr().out
-        assert "STOP stage=DETAIL" not in output
-        assert "[CHECKPOINT] status=NOT_SAVED" not in output
-        assert "[STOP] code=POST_AUTHOR_UNVERIFIED" not in output
+        assert "terminal_reason=AUTHOR_CONFLICT" in output
         assert "@other" not in output
 
 
@@ -3044,7 +3260,7 @@ def test_detail_does_not_auto_scroll_an_offscreen_target() -> None:
     _run_offline_page(feed_html, exercise)
 
 
-def test_detail_body_mismatch_fails_closed_without_checkpoint(tmp_path: Path) -> None:
+def test_detail_body_mismatch_returns_home_without_claiming_read(tmp_path: Path) -> None:
     actor = "offline.operator"
     target_url = "https://www.threads.com/@candidate/post/body-mismatch"
     home_body = "Hiring a frontend engineer"
@@ -3075,24 +3291,26 @@ def test_detail_body_mismatch_fails_closed_without_checkpoint(tmp_path: Path) ->
             )
 
         await page.route(target_url, serve_wrong_detail)
-        with pytest.raises(UiReadError) as caught:
-            await workflow.run_page_workflow(
-                page,
-                account,
-                store,
-                max_posts=2,
-                max_scrolls=0,
-                terms=("hiring",),
-            )
-        assert caught.value.code == "DETAIL_BODY_UNVERIFIED"
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=2,
+            max_scrolls=0,
+            terms=("hiring",),
+        )
+        assert result.status == "DETAIL_RETRY_PENDING"
+        assert result.detail_reads == 0
+        assert page.url == HOME_URL
 
     _run_offline_page(feed_html, exercise)
     checkpoint = store.load(
         account.account_id,
         policy_fingerprint(canonical_terms(("hiring",))),
     )
-    assert checkpoint.completed_runs == 0
+    assert checkpoint.completed_runs == 1
     assert checkpoint.detail_reads == 0
+    assert len(checkpoint.pending_read_fingerprints) == 1
 
 
 def test_overlapping_scan_completes_coverage_before_detail_and_checkpoint(
@@ -4448,7 +4666,7 @@ article p span:first-child {{ position: relative; left: -2px; }}
     _run_offline_page(feed_html, exercise)
     output = capsys.readouterr().out
     assert "[DETAIL] post=1 status=VERIFIED" in output
-    assert "[BACK] post=1 status=RESTORED anchor=MATCHED" in output
+    assert "[BACK] post=1 status=RESTORED anchor=IDENTITY_VERIFIED" in output
     assert "[CHECKPOINT] status=SAVED completed_runs=1" in output
     assert "[CYCLE] status=COMPLETE_WITH_SKIPS" in output
     checkpoint = store.load(
@@ -5551,7 +5769,7 @@ window.addEventListener('scroll', () => {{
     assert "[SCROLL_PROGRESS]" in output
     assert "[SELECT]" in output
     assert "[DETAIL] post=3 status=VERIFIED" in output
-    assert "[BACK] post=3 status=RESTORED anchor=MATCHED" in output
+    assert "[BACK] post=3 status=RESTORED anchor=IDENTITY_VERIFIED" in output
     assert "[CHECKPOINT] status=SAVED completed_runs=1" in output
     checkpoint = store.load(
         account.account_id,
@@ -6118,7 +6336,7 @@ def test_unverified_display_row_does_not_block_verified_selected_detail(
     assert "OBSERVED stage=FEED_INITIAL state=OBSERVATION_UNCERTAIN verified=2" in output
     assert "VIEWPORT_COVERAGE_INCOMPLETE" in output
     assert "[DETAIL] post=2 status=VERIFIED" in output
-    assert "[BACK] post=2 status=RESTORED anchor=MATCHED" in output
+    assert "[BACK] post=2 status=RESTORED anchor=IDENTITY_VERIFIED" in output
     assert output.count(f"| {unverified_body}") == 1
     assert output.count(f"| {verified_body}") == 1
     assert output.count(f"| {selected_body}") == 2
@@ -6840,7 +7058,7 @@ feed.addEventListener('scroll', () => sessionStorage.setItem(
     assert output.count(loaded_body) == 2
     assert "scroll_height_delta=132.0" in output
     assert "[DETAIL] post=2 status=VERIFIED" in output
-    assert "[BACK] post=2 status=RESTORED anchor=MATCHED" in output
+    assert "[BACK] post=2 status=RESTORED anchor=IDENTITY_VERIFIED" in output
     assert "[CHECKPOINT] status=SAVED completed_runs=1" in output
     checkpoint = store.load(
         account.account_id,

@@ -264,7 +264,7 @@ class ThreadsHomeReader:
         self._carried_viewport_candidate_identities: tuple[_TrackedRowIdentity, ...] = ()
         self._pending_viewport_candidate_identities: tuple[_TrackedRowIdentity, ...] = ()
         self._cached_home_bodies: dict[str, tuple[str, bool]] = {}
-        self._detail_return_anchor: tuple[str, float] | None = None
+        self._detail_return_anchor: str | None = None
         self._detail_return_target: PostTarget | None = None
         self._home_session = HomeSession(
             self, readiness_timeout_ms=_READINESS_TIMEOUT_MS
@@ -272,7 +272,6 @@ class ThreadsHomeReader:
         self._detail_navigator = DetailNavigator(
             self,
             timeout_ms=_DETAIL_TIMEOUT_MS,
-            max_permalink_candidates=_MAX_PERMALINK_CANDIDATES,
         )
         self._reported_render_rescans: set[tuple[str, float | None]] = set()
         self._skipped_candidate_identities: set[str] = set()
@@ -1331,6 +1330,7 @@ class ThreadsHomeReader:
         *,
         recoverable_codes: tuple[str, ...] | None = None,
         operation: str | None = None,
+        cancel_code: str | None = None,
     ) -> _ReadinessResult:
         allowed_codes = recoverable_codes or (timeout_code,)
         window = 0
@@ -1463,7 +1463,7 @@ class ThreadsHomeReader:
             if self._readiness_prompt is None:
                 raise UiReadError(final_code) from None
             if not await self._readiness_prompt(stage, window):
-                raise UiReadError(final_code) from None
+                raise UiReadError(cancel_code or final_code) from None
 
     async def _wait_for_home_render(
         self,
@@ -4408,6 +4408,10 @@ class ThreadsHomeReader:
 
     async def read_detail(self, target: PostTarget) -> PostTarget:
         return await self._read_detail(target)
+
+    @property
+    def detail_route_verified(self) -> bool:
+        return self._detail_navigator.route_verified
 
     async def actionable_now(self, target: PostTarget) -> PostTarget:
         return await self._detail_navigator.actionable_now(target)

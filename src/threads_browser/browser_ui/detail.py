@@ -6,7 +6,6 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from hashlib import sha256
 from typing import Any, Protocol
-from urllib.parse import urlsplit
 
 from playwright.async_api import (
     Error as PlaywrightError,
@@ -24,17 +23,20 @@ from ..feed.models import PostTarget
 from ..feed.relevance import normalize_text
 from ..feed.urls import _post_url, _post_url_hint, _profile_author, _same_home_origin
 from .body_text import _VisibleBodyRead
+from .feed_rows import _BODY_EXCLUSION_SELECTOR
 from .loading import CardNotReady as _CardNotReady
 from .loading import RenderObservation as _RenderObservation
 
 _DETAIL_ROOT_SELECTOR = 'article, [role="article"], [data-pressable-container="true"]'
 _DETAIL_QUOTE_SELECTOR = 'blockquote, [role="quote"]'
+_DETAIL_EXCLUDED_SELECTOR = _BODY_EXCLUSION_SELECTOR
 _DETAIL_PENDING_SELECTOR = (
     '[aria-busy="true"], [role="progressbar"], [data-loading="true"], '
     '[data-testid*="skeleton" i]'
 )
 _MAX_DETAIL_ROOTS = 40
 _MAX_DETAIL_LINKS = 40
+_MAX_DETAIL_TEXT_CANDIDATES = 200
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +78,8 @@ def _detail_body_matches(target: PostTarget, body: str | None) -> bool:
 
 def _detail_error_code(reason: str) -> str:
     return {
+        "RENDER_UNAVAILABLE": "DETAIL_RENDER_UNAVAILABLE",
+        "ROOT_ABSENT": "DETAIL_RENDER_UNAVAILABLE",
         "ROOT_AMBIGUOUS": "DETAIL_ROOT_AMBIGUOUS",
         "SELF_LINK_REJECTED": "DETAIL_PROVENANCE_UNVERIFIED",
         "AUTHOR_UNVERIFIED": "DETAIL_PROVENANCE_UNVERIFIED",
@@ -89,7 +93,7 @@ def _detail_error_code(reason: str) -> str:
 
 class DetailReaderHost(Protocol):
     _page: Page
-    _detail_return_anchor: tuple[str, float] | None
+    _detail_return_anchor: str | None
     _detail_return_target: PostTarget | None
 
     async def _is_in_visible_scrollports(self, element: Locator) -> bool: ...
@@ -98,11 +102,9 @@ class DetailReaderHost(Protocol):
     def _remaining_readiness_ms(self, deadline: float, timeout_code: str) -> int: ...
     def _mark_ui_transition(self) -> None: ...
     async def _check_blocker(self) -> None: ...
-    async def _read_card(self, root: Locator, *, require_body: bool = False) -> PostTarget: ...
     async def _read_detail_body(
         self, root: Locator, fingerprint: str
     ) -> _VisibleBodyRead: ...
-    async def _wait_for_pending_card(self, pending: _CardNotReady, deadline: float) -> None: ...
     async def _await_render_settled(
         self,
         stage: str,
@@ -118,17 +120,9 @@ class DetailReaderHost(Protocol):
         attempt: Callable[[float], Awaitable[Any]],
         *,
         recoverable_codes: tuple[str, ...] = (),
+        cancel_code: str | None = None,
     ) -> Any: ...
-    async def _content_region(
-        self,
-        *,
-        prefer_main: bool = False,
-        error_code: str = "FEED_REGION_AMBIGUOUS",
-    ) -> Locator: ...
     async def _is_outside_content_landmark(self, link: Locator) -> bool: ...
-    async def _resolve_permalink_card(
-        self, permalink: Locator, expected_url: str, expected_author: str
-    ) -> tuple[Locator, Any]: ...
     async def _go_back_to_home(self) -> None: ...
     async def _revalidate_action_target(self, target: PostTarget) -> PostTarget: ...
 
@@ -141,12 +135,11 @@ class DetailNavigator:
         host: DetailReaderHost,
         *,
         timeout_ms: int,
-        max_permalink_candidates: int,
     ) -> None:
         self._host = host
         self._timeout_ms = timeout_ms
-        self._max_permalink_candidates = max_permalink_candidates
         self._last_reported_detail_state: tuple[str, _DetailState] | None = None
+        self.route_verified = False
 
     async def _detail_click_point(self, permalink: Locator) -> tuple[float, float]:
         viewport = self._host._page.viewport_size
@@ -207,7 +200,7 @@ class DetailNavigator:
             f"terminal_reason={state.terminal_reason}"
         )
 
-    async def _detail_region(self) -> tuple[Locator | None, int]:
+    async def _detail_region(self) -> tuple[Locator, int]:
         for selector in ('main, [role="main"]', '[role="feed"]'):
             landmarks = self._host._page.locator(selector)
             visible: list[Locator] = []
@@ -216,14 +209,16 @@ class DetailNavigator:
                 if await landmark.is_visible():
                     visible.append(landmark)
             if visible:
-                return (visible[0] if len(visible) == 1 else None), len(visible)
-        return None, 0
+                if len(visible) == 1:
+                    return visible[0], 1
+                return self._host._page.locator("body"), len(visible)
+        return self._host._page.locator("body"), 0
 
     async def _is_top_level_detail_root(self, root: Locator, region: Locator) -> bool:
         return bool(
             await root.evaluate(
                 """(node, args) => {
-                    if (!args.region.contains(node) || node.closest(args.quote)) return false;
+                    if (!args.region.contains(node) || node.closest(args.excluded)) return false;
                     for (let parent = node.parentElement;
                          parent && parent !== args.region; parent = parent.parentElement) {
                         if (parent.matches(args.roots)) return false;
@@ -232,7 +227,7 @@ class DetailNavigator:
                 }""",
                 {
                     "region": await region.element_handle(),
-                    "quote": _DETAIL_QUOTE_SELECTOR,
+                    "excluded": _DETAIL_EXCLUDED_SELECTOR,
                     "roots": _DETAIL_ROOT_SELECTOR,
                 },
             )
@@ -348,6 +343,102 @@ class DetailNavigator:
             _detail_body_matches(target, body.body),
         )
 
+    async def _fallback_detail_roots(
+        self,
+        region: Locator,
+        target: PostTarget,
+    ) -> tuple[list[Locator], int, bool]:
+        selector = "p, span, div, section, main"
+        candidates = region.locator(selector)
+        count = await candidates.count()
+        scanned_count = min(count, _MAX_DETAIL_TEXT_CANDIDATES)
+        matching: list[tuple[str, Locator]] = []
+        visible_body_nodes = 0
+        for index in range(scanned_count):
+            candidate = candidates.nth(index)
+            if not await candidate.is_visible():
+                continue
+            eligible = await candidate.evaluate(
+                """(node, args) => {
+                    const excluded = args.excluded;
+                    if (node.closest(excluded) || node.closest(args.roots)) return false;
+                    if (node.querySelector(args.roots)) return false;
+                    const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+                    let text = "";
+                    let previousBlock = null;
+                    let textNode;
+                    while ((textNode = walker.nextNode())) {
+                        const parent = textNode.parentElement;
+                        if (!parent || parent.closest(args.excluded) ||
+                            parent.closest(args.roots)) continue;
+                        let current = parent;
+                        let visible = true;
+                        while (current && current !== node) {
+                            const style = getComputedStyle(current);
+                            if (style.display === "none" || style.visibility === "hidden" ||
+                                Number(style.opacity) === 0) {
+                                visible = false;
+                                break;
+                            }
+                            current = current.parentElement;
+                        }
+                        if (!visible) continue;
+                        let block = parent;
+                        while (block && block !== node) {
+                            const display = getComputedStyle(block).display;
+                            if (["block", "flow-root", "flex", "grid", "list-item",
+                                 "table", "table-cell", "table-caption"].includes(display)) {
+                                break;
+                            }
+                            block = block.parentElement;
+                        }
+                        if (previousBlock && block !== previousBlock) text += " ";
+                        text += textNode.data;
+                        previousBlock = block;
+                    }
+                    return text;
+                }""",
+                {
+                    "excluded": _DETAIL_EXCLUDED_SELECTOR,
+                    "roots": _DETAIL_ROOT_SELECTOR,
+                },
+            )
+            if not eligible or not await self._host._is_in_visible_scrollports(candidate):
+                continue
+            text = eligible
+            if not text.strip():
+                continue
+            visible_body_nodes += 1
+            if not _detail_body_matches(target, text):
+                continue
+            path = await candidate.evaluate(
+                """node => {
+                    const path = [];
+                    for (let current = node; current?.parentElement;
+                         current = current.parentElement) {
+                        let siblingIndex = 0;
+                        for (let sibling = current.previousElementSibling;
+                             sibling; sibling = sibling.previousElementSibling) siblingIndex++;
+                        path.push(`${current.tagName.toLowerCase()}:${siblingIndex}`);
+                    }
+                    return path.reverse().join("/");
+                }"""
+            )
+            matching.append((path, candidate))
+
+        # Keep the outermost exact-text container for a body, so a matching
+        # paragraph and its matching wrapper count as one post root.
+        roots: list[Locator] = []
+        for path, candidate in matching:
+            if any(
+                path.startswith(f"{other_path}/")
+                for other_path, _ in matching
+                if other_path != path
+            ):
+                continue
+            roots.append(candidate)
+        return roots, visible_body_nodes, count > scanned_count
+
     async def _observe_detail(
         self,
         target: PostTarget,
@@ -373,27 +464,6 @@ class DetailNavigator:
 
         region, region_count = await self._detail_region()
         pending = await self._has_pending_ui(region)
-        if region is None:
-            reason = "ROOT_AMBIGUOUS" if region_count > 1 else "ROOT_ABSENT"
-            state = _DetailState(
-                route_verified=True,
-                same_origin=True,
-                main_regions_count=region_count,
-                hydration_pending=pending,
-                terminal_reason=reason,
-            )
-            self._report_detail_state("POST_ROUTE", state)
-            if pending:
-                return None, state
-            return (
-                _RenderObservation(
-                    ("no-main-region", region_count, pending),
-                    target,
-                    terminal_code=_detail_error_code(reason),
-                ),
-                state,
-            )
-
         all_roots = region.locator(_DETAIL_ROOT_SELECTOR)
         root_count = await all_roots.count()
         article_roots = 0
@@ -432,74 +502,6 @@ class DetailNavigator:
                 state,
             )
 
-        # Older layouts expose a generic card wrapper but no semantic row root.
-        # Accept that path only when it contains the target's canonical self link.
-        if not candidate_roots and self_permalink_candidates:
-            try:
-                root = await self._detail_permalink_card(target)
-                detail = await self._host._read_card(
-                    root,
-                    require_body=target.body is not None,
-                )
-            except _CardNotReady as readiness:
-                pending = pending or readiness.reason_code in {
-                    "POST_ROOT_DOM_IDENTITY_CHANGED",
-                    "POST_BODY_PENDING",
-                    "POST_AUTHOR_PENDING",
-                    "POST_PERMALINK_PENDING",
-                }
-                state = _DetailState(
-                    True, True, region_count, article_roots, pressable_roots,
-                    self_permalink_candidates, 0, 0, 0, pending, "BODY_PENDING",
-                )
-                self._report_detail_state("POST_ROUTE", state)
-                if pending:
-                    return None, state
-                return (
-                    _RenderObservation(
-                        ("generic-card-pending", self_permalink_candidates),
-                        target,
-                        terminal_code="DETAIL_BODY_UNVERIFIED",
-                    ),
-                    state,
-                )
-            body_matches = _detail_body_matches(target, detail.body)
-            if detail.author != target.author:
-                reason = "AUTHOR_CONFLICT"
-            elif not body_matches:
-                reason = "BODY_CHANGED"
-            elif not detail.body_complete or not detail.body_consistent:
-                reason = "BODY_PENDING" if not detail.body_consistent else "BODY_CHANGED"
-            else:
-                state = _DetailState(
-                    True, True, region_count, article_roots, pressable_roots,
-                    self_permalink_candidates, 1, 1, 1, False, "DETAIL_VERIFIED",
-                )
-                self._report_detail_state("POST_ROUTE", state)
-                return (
-                    _RenderObservation(
-                        (detail.url, detail.author, sha256(detail.body.encode()).hexdigest()),
-                        detail,
-                        ready_state="DETAIL_VERIFIED",
-                    ),
-                    state,
-                )
-            state = _DetailState(
-                True, True, region_count, article_roots, pressable_roots,
-                self_permalink_candidates, 1, 1, 0, pending, reason,
-            )
-            self._report_detail_state("POST_ROUTE", state)
-            if pending:
-                return None, state
-            return (
-                _RenderObservation(
-                    ("generic-card-unverified", reason),
-                    target,
-                    terminal_code=_detail_error_code(reason),
-                ),
-                state,
-            )
-
         reads: list[_DetailRootRead] = []
         for root in candidate_roots:
             try:
@@ -507,17 +509,45 @@ class DetailNavigator:
             except _CardNotReady:
                 pending = True
 
+        fallback_visible_nodes = 0
+        if not any(item.body_matches for item in reads):
+            fallback_roots, fallback_visible_nodes, fallback_incomplete = (
+                await self._fallback_detail_roots(region, target)
+            )
+            if fallback_incomplete:
+                state = _DetailState(
+                    True, True, region_count, article_roots, pressable_roots,
+                    self_permalink_candidates, 0, fallback_visible_nodes,
+                    len(fallback_roots), pending, "ROOT_AMBIGUOUS",
+                )
+                self._report_detail_state("POST_ROUTE", state)
+                return (
+                    _RenderObservation(
+                        ("fallback-search-incomplete", region_count),
+                        target,
+                        terminal_code="DETAIL_ROOT_AMBIGUOUS",
+                    ),
+                    state,
+                )
+            for root in fallback_roots:
+                try:
+                    reads.append(await self._read_detail_root(root, target))
+                except _CardNotReady:
+                    pending = True
+
         author_candidates = sum(len(item.authors) for item in reads)
-        body_nodes_visible = sum(
-            item.body.read_evidence.visible_text_rect_count or 0 for item in reads
+        body_nodes_visible = max(
+            fallback_visible_nodes,
+            sum(item.body.read_evidence.visible_text_rect_count or 0 for item in reads),
         )
         body_matches = [item for item in reads if item.body_matches]
-        expected_matches = [
+        route_and_content_matches = [
             item
             for item in body_matches
-            if item.authors == {target.author} and not item.has_rejected_post_link
+            if not item.has_rejected_post_link
+            and (not item.authors or item.authors == {target.author})
         ]
-        matching_roots = len(expected_matches)
+        matching_roots = len(route_and_content_matches)
 
         if len(body_matches) > 1:
             reason = "ROOT_AMBIGUOUS"
@@ -525,10 +555,8 @@ class DetailNavigator:
             reason = "SELF_LINK_REJECTED"
         elif body_matches and body_matches[0].authors and body_matches[0].authors != {target.author}:
             reason = "AUTHOR_CONFLICT"
-        elif body_matches and not body_matches[0].authors:
-            reason = "AUTHOR_UNVERIFIED"
-        elif expected_matches:
-            read = expected_matches[0]
+        elif route_and_content_matches:
+            read = route_and_content_matches[0]
             if not read.body.consistent:
                 reason = "BODY_CHANGED"
             elif not read.body.complete:
@@ -574,12 +602,10 @@ class DetailNavigator:
                 )
         elif any(item.authors == {target.author} for item in reads):
             reason = "BODY_CHANGED"
-        elif any(item.authors and target.author not in item.authors for item in body_matches):
-            reason = "AUTHOR_CONFLICT"
-        elif candidate_roots and not any(item.authors for item in reads):
-            reason = "AUTHOR_UNVERIFIED"
+        elif body_nodes_visible == 0:
+            reason = "RENDER_UNAVAILABLE"
         else:
-            reason = "ROOT_ABSENT"
+            reason = "BODY_CHANGED"
 
         state = _DetailState(
             True, True, region_count, article_roots, pressable_roots,
@@ -587,7 +613,12 @@ class DetailNavigator:
             matching_roots, pending, reason,
         )
         self._report_detail_state("POST_ROUTE", state)
-        if pending:
+        if pending or reason in {
+            "RENDER_UNAVAILABLE",
+            "BODY_PENDING",
+            "BODY_CHANGED",
+            "STABILITY_PENDING",
+        }:
             return None, state
         return (
             _RenderObservation(
@@ -607,6 +638,9 @@ class DetailNavigator:
         )
 
     async def _read_detail(self, target: PostTarget) -> PostTarget:
+        self.route_verified = False
+        self._host._detail_return_anchor = None
+        self._host._detail_return_target = None
         deadline = self._host._readiness_deadline(self._timeout_ms)
         try:
 
@@ -620,6 +654,8 @@ class DetailNavigator:
             )
             current = await self.actionable_now(target)
             click_point = await self._detail_click_point(current.permalink)
+            self._host._detail_return_anchor = current.fingerprint
+            self._host._detail_return_target = current
             self._host._remaining_readiness_ms(
                 deadline,
                 "DETAIL_NAVIGATION_UNVERIFIED",
@@ -672,11 +708,12 @@ class DetailNavigator:
                 terminal_reason="ROUTE_VERIFIED",
             ),
         )
+        self.route_verified = True
 
         latest_state = _DetailState(
             route_verified=True,
             same_origin=True,
-            terminal_reason="ROOT_ABSENT",
+            terminal_reason="RENDER_UNAVAILABLE",
         )
 
         async def read_detail_window(window_deadline: float) -> PostTarget:
@@ -684,30 +721,6 @@ class DetailNavigator:
 
             async def observe() -> _RenderObservation[PostTarget] | None:
                 nonlocal latest_state
-                try:
-                    await self._host._page.wait_for_function(
-                        """() => Array.from(document.querySelectorAll(
-                            'main, [role="main"], [role="feed"]'
-                        )).some(node => {
-                            if (node.getAttribute("aria-busy") === "true") return true;
-                            const style = getComputedStyle(node);
-                            const rect = node.getBoundingClientRect();
-                            return style.display !== "none" &&
-                                style.visibility !== "hidden" &&
-                                rect.width > 0 && rect.height > 0;
-                        })""",
-                        timeout=self._host._remaining_readiness_ms(
-                            window_deadline,
-                            "DETAIL_RENDER_PENDING",
-                        ),
-                    )
-                except PlaywrightTimeoutError:
-                    observation, latest_state = await self._observe_detail(target)
-                    return observation
-                self._host._remaining_readiness_ms(
-                    window_deadline,
-                    "DETAIL_RENDER_PENDING",
-                )
                 await self._host._check_blocker()
                 observation, latest_state = await self._observe_detail(target)
                 self._host._remaining_readiness_ms(
@@ -729,6 +742,7 @@ class DetailNavigator:
                 "DETAIL_RENDER_PENDING",
                 read_detail_window,
                 recoverable_codes=("DETAIL_RENDER_PENDING",),
+                cancel_code="OPERATOR_CANCELLED",
             )
         except UiReadError as error:
             if error.code == "DETAIL_RENDER_PENDING":
@@ -740,46 +754,7 @@ class DetailNavigator:
             raise UiReadError("DETAIL_BODY_UNVERIFIED")
         if not _detail_body_matches(target, detail.body):
             raise UiReadError("DETAIL_BODY_UNVERIFIED")
-        self._host._detail_return_anchor = (target.fingerprint, target.viewport_y)
-        self._host._detail_return_target = target
         return detail
-
-    async def _detail_permalink_card(self, target: PostTarget) -> Locator:
-        region = await self._host._content_region(
-            prefer_main=True,
-            error_code="DETAIL_REGION_AMBIGUOUS",
-        )
-        permalinks = region.locator('a[href*="/post/"]')
-        scan_limit = min(await permalinks.count(), self._max_permalink_candidates)
-        for index in range(scan_limit):
-            permalink = permalinks.nth(index)
-            if not await permalink.is_visible():
-                continue
-            if await self._host._is_outside_content_landmark(permalink):
-                continue
-            href = await permalink.get_attribute("href")
-            parsed_post = None if href is None else _post_url(href)
-            if parsed_post is None:
-                if href is not None and _post_url_hint(href):
-                    raise UiReadError("DETAIL_PROVENANCE_UNVERIFIED")
-                continue
-            if parsed_post[0] != target.url:
-                continue
-            root, _ = await self._host._resolve_permalink_card(
-                permalink,
-                target.url,
-                target.author,
-            )
-            return root
-        path = urlsplit(target.url).path
-        matching_permalink = region.locator(f'a[href$="{path}"]')
-        if await matching_permalink.count() and await self._has_pending_ui(region):
-            raise _CardNotReady(
-                matching_permalink.first,
-                in_viewport=True,
-                timeout_code="DETAIL_RENDER_PENDING",
-            )
-        raise UiReadError("DETAIL_ROOT_UNVERIFIED")
 
     async def return_to_home(self) -> None:
         await self._host._go_back_to_home()
@@ -791,5 +766,5 @@ class DetailNavigator:
             current = await self._host._revalidate_action_target(target)
         except UiReadError:
             raise UiReadError("RETURN_CONTEXT_CHANGED") from None
-        if current.fingerprint != anchor[0] or abs(current.viewport_y - anchor[1]) > 48:
+        if current.fingerprint != anchor:
             raise UiReadError("RETURN_CONTEXT_CHANGED")
