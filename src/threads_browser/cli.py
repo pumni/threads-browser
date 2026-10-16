@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import math
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -68,6 +69,16 @@ def _add_run_options(parser: argparse.ArgumentParser, *, legacy: bool) -> None:
         type=int,
         default=40,
         help="maximum distinct verified posts per run (1-400; default: 40)",
+    )
+    parser.add_argument(
+        "--max-runtime-seconds",
+        type=float,
+        help="optional maximum browser workflow runtime in seconds",
+    )
+    parser.add_argument(
+        "--no-readiness-prompt",
+        action="store_true",
+        help="stop when readiness checks expire instead of waiting for operator input",
     )
     parser.add_argument(
         "-t",
@@ -348,6 +359,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not 1 <= args.max_total_posts <= 400:
                 print("ERROR TOTAL_SCAN_LIMIT_INVALID", file=sys.stderr)
                 return 1
+            if args.max_runtime_seconds is not None and (
+                not math.isfinite(args.max_runtime_seconds)
+                or args.max_runtime_seconds <= 0
+            ):
+                print("ERROR RUNTIME_LIMIT_INVALID", file=sys.stderr)
+                return 1
 
             account = accounts.get(args.alias)
             if account.expected_actor is None:
@@ -376,12 +393,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                         terms=terms,
                         max_scrolls=args.max_scrolls,
                         max_total_posts=args.max_total_posts,
+                        max_runtime_seconds=args.max_runtime_seconds,
                         show_post_text=args.show_post_text,
                         show_observed_text=args.show_observed_text,
                         detail=args.detail,
                         readiness_prompt=(
                             _prompt_readiness_extension
-                            if _has_interactive_terminal()
+                            if not args.no_readiness_prompt
+                            and _has_interactive_terminal()
                             else None
                         ),
                     )

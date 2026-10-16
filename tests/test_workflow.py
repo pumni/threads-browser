@@ -3705,6 +3705,167 @@ def test_direct_browser_workflow_rejects_busy_profile_and_releases_on_failure(
         pass
 
 
+def test_browser_runtime_timeout_during_launch_releases_profile_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = tmp_path / "dedicated-profile"
+    profile.mkdir()
+    account = BrowserAccount(uuid4(), "offline", "offline.operator", profile)
+    store = CheckpointStore(tmp_path / "data")
+    manager_state = {"entered": False, "exited": False}
+
+    class Chromium:
+        async def launch_persistent_context(self, **_kwargs):
+            await asyncio.Event().wait()
+
+    class Manager:
+        async def __aenter__(self):
+            manager_state["entered"] = True
+            return SimpleNamespace(chromium=Chromium())
+
+        async def __aexit__(self, *_args):
+            manager_state["exited"] = True
+
+    monkeypatch.setattr(workflow, "async_playwright", Manager)
+
+    with pytest.raises(UiReadError) as caught:
+        asyncio.run(
+            workflow.run_browser_nurture(
+                account,
+                store,
+                max_posts=1,
+                terms=("hiring",),
+                max_runtime_seconds=0.01,
+            )
+        )
+
+    assert caught.value.code == "CYCLE_TIMEOUT"
+    assert manager_state == {"entered": True, "exited": True}
+    checkpoint = store.load(account.account_id, policy_fingerprint(("hiring",)))
+    assert checkpoint.seen_fingerprints == ()
+    assert checkpoint.pending_read_fingerprints == ()
+    with store.profile_lock(account):
+        pass
+
+
+def test_browser_runtime_timeout_during_active_detail_closes_context_and_releases_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = tmp_path / "dedicated-profile"
+    profile.mkdir()
+    account = BrowserAccount(uuid4(), "offline", "offline.operator", profile)
+    store = CheckpointStore(tmp_path / "data")
+    lifecycle = {"closed": False, "manager_exited": False, "detail": False}
+
+    class Context:
+        def __init__(self) -> None:
+            self.pages = [object()]
+
+        async def close(self):
+            lifecycle["closed"] = True
+
+    context = Context()
+
+    class Chromium:
+        async def launch_persistent_context(self, **_kwargs):
+            return context
+
+    class Manager:
+        async def __aenter__(self):
+            return SimpleNamespace(chromium=Chromium())
+
+        async def __aexit__(self, *_args):
+            lifecycle["manager_exited"] = True
+
+    async def wait_in_detail(*_args, **kwargs):
+        lifecycle["detail"] = kwargs["detail"]
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(workflow, "async_playwright", Manager)
+    monkeypatch.setattr(workflow, "_detail_terminal_ready", lambda: True)
+    monkeypatch.setattr(workflow, "run_page_workflow", wait_in_detail)
+
+    with pytest.raises(UiReadError) as caught:
+        asyncio.run(
+            workflow.run_browser_nurture(
+                account,
+                store,
+                max_posts=1,
+                terms=("hiring",),
+                max_runtime_seconds=0.01,
+                detail=True,
+            )
+        )
+
+    assert caught.value.code == "CYCLE_TIMEOUT"
+    assert lifecycle == {"closed": True, "manager_exited": True, "detail": True}
+    checkpoint = store.load(account.account_id, policy_fingerprint(("hiring",)))
+    assert checkpoint.seen_fingerprints == ()
+    assert checkpoint.pending_read_fingerprints == ()
+    with store.profile_lock(account):
+        pass
+
+
+def test_external_browser_cancellation_propagates_after_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = tmp_path / "dedicated-profile"
+    profile.mkdir()
+    account = BrowserAccount(uuid4(), "offline", "offline.operator", profile)
+    store = CheckpointStore(tmp_path / "data")
+    lifecycle = {"closed": False, "manager_exited": False}
+
+    class Context:
+        def __init__(self) -> None:
+            self.pages = [object()]
+
+        async def close(self):
+            lifecycle["closed"] = True
+
+    class Chromium:
+        async def launch_persistent_context(self, **_kwargs):
+            return Context()
+
+    class Manager:
+        async def __aenter__(self):
+            return SimpleNamespace(chromium=Chromium())
+
+        async def __aexit__(self, *_args):
+            lifecycle["manager_exited"] = True
+
+    async def wait_for_cancellation(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(workflow, "async_playwright", Manager)
+    monkeypatch.setattr(workflow, "run_page_workflow", wait_for_cancellation)
+
+    async def exercise() -> None:
+        task = asyncio.create_task(
+            workflow.run_browser_nurture(
+                account,
+                store,
+                max_posts=1,
+                terms=("hiring",),
+            )
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+
+    assert lifecycle == {"closed": True, "manager_exited": True}
+    checkpoint = store.load(account.account_id, policy_fingerprint(("hiring",)))
+    assert checkpoint.seen_fingerprints == ()
+    assert checkpoint.pending_read_fingerprints == ()
+    with store.profile_lock(account):
+        pass
+
+
 def test_browser_workflow_detail_requires_tty_before_profile_or_browser_access(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

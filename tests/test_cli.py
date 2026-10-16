@@ -289,6 +289,69 @@ def test_detail_cli_supports_short_and_legacy_run_without_duplicate_opt_in_text(
     assert "STOP RETURN_CONTEXT_CHANGED" not in failed.err
 
 
+def test_runtime_budget_and_prompt_suppression_reach_short_and_legacy_workflows(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    root = tmp_path / "private-root"
+    profile = tmp_path / "existing-profile"
+    profile.mkdir()
+    monkeypatch.setenv("THREADS_BROWSER_DATA_ROOT", str(root))
+    assert main(
+        [
+            "account",
+            "add",
+            "pilot",
+            "--actor",
+            "offline.operator",
+            "--profile-dir",
+            str(profile),
+        ]
+    ) == 0
+    capsys.readouterr()
+    TermsStore(root).set("pilot", ("hiring",))
+    monkeypatch.setattr(cli, "_has_interactive_terminal", lambda: True)
+    calls: dict[str, object] = {}
+
+    async def fake_run(_account, _store, **kwargs):
+        calls.update(kwargs)
+        return SimpleNamespace(
+            status="NO_VERIFIED_POSTS_IN_BUDGET",
+            ui_status="UNVERIFIED_LIVE_UI",
+            home_sampled=0,
+            home_new=0,
+            home_relevant=0,
+            home_irrelevant=0,
+            home_unknown=0,
+            home_relevant_ratio=None,
+            duplicates=0,
+            detail_reads=0,
+            scroll_attempts=0,
+            scrolls=0,
+            skipped_unverified=0,
+            checkpoint_runs=0,
+        )
+
+    monkeypatch.setattr(workflow, "run_browser_nurture", fake_run)
+    for command in (
+        ["run", "pilot"],
+        ["nurture", "run", "pilot", "--headed", "--max-posts", "20", "-t", "hiring"],
+    ):
+        calls.clear()
+        result = main([*command, "--max-runtime-seconds", "12.5", "--no-readiness-prompt"])
+        capsys.readouterr()
+        assert result == 0
+        assert calls["max_runtime_seconds"] == 12.5
+        assert calls["readiness_prompt"] is None
+
+
+def test_runtime_budget_must_be_positive_and_finite(capsys) -> None:
+    for runtime in ("0", "-1", "nan", "inf"):
+        assert main(["run", "missing", "--max-runtime-seconds", runtime]) == 1
+        assert capsys.readouterr().err == "ERROR RUNTIME_LIMIT_INVALID\n"
+
+
 def test_show_post_text_cli_passes_opt_in_only_after_tty_check(
     tmp_path: Path,
     monkeypatch,
