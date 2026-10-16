@@ -3669,6 +3669,43 @@ def test_default_desktop_profile_is_rejected_before_browser_startup(
     assert launch_error.value.code == "PROFILE_UNAVAILABLE"
 
 
+def test_direct_browser_workflow_rejects_busy_profile_and_releases_on_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = tmp_path / "dedicated-profile"
+    profile.mkdir()
+    account = BrowserAccount(uuid4(), "offline", "offline.operator", profile)
+    store = CheckpointStore(tmp_path / "data")
+
+    def browser_must_not_start():
+        pytest.fail("busy profile must be rejected before Playwright starts")
+
+    monkeypatch.setattr(workflow, "async_playwright", browser_must_not_start)
+    with store.profile_lock(account):
+        with pytest.raises(BrowserDataError) as busy:
+            asyncio.run(
+                workflow.run_browser_nurture(
+                    account, store, max_posts=1, terms=("hiring",)
+                )
+            )
+    assert busy.value.code == "ACCOUNT_BUSY"
+
+    def fail_browser_start():
+        raise OSError("synthetic browser startup failure")
+
+    monkeypatch.setattr(workflow, "async_playwright", fail_browser_start)
+    with pytest.raises(UiReadError) as failed:
+        asyncio.run(
+            workflow.run_browser_nurture(
+                account, store, max_posts=1, terms=("hiring",)
+            )
+        )
+    assert failed.value.code == "INTERNAL_OPERATION_ERROR"
+    with store.profile_lock(account):
+        pass
+
+
 def test_browser_workflow_detail_requires_tty_before_profile_or_browser_access(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
