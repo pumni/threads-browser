@@ -3682,13 +3682,12 @@ def test_direct_browser_workflow_rejects_busy_profile_and_releases_on_failure(
         pytest.fail("busy profile must be rejected before Playwright starts")
 
     monkeypatch.setattr(workflow, "async_playwright", browser_must_not_start)
-    with store.profile_lock(account):
-        with pytest.raises(BrowserDataError) as busy:
-            asyncio.run(
-                workflow.run_browser_nurture(
-                    account, store, max_posts=1, terms=("hiring",)
-                )
+    with store.profile_lock(account), pytest.raises(BrowserDataError) as busy:
+        asyncio.run(
+            workflow.run_browser_nurture(
+                account, store, max_posts=1, terms=("hiring",)
             )
+        )
     assert busy.value.code == "ACCOUNT_BUSY"
 
     def fail_browser_start():
