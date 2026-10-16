@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sys
@@ -46,6 +47,28 @@ _CHECKPOINT_KEYS = {
 _MAX_DOCUMENT_BYTES = 256 * 1024
 _MAX_COUNTER = 1_000_000_000_000
 _MAX_SEEN = 5_000
+_UTC_TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z")
+_OPERATION_STATUS_KEYS = {
+    "schema_version",
+    "started_at",
+    "finished_at",
+    "duration_seconds",
+    "status",
+    "cycle_status",
+    "stop_reason",
+    "exit_code",
+    "checkpoint_runs",
+    "counters",
+}
+_OPERATION_COUNTERS = {
+    "home_sampled",
+    "home_new",
+    "detail_reads",
+    "scroll_attempts",
+    "scrolls",
+    "skipped_unverified",
+    "unique_verified_posts",
+}
 _ERROR_CODES = {
     "ACCOUNT_BUSY",
     "ACCOUNT_INVALID",
@@ -668,6 +691,60 @@ class CheckpointStore:
             f"{validated.account_id}-{validated.policy_fingerprint}.json"
         )
         _write_json(root, target, validated.to_document())
+
+
+def write_operation_status(data_root: Path, document: Mapping[str, object]) -> None:
+    """Atomically replace the sanitized latest scheduled-run summary."""
+    if (
+        set(document) != _OPERATION_STATUS_KEYS
+        or type(document.get("schema_version")) is not int
+        or document.get("schema_version") != 1
+        or not isinstance(document.get("started_at"), str)
+        or _UTC_TIMESTAMP.fullmatch(document["started_at"]) is None
+        or (
+            document.get("finished_at") is not None
+            and (
+                not isinstance(document.get("finished_at"), str)
+                or _UTC_TIMESTAMP.fullmatch(document["finished_at"]) is None
+            )
+        )
+        or not isinstance(document.get("status"), str)
+        or document.get("status") not in {"RUNNING", "COMPLETE", "FAILED", "STOPPED"}
+        or not isinstance(document.get("stop_reason"), str)
+        or re.fullmatch(r"[A-Z0-9_]{1,80}", document["stop_reason"]) is None
+        or (
+            document.get("cycle_status") is not None
+            and (
+                not isinstance(document.get("cycle_status"), str)
+                or re.fullmatch(r"[A-Z0-9_]{1,80}", document["cycle_status"]) is None
+            )
+        )
+    ):
+        raise BrowserDataError("STATE_INVALID")
+
+    duration = document.get("duration_seconds")
+    exit_code = document.get("exit_code")
+    checkpoint_runs = document.get("checkpoint_runs")
+    counters = document.get("counters")
+    if (
+        isinstance(duration, bool)
+        or not isinstance(duration, (int, float))
+        or not math.isfinite(duration)
+        or duration < 0
+        or (exit_code is not None and type(exit_code) is not int)
+        or (
+            checkpoint_runs is not None
+            and (type(checkpoint_runs) is not int or checkpoint_runs < 0)
+        )
+        or not isinstance(counters, Mapping)
+        or not set(counters).issubset(_OPERATION_COUNTERS)
+        or any(type(value) is not int or value < 0 for value in counters.values())
+    ):
+        raise BrowserDataError("STATE_INVALID")
+
+    root = _ensure_root(data_root)
+    directory = _ensure_directory(root, "operations")
+    _write_json(root, directory / "last_run.json", dict(document))
 
 
 def profile_lock(data_root: Path, account: BrowserAccount) -> ProcessLock:

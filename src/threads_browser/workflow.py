@@ -206,34 +206,42 @@ async def run_browser_nurture(
         )
         raise UiReadError("INTERNAL_OPERATION_ERROR") from None
     finally:
+        cleanup_failed = False
+        operation_failed = sys.exc_info()[0] is not None
         try:
             if context is not None:
                 try:
                     async with asyncio.timeout(_CLEANUP_ALLOWANCE_SECONDS):
                         await context.close()
-                except PlaywrightError:
-                    pass
                 except TimeoutError:
-                    _emit_cleanup_timeout()
+                    cleanup_failed = True
+                    _emit_cleanup_failure(timed_out=True)
+                except Exception:  # noqa: BLE001 - sanitize cleanup failures; cancellation is not an Exception.
+                    cleanup_failed = True
+                    _emit_cleanup_failure(timed_out=False)
             if manager_entered:
                 assert playwright_manager is not None
                 try:
                     async with asyncio.timeout(_CLEANUP_ALLOWANCE_SECONDS):
                         await playwright_manager.__aexit__(None, None, None)
-                except PlaywrightError:
-                    pass
                 except TimeoutError:
-                    _emit_cleanup_timeout()
+                    cleanup_failed = True
+                    _emit_cleanup_failure(timed_out=True)
+                except Exception:  # noqa: BLE001 - sanitize cleanup failures; cancellation is not an Exception.
+                    cleanup_failed = True
+                    _emit_cleanup_failure(timed_out=False)
         finally:
             lock.release()
+        if cleanup_failed and not operation_failed:
+            raise UiReadError("BROWSER_CLEANUP_FAILED") from None
 
 
-def _emit_cleanup_timeout() -> None:
+def _emit_cleanup_failure(*, timed_out: bool) -> None:
     emit_failure_diagnostic(
         phase="STOPPED",
         operation="OTHER",
         error_class="OTHER",
-        error_kind="TIMEOUT",
+        error_kind="TIMEOUT" if timed_out else "OTHER",
         page_closed=None,
         context_closed=None,
     )

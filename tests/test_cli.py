@@ -9,10 +9,12 @@ import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from threads_browser import cli, workflow
 from threads_browser.cli import main
 from threads_browser.reader import UiReadError
-from threads_browser.storage import AccountStore, TermsStore
+from threads_browser.storage import AccountStore, BrowserDataError, TermsStore
 
 
 def test_account_cli_keeps_profile_reference_and_actor_out_of_output(
@@ -350,6 +352,170 @@ def test_runtime_budget_must_be_positive_and_finite(capsys) -> None:
     for runtime in ("0", "-1", "nan", "inf"):
         assert main(["run", "missing", "--max-runtime-seconds", runtime]) == 1
         assert capsys.readouterr().err == "ERROR RUNTIME_LIMIT_INVALID\n"
+
+
+@pytest.mark.parametrize(
+    "code",
+    ("ACCOUNT_BUSY", "LOGIN_REQUIRED", "CHALLENGE_REQUIRED", "RATE_LIMITED", "CYCLE_TIMEOUT"),
+)
+def test_scheduled_failures_write_sanitized_status(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+    code: str,
+) -> None:
+    root = tmp_path / "private-root"
+    profile = tmp_path / "existing-profile"
+    profile.mkdir()
+    monkeypatch.setenv("THREADS_BROWSER_DATA_ROOT", str(root))
+    assert main(
+        [
+            "account",
+            "add",
+            "pilot",
+            "--actor",
+            "offline.operator",
+            "--profile-dir",
+            str(profile),
+        ]
+    ) == 0
+    TermsStore(root).set("pilot", ("hiring",))
+    capsys.readouterr()
+    monkeypatch.setattr(cli, "_has_interactive_terminal", lambda: True)
+    calls: dict[str, object] = {}
+
+    async def fail_run(_account, _store, **kwargs):
+        calls.update(kwargs)
+        if code == "ACCOUNT_BUSY":
+            raise BrowserDataError(code)
+        raise UiReadError(code)
+
+    monkeypatch.setattr(workflow, "run_browser_nurture", fail_run)
+    assert main(["run", "pilot", "--scheduled", "--max-runtime-seconds", "720"]) == 1
+    captured = capsys.readouterr()
+    status = json.loads((root / "operations" / "last_run.json").read_text(encoding="utf-8"))
+
+    assert status["status"] == "FAILED"
+    assert status["stop_reason"] == code
+    assert status["exit_code"] == 1
+    assert status["checkpoint_runs"] == 0
+    assert status["counters"] == {}
+    assert status["started_at"].endswith("Z")
+    assert status["finished_at"].endswith("Z")
+    assert status["duration_seconds"] >= 0
+    assert calls["readiness_prompt"] is None
+    assert "offline.operator" not in json.dumps(status) + captured.out + captured.err
+    assert str(profile) not in json.dumps(status) + captured.out + captured.err
+
+
+def test_scheduled_success_records_only_safe_counts(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    root = tmp_path / "private-root"
+    profile = tmp_path / "existing-profile"
+    profile.mkdir()
+    monkeypatch.setenv("THREADS_BROWSER_DATA_ROOT", str(root))
+    assert main(
+        [
+            "account",
+            "add",
+            "pilot",
+            "--actor",
+            "offline.operator",
+            "--profile-dir",
+            str(profile),
+        ]
+    ) == 0
+    TermsStore(root).set("pilot", ("hiring",))
+    capsys.readouterr()
+
+    async def successful_run(_account, _store, **_kwargs):
+        return SimpleNamespace(
+            status="COMPLETE_WITH_SKIPS",
+            ui_status="UNVERIFIED_LIVE_UI",
+            stop_reason="FEED_END_REACHED",
+            checkpoint_runs=7,
+            home_sampled=12,
+            home_new=3,
+            home_relevant=2,
+            home_irrelevant=1,
+            home_unknown=0,
+            home_relevant_ratio=0.67,
+            duplicates=4,
+            detail_reads=1,
+            scroll_attempts=2,
+            scrolls=2,
+            skipped_unverified=1,
+            unique_verified_posts=1,
+            actor="offline.operator",
+            url="https://www.threads.com/@candidate/post/synthetic",
+            body="synthetic body",
+        )
+
+    monkeypatch.setattr(workflow, "run_browser_nurture", successful_run)
+    assert main(["run", "pilot", "--scheduled", "--max-runtime-seconds", "720"]) == 0
+    output = capsys.readouterr().out
+    status_json = (root / "operations" / "last_run.json").read_text(encoding="utf-8")
+    status = json.loads(status_json)
+
+    assert status["status"] == "COMPLETE"
+    assert status["cycle_status"] == "COMPLETE_WITH_SKIPS"
+    assert status["stop_reason"] == "FEED_END_REACHED"
+    assert status["exit_code"] == 0
+    assert status["checkpoint_runs"] == 7
+    assert status["counters"] == {
+        "detail_reads": 1,
+        "home_new": 3,
+        "home_sampled": 12,
+        "scroll_attempts": 2,
+        "scrolls": 2,
+        "skipped_unverified": 1,
+        "unique_verified_posts": 1,
+    }
+    assert all(
+        value not in status_json + output
+        for value in (
+            "offline.operator",
+            str(profile),
+            "threads.com",
+            "synthetic body",
+        )
+    )
+
+
+def test_scheduled_runs_require_runtime_and_reject_text_opt_ins(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    root = tmp_path / "private-root"
+    profile = tmp_path / "existing-profile"
+    profile.mkdir()
+    monkeypatch.setenv("THREADS_BROWSER_DATA_ROOT", str(root))
+    assert main(
+        [
+            "account",
+            "add",
+            "pilot",
+            "--actor",
+            "offline.operator",
+            "--profile-dir",
+            str(profile),
+        ]
+    ) == 0
+    TermsStore(root).set("pilot", ("hiring",))
+    capsys.readouterr()
+
+    assert main(["run", "pilot", "--scheduled"]) == 1
+    assert capsys.readouterr().err == "ERROR SCHEDULED_RUNTIME_REQUIRED\n"
+    status = json.loads((root / "operations" / "last_run.json").read_text(encoding="utf-8"))
+    assert status["status"] == "FAILED"
+    assert status["stop_reason"] == "SCHEDULED_RUNTIME_REQUIRED"
+
+    assert main(["run", "pilot", "--scheduled", "--detail"]) == 1
+    assert capsys.readouterr().err == "ERROR SCHEDULED_TEXT_OUTPUT_INVALID\n"
 
 
 def test_show_post_text_cli_passes_opt_in_only_after_tty_check(

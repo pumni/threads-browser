@@ -10,7 +10,7 @@ src/threads_browser/
   login.py                   Human-operated persistent Chromium login
   reader.py                  Compatibility API and feed-observation coordinator
   workflow.py                Compatibility API and headed browser lifecycle
-  storage.py                 Local accounts, terms, checkpoint and OS locking
+  storage.py                 Accounts, terms, profile locks, checkpoints and scheduled status
   errors.py                  Shared UI failure type
   browser_ui/
     geometry.py              Shared viewport and nested-scrollport geometry

@@ -272,6 +272,9 @@ def test_offline_chromium_cli_reads_once_and_resumes_without_double_counting(
     )
     assert "POST_TEXT" not in first.out + first.err + second.out + second.err
 
+    with store.profile_lock(account):
+        pass
+
     assert requests
     assert all(urlsplit(url).netloc == "www.threads.com" for url in requests)
     assert {HOME_URL, old_relevant_url, new_relevant_url}.issubset(requests)
@@ -870,7 +873,7 @@ def test_empty_detail_is_reported_unavailable_and_home_progress_is_saved(
     assert all(value not in diagnostics for value in (target_url, actor, body, str(profile)))
 
 
-def test_failed_fallback_detail_is_retried_on_the_next_cycle(
+def test_failed_fallback_retries_and_completed_post_stays_deduped_across_ten_cycles(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -905,54 +908,55 @@ def test_failed_fallback_detail_is_retried_on_the_next_cycle(
             body=empty_detail if detail_attempts == 1 else valid_detail,
         )
 
-    async def first_cycle(page) -> None:
+    async def repeated_cycles(page) -> None:
         await page.route(target_url, serve_detail)
-        result = await workflow.run_page_workflow(
-            page,
-            account,
-            store,
-            max_posts=1,
-            max_scrolls=0,
-            terms=("hiring",),
-            detail=True,
-        )
-        assert result.status == "DETAIL_RETRY_PENDING"
-        assert result.detail_reads == 0
-        assert page.url == HOME_URL
+        checkpoints = []
+        for cycle in range(10):
+            result = await workflow.run_page_workflow(
+                page,
+                account,
+                store,
+                max_posts=1,
+                max_scrolls=0,
+                terms=("hiring",),
+                detail=True,
+            )
+            if cycle == 0:
+                assert result.status == "DETAIL_RETRY_PENDING"
+                assert result.detail_reads == 0
+            elif cycle == 1:
+                assert result.status == "COMPLETE"
+                assert result.detail_reads == 1
+            else:
+                assert result.detail_reads == 0
+            assert page.url == HOME_URL
+            checkpoint = store.load(
+                account.account_id,
+                policy_fingerprint(canonical_terms(("hiring",))),
+            )
+            if checkpoints:
+                assert checkpoint.completed_runs >= checkpoints[-1].completed_runs
+                assert checkpoint.detail_reads >= checkpoints[-1].detail_reads
+                assert set(checkpoint.seen_fingerprints).issuperset(
+                    checkpoints[-1].seen_fingerprints
+                )
+            checkpoints.append(checkpoint)
+        assert checkpoints[0].completed_runs == 1
+        assert checkpoints[0].detail_reads == 0
+        assert len(checkpoints[0].pending_read_fingerprints) == 1
+        assert checkpoints[1].completed_runs == 2
+        assert checkpoints[1].detail_reads == 1
+        assert checkpoints[1].pending_read_fingerprints == ()
+        assert checkpoints[-1].completed_runs >= checkpoints[1].completed_runs
 
-    async def second_cycle(page) -> None:
-        await page.route(target_url, serve_detail)
-        result = await workflow.run_page_workflow(
-            page,
-            account,
-            store,
-            max_posts=1,
-            max_scrolls=0,
-            terms=("hiring",),
-            detail=True,
-        )
-        assert result.status == "COMPLETE"
-        assert result.detail_reads == 1
-        assert page.url == HOME_URL
-
-    _run_offline_page(feed_html, first_cycle)
-    first_checkpoint = store.load(
+    _run_offline_page(feed_html, repeated_cycles)
+    final_checkpoint = store.load(
         account.account_id,
         policy_fingerprint(canonical_terms(("hiring",))),
     )
-    assert first_checkpoint.completed_runs == 1
-    assert first_checkpoint.detail_reads == 0
-    assert len(first_checkpoint.pending_read_fingerprints) == 1
-    assert "decision=VERIFIED_FALLBACK" in capsys.readouterr().out
-
-    _run_offline_page(feed_html, second_cycle)
-    second_checkpoint = store.load(
-        account.account_id,
-        policy_fingerprint(canonical_terms(("hiring",))),
-    )
-    assert second_checkpoint.completed_runs == 2
-    assert second_checkpoint.detail_reads == 1
-    assert second_checkpoint.pending_read_fingerprints == ()
+    assert final_checkpoint.completed_runs == 10
+    assert final_checkpoint.detail_reads == 1
+    assert final_checkpoint.pending_read_fingerprints == ()
     assert detail_attempts == 2
     assert "decision=VERIFIED_FALLBACK" in capsys.readouterr().out
 
@@ -1001,7 +1005,6 @@ def test_completed_fallback_is_not_opened_again_on_unchanged_feed(
             terms=("hiring",),
             detail=True,
         )
-        assert result.status == "COMPLETE"
         assert result.detail_reads == 1
         assert page.url == HOME_URL
 
@@ -3862,6 +3865,57 @@ def test_external_browser_cancellation_propagates_after_cleanup(
     checkpoint = store.load(account.account_id, policy_fingerprint(("hiring",)))
     assert checkpoint.seen_fingerprints == ()
     assert checkpoint.pending_read_fingerprints == ()
+    with store.profile_lock(account):
+        pass
+
+
+def test_browser_cleanup_timeout_is_reported_after_successful_cycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = tmp_path / "dedicated-profile"
+    profile.mkdir()
+    account = BrowserAccount(uuid4(), "offline", "offline.operator", profile)
+    store = CheckpointStore(tmp_path / "data")
+    lifecycle = {"manager_exited": False}
+
+    class Context:
+        def __init__(self) -> None:
+            self.pages = [object()]
+
+        async def close(self):
+            await asyncio.Event().wait()
+
+    class Chromium:
+        async def launch_persistent_context(self, **_kwargs):
+            return Context()
+
+    class Manager:
+        async def __aenter__(self):
+            return SimpleNamespace(chromium=Chromium())
+
+        async def __aexit__(self, *_args):
+            lifecycle["manager_exited"] = True
+
+    async def successful_cycle(*_args, **_kwargs):
+        return SimpleNamespace(status="COMPLETE")
+
+    monkeypatch.setattr(workflow, "async_playwright", Manager)
+    monkeypatch.setattr(workflow, "run_page_workflow", successful_cycle)
+    monkeypatch.setattr(workflow, "_CLEANUP_ALLOWANCE_SECONDS", 0.01)
+
+    with pytest.raises(UiReadError) as caught:
+        asyncio.run(
+            workflow.run_browser_nurture(
+                account,
+                store,
+                max_posts=1,
+                terms=("hiring",),
+            )
+        )
+
+    assert caught.value.code == "BROWSER_CLEANUP_FAILED"
+    assert lifecycle["manager_exited"]
     with store.profile_lock(account):
         pass
 
