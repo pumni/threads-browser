@@ -2437,8 +2437,9 @@ def test_closed_session_during_scan_is_classified_without_checkpoint(
     _run_offline_page(html, exercise)
     output = capsys.readouterr().out
     assert (
-        "[FAILURE_DIAGNOSTIC] phase=VERIFYING operation=SCAN_ROW "
-        "error_class=TARGET_CLOSED page_closed=true context_closed=unknown"
+        "[FAILURE_DIAGNOSTIC] phase=VERIFYING operation=SCAN_ROW error_class=TARGET_CLOSED "
+        "error_kind=OTHER page_closed=true context_closed=unknown "
+        "row_identity_reused=unknown row_identity_changed=unknown"
     ) in output
     assert output.count("[FAILURE_DIAGNOSTIC]") == 1
     checkpoint = store.load(
@@ -2448,7 +2449,7 @@ def test_closed_session_during_scan_is_classified_without_checkpoint(
     assert checkpoint.completed_runs == 0
 
 
-def test_transient_row_detachment_is_retried_after_session_reverification(
+def test_transient_execution_context_scan_error_is_retried_after_reverification(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -2458,7 +2459,7 @@ def test_transient_row_detachment_is_retried_after_session_reverification(
 <nav aria-label="Main" role="navigation">
 <a aria-current="page" aria-label="For you" href="/">For you</a>
 <a aria-label="Profile" href="/@{actor}">Profile</a></nav>
-<main><article><a href="/@candidate/post/detached-row"><time>now</time></a>
+<main><article id="candidate-row"><a href="/@candidate/post/detached-row"><time>now</time></a>
 <a href="/@candidate">candidate</a><p>A synthetic weather update</p></article></main>
 </body></html>"""
     profile = tmp_path / "profile"
@@ -2469,14 +2470,11 @@ def test_transient_row_detachment_is_retried_after_session_reverification(
     class DetachOnceReader(ThreadsHomeReader):
         detached = False
 
-        async def _visible_targets(self, *args, **kwargs):
-            if not self.detached:
+        async def _read_visible_body_progress(self, root, *args, **kwargs):
+            if not self.detached and await root.get_attribute("id") == "candidate-row":
                 self.detached = True
-                await self._page.locator("main > article").evaluate(
-                    "node => node.replaceWith(node.cloneNode(true))"
-                )
-                raise PlaywrightError("Element is not attached to the DOM PRIVATE_MARKER")
-            return await super()._visible_targets(*args, **kwargs)
+                raise PlaywrightError("Execution context was destroyed PRIVATE_MARKER")
+            return await super()._read_visible_body_progress(root, *args, **kwargs)
 
     monkeypatch.setattr(workflow, "ThreadsHomeReader", DetachOnceReader)
 
@@ -2507,8 +2505,10 @@ def test_transient_row_detachment_is_retried_after_session_reverification(
     _run_offline_page(html, exercise)
     output = capsys.readouterr().out
     assert (
-        "[FAILURE_DIAGNOSTIC] phase=VERIFYING operation=SCAN_ROW "
-        "error_class=DOM_DETACHED page_closed=false context_closed=unknown"
+        "[FAILURE_DIAGNOSTIC] phase=VERIFYING stage=FEED_INITIAL viewport=1 candidate=1 "
+        "operation=READ_BODY error_class=DOM_DETACHED error_kind=EXECUTION_CONTEXT "
+        "page_closed=false context_closed=unknown row_identity_reused=true "
+        "row_identity_changed=false"
     ) in output
     assert "RECOVERED stage=FEED_INITIAL retry=1" in output
     assert "PRIVATE_MARKER" not in output
@@ -2517,6 +2517,213 @@ def test_transient_row_detachment_is_retried_after_session_reverification(
         policy_fingerprint(canonical_terms(("hiring",))),
     )
     assert checkpoint.completed_runs == 1
+
+
+def _synthetic_three_card_feed(actor: str) -> str:
+    cards = "\n".join(
+        f"""<article id="scan-row-{index}">
+<a href="/@candidate/post/scan-row-{index}"><time>now</time></a>
+<a href="/@candidate">candidate</a>
+<p>SYNTHETIC_PRIVATE_ROW_{index} weather update</p></article>"""
+        for index in range(1, 4)
+    )
+    return f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main>{cards}</main></body></html>"""
+
+
+@pytest.mark.parametrize(
+    ("error_message", "expected_class", "expected_kind"),
+    [
+        ("synthetic protocol failure PRIVATE_MARKER", "OTHER", "OTHER"),
+        ("Evaluation failed: PRIVATE_MARKER", "OTHER", "EVALUATION"),
+        ("strict mode violation: PRIVATE_MARKER", "OTHER", "STRICT_MODE"),
+        (
+            "Execution context was destroyed PRIVATE_MARKER",
+            "DOM_DETACHED",
+            "EXECUTION_CONTEXT",
+        ),
+    ],
+    ids=("other", "evaluation", "strict-mode", "execution-context"),
+)
+def test_transient_scan_row_failure_retries_without_replaying_verified_posts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    error_message: str,
+    expected_class: str,
+    expected_kind: str,
+) -> None:
+    actor = "offline.operator"
+    html = _synthetic_three_card_feed(actor)
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(tmp_path / "data").add("offline", actor, profile)
+    store = CheckpointStore(tmp_path / "data")
+    detail_requests = 0
+
+    class FailThirdBodyOnceReader(ThreadsHomeReader):
+        failures = 0
+
+        async def _read_visible_body_progress(self, root, *args, **kwargs):
+            if await root.get_attribute("id") == "scan-row-3" and not self.failures:
+                self.failures += 1
+                raise PlaywrightError(error_message)
+            return await super()._read_visible_body_progress(root, *args, **kwargs)
+
+    monkeypatch.setattr(workflow, "ThreadsHomeReader", FailThirdBodyOnceReader)
+
+    async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            nonlocal detail_requests
+            detail_requests += 1
+            post_id = route.request.url.rsplit("/", maxsplit=1)[-1]
+            row_number = post_id.rsplit("-", maxsplit=1)[-1]
+            body = f"SYNTHETIC_PRIVATE_ROW_{row_number} weather update"
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=(
+                    "<!doctype html><html><body><main><article>"
+                    f'<a href="/@candidate/post/{post_id}"><time>now</time></a>'
+                    f'<a href="/@candidate">candidate</a><p>{body}</p>'
+                    "</article></main></body></html>"
+                ),
+            )
+
+        await page.route("**/post/scan-row-*", serve_detail)
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=3,
+            max_scrolls=0,
+            terms=("weather",),
+        )
+        assert result.status == "COMPLETE"
+        assert result.home_sampled == 3
+        assert result.home_new == 3
+        assert result.classified == 3
+        assert result.observed_rows == 3
+        assert result.provenance_verified == 3
+        assert result.unique_verified_posts == 3
+        assert result.visible_text_segments == 3
+        assert result.duplicates == 0
+        assert result.detail_reads == 1
+        assert detail_requests == 1
+
+    _run_offline_page(html, exercise)
+    output = capsys.readouterr().out
+    assert (
+        "[FAILURE_DIAGNOSTIC] phase=VERIFYING stage=FEED_INITIAL viewport=1 candidate=3 "
+        f"operation=READ_BODY error_class={expected_class} error_kind={expected_kind} "
+        "page_closed=false context_closed=unknown row_identity_reused=true "
+        "row_identity_changed=false"
+    ) in output
+    assert "RECOVERED stage=FEED_INITIAL retry=1" in output
+    assert "PRIVATE_MARKER" not in output
+    assert all(f"SYNTHETIC_PRIVATE_ROW_{index}" not in output for index in range(1, 4))
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("weather",))),
+    )
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.home_sampled == 3
+    assert len(checkpoint.seen_fingerprints) == 3
+    assert checkpoint.detail_reads == 1
+
+
+@pytest.mark.parametrize("failure_mode", ["persistent", "canonical-change", "root-replaced"])
+def test_unrevalidated_scan_row_failure_stops_without_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure_mode: str,
+) -> None:
+    actor = "offline.operator"
+    html = _synthetic_three_card_feed(actor)
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(tmp_path / "data").add("offline", actor, profile)
+    store = CheckpointStore(tmp_path / "data")
+    detail_route_requests = 0
+
+    class FailThirdBodyReader(ThreadsHomeReader):
+        last_instance = None
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.failures = 0
+            self.disposed_handle_batches = []
+            type(self).last_instance = self
+
+        async def _read_visible_body_progress(self, root, *args, **kwargs):
+            if await root.get_attribute("id") != "scan-row-3":
+                return await super()._read_visible_body_progress(root, *args, **kwargs)
+            self.failures += 1
+            if failure_mode == "canonical-change" and self.failures == 1:
+                await root.locator('a[href*="/post/"]').first.evaluate(
+                    "node => node.setAttribute('href', '/@candidate/post/rebound-row')"
+                )
+            elif failure_mode == "root-replaced" and self.failures == 1:
+                await root.evaluate("node => node.replaceWith(node.cloneNode(true))")
+            raise PlaywrightError("synthetic protocol failure PRIVATE_MARKER")
+
+        async def _dispose_active_scan_candidate_handles(self):
+            handles = self._active_scan_candidate_handles
+            if handles is not None:
+                self.disposed_handle_batches.append(len(handles))
+            await super()._dispose_active_scan_candidate_handles()
+
+    monkeypatch.setattr(workflow, "ThreadsHomeReader", FailThirdBodyReader)
+
+    async def exercise(page) -> None:
+        async def track_detail(route: Route) -> None:
+            nonlocal detail_route_requests
+            detail_route_requests += 1
+            await route.fulfill(status=500, content_type="text/plain", body="unavailable")
+
+        await page.route("**/post/**", track_detail)
+        with pytest.raises(UiReadError) as caught:
+            await workflow.run_page_workflow(
+                page,
+                account,
+                store,
+                max_posts=3,
+                max_scrolls=0,
+                terms=("hiring",),
+            )
+        assert caught.value.code == "SCAN_ROW_UNVERIFIED"
+        assert detail_route_requests == 0
+
+    _run_offline_page(html, exercise)
+    output = capsys.readouterr().out
+    assert "PRIVATE_MARKER" not in output
+    assert all(f"SYNTHETIC_PRIVATE_ROW_{index}" not in output for index in range(1, 4))
+    assert "offline.operator" not in output
+    assert "scan-row-3" not in output
+    assert "/@candidate/post/" not in output
+    assert str(profile) not in output
+    if failure_mode == "persistent":
+        assert output.count("error_kind=OTHER") == 2
+        assert output.count("row_identity_reused=true row_identity_changed=false") == 2
+    else:
+        assert output.count("error_kind=OTHER") == 1
+        assert "row_identity_reused=false row_identity_changed=true" in output
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert checkpoint.completed_runs == 0
+    assert checkpoint.home_sampled == 0
+    assert checkpoint.detail_reads == 0
+    assert checkpoint.seen_fingerprints == ()
+    assert FailThirdBodyReader.last_instance is not None
+    assert FailThirdBodyReader.last_instance._active_scan_candidate_handles is None
+    assert FailThirdBodyReader.last_instance.disposed_handle_batches
+    assert FailThirdBodyReader.last_instance.disposed_handle_batches[0] == 3
 
 
 def test_invalid_workflow_transition_is_not_mapped_to_browser_loss(
@@ -2556,7 +2763,8 @@ def test_invalid_workflow_transition_is_not_mapped_to_browser_loss(
     output = capsys.readouterr().out
     assert (
         "[FAILURE_DIAGNOSTIC] phase=INITIALIZING operation=STATE_TRANSITION "
-        "error_class=STATE_INVALID page_closed=false context_closed=unknown"
+        "error_class=STATE_INVALID error_kind=OTHER page_closed=false "
+        "context_closed=unknown row_identity_reused=unknown row_identity_changed=unknown"
     ) in output
     assert "BROWSER_SESSION_UNAVAILABLE" not in output
     checkpoint = store.load(
@@ -2603,8 +2811,9 @@ def test_other_playwright_scan_error_is_not_mapped_to_browser_loss(
     _run_offline_page(html, exercise)
     output = capsys.readouterr().out
     assert (
-        "[FAILURE_DIAGNOSTIC] phase=VERIFYING operation=SCAN_ROW "
-        "error_class=OTHER page_closed=false context_closed=unknown"
+        "[FAILURE_DIAGNOSTIC] phase=VERIFYING operation=SCAN_ROW error_class=OTHER "
+        "error_kind=OTHER page_closed=false context_closed=unknown "
+        "row_identity_reused=unknown row_identity_changed=unknown"
     ) in output
     assert "PRIVATE_MARKER" not in output
     assert output.count("[FAILURE_DIAGNOSTIC]") == 1

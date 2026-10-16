@@ -297,6 +297,8 @@ async def run_page_workflow(
         current_unverified_rows: list[tuple[str, float]] = []
         matched_overlap_rows: set[int] = set()
         row_target_progress_ids: set[str] = set()
+        emitted_verified_fingerprints: set[str] = set()
+        completed_viewport_fingerprints: set[str] = set()
 
         async def observe_row(
             row: _HomeRowObservation,
@@ -308,6 +310,8 @@ async def run_page_workflow(
             previous_unverified_rows: list[tuple[str, float]] = previous_unverified_rows,
             matched_overlap_rows: set[int] = matched_overlap_rows,
             row_target_progress_ids: set[str] = row_target_progress_ids,
+            emitted_verified_fingerprints: set[str] = emitted_verified_fingerprints,
+            completed_viewport_fingerprints: set[str] = completed_viewport_fingerprints,
             pending_scroll_baseline: dict[str, object] | None = pending_scroll_baseline,
         ) -> None:
             nonlocal viewport_classified, viewport_irrelevant
@@ -315,6 +319,14 @@ async def run_page_workflow(
             nonlocal viewport_unverified_relevant, viewport_unknown
 
             diagnostic = row.diagnostic
+            target = row.target
+            if diagnostic.state == "VERIFIED" and target is not None:
+                if (
+                    reader.last_scan_retry_count
+                    and target.fingerprint in emitted_verified_fingerprints
+                ):
+                    return
+                emitted_verified_fingerprints.add(target.fingerprint)
             evidence = diagnostic.read_evidence
             previous_evidence = None
             if pending_scroll_baseline is not None and diagnostic.observation_id:
@@ -410,7 +422,6 @@ async def run_page_workflow(
                     diagnostic.wheel_surface_matches = False
                     diagnostic.scroll_reason_flags = ("SCROLLER_MISMATCH",)
 
-            target = row.target
             row_fingerprint = (
                 target.fingerprint
                 if target is not None
@@ -440,6 +451,8 @@ async def run_page_workflow(
             )
             stats.provenance_verified += int(coverage_outcome.identity_added)
             reader.last_scan_counts.new_verified_rows += int(coverage_outcome.body_completed)
+            if coverage_outcome.body_completed and row_fingerprint is not None:
+                completed_viewport_fingerprints.add(row_fingerprint)
             if detail:
                 observation_emitted = bool(
                     (row.target and (row.target.body or row.target.visible_segments))
@@ -674,6 +687,7 @@ async def run_page_workflow(
 
         state.transition(WorkflowPhase.WAITING_FOR_CONTENT)
         state.transition(WorkflowPhase.VERIFYING)
+        reader.set_scan_viewport_index(viewport_number)
         reader.set_failure_context(state.phase.value, "SCAN_ROW")
         try:
             await reader.scan_viewport(
@@ -681,6 +695,7 @@ async def run_page_workflow(
                 scanned_fingerprints=dedupe.seen_this_run,
                 on_row=observe_row,
             )
+            reader.last_scan_counts.new_verified_rows = len(completed_viewport_fingerprints)
         except (UiReadError, PlaywrightError) as raw_error:
             error = (
                 raw_error

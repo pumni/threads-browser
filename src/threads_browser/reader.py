@@ -67,6 +67,7 @@ from .browser_ui.loading import (
 from .browser_ui.scrolling import NativeWheelScrollEngine, ScrollGestureResult
 from .browser_ui.session import (
     HomeSession,
+    classify_playwright_error_kind,
     classify_playwright_failure,
     emit_failure_diagnostic,
 )
@@ -118,6 +119,12 @@ _SCROLL_ADVANCE_RATIO = 0.4
 _SCROLL_ADVANCE_MIN_PX = 64
 _SCROLL_ADVANCE_MAX_PX = 360
 _MAX_PERMALINK_CANDIDATES = 40
+_SCAN_LINK_EXCLUSION_SELECTOR = (
+    "nav, aside, footer, form, [contenteditable='true'], "
+    "[role='navigation'], [role='menu'], [role='complementary'], "
+    "[role='dialog'], [role='search'], [role='banner'], "
+    "[role='contentinfo'], [role='textbox']"
+)
 _MAX_FEED_ROOTS_PER_TYPE = 40
 _MAX_VISIBLE_ROW_CANDIDATES = 40
 _UNSUPPORTED_CONFIRMATION_SCANS = 3
@@ -153,6 +160,19 @@ class _TrackedRowIdentity:
 
     def __repr__(self) -> str:
         return "TrackedRowIdentity(<private>)"
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _ScanFailureSite:
+    stage: str
+    viewport_index: int | None
+    candidate_index: int | None
+    operation: str
+    root_handle: JSHandle = field(repr=False)
+    canonical_identity: str = field(repr=False)
+    box: tuple[float, float, float, float] = field(repr=False)
+    viewport_size: tuple[int, int] = field(repr=False)
+    scroll_position: tuple[float, float, float] = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +225,13 @@ class ThreadsHomeReader:
         self._detail_mode = detail_mode
         self._failure_phase = "INITIALIZING"
         self._failure_operation = "SETTLE"
+        self._scan_stage: str | None = None
+        self._scan_viewport_index: int | None = None
+        self._scan_candidate_index: int | None = None
+        self._scan_operation = "DISCOVER_ROOTS"
+        self._scan_failure_site: _ScanFailureSite | None = None
+        self._active_scan_candidate_handles: dict[int, JSHandle] | None = None
+        self.last_scan_retry_count = 0
         self._home_url: str | None = None
         self._verified_actor_route: str | None = None
         self._last_ui_transition_at: float | None = None
@@ -257,6 +284,185 @@ class ThreadsHomeReader:
     def set_failure_context(self, phase: str, operation: str) -> None:
         self._failure_phase = phase
         self._failure_operation = operation
+
+    def set_scan_viewport_index(self, viewport_index: int | None) -> None:
+        self._scan_viewport_index = viewport_index
+
+    def _set_scan_operation(self, operation: str) -> None:
+        self._scan_operation = operation
+        if self._scan_failure_site is not None:
+            self._scan_failure_site = replace(
+                self._scan_failure_site,
+                operation=operation,
+            )
+
+    async def _scan_candidate_identity(
+        self,
+        root: Locator,
+        root_handle: JSHandle,
+    ) -> str | None:
+        hrefs = await root.evaluate(
+            _with_scrollport_geometry(
+                """(node, args) => {
+                    /*SCROLLPORT_GEOMETRY*/
+                    if (node !== args.expected) return null;
+                    const visible = element => {
+                        for (let current = element; current;
+                             current = current.parentElement) {
+                            const style = getComputedStyle(current);
+                            if (style.display === "none" ||
+                                style.visibility === "hidden" ||
+                                Number(style.opacity) === 0) return false;
+                        }
+                        return geometryFor(element).intersects;
+                    };
+                    const hrefs = [];
+                    for (const link of node.querySelectorAll("a[href]")) {
+                        if (link.closest(args.quote) || link.closest(args.excluded)) continue;
+                        const nearest = link.parentElement?.closest(args.roots);
+                        const belongs = node.matches(args.roots)
+                            ? nearest === node
+                            : node.contains(link) && !nearest;
+                        if (!belongs || !visible(link)) continue;
+                        hrefs.push(link.getAttribute("href"));
+                        if (hrefs.length > args.maxLinks) break;
+                    }
+                    return hrefs;
+                }"""
+            ),
+            {
+                "expected": root_handle,
+                "roots": _FEED_ROOT_SELECTOR,
+                "quote": _QUOTE_SELECTOR,
+                "excluded": _SCAN_LINK_EXCLUSION_SELECTOR,
+                "maxLinks": _MAX_CARD_LINKS,
+            },
+        )
+        if hrefs is None or len(hrefs) > _MAX_CARD_LINKS:
+            return None
+        post_identities: set[tuple[str, str]] = set()
+        authors: set[str] = set()
+        for href in hrefs:
+            parsed = _post_url(href)
+            if parsed is not None:
+                post_identities.add(parsed)
+            elif _post_url_hint(href):
+                return None
+            else:
+                author = _profile_author(href)
+                if author is not None:
+                    authors.add(author)
+        if len(post_identities) != 1 or len(authors) != 1:
+            return None
+        url, route_author = next(iter(post_identities))
+        author = next(iter(authors))
+        if route_author != author:
+            return None
+        return sha256(f"{url}\n{author}".encode()).hexdigest()
+
+    async def _scan_position(self) -> tuple[float, float, float]:
+        values = await self._page.evaluate(
+            """() => [window.scrollX, window.scrollY,
+                document.scrollingElement?.scrollTop ?? 0]"""
+        )
+        return (float(values[0]), float(values[1]), float(values[2]))
+
+    async def _capture_scan_failure_site(
+        self,
+        root: Locator,
+        root_handle: JSHandle,
+        viewport: dict[str, int],
+        candidate_index: int,
+    ) -> None:
+        self._scan_candidate_index = candidate_index
+        self._set_scan_operation("STRUCTURE")
+        identity = await self._scan_candidate_identity(root, root_handle)
+        box = await root.bounding_box()
+        position = await self._scan_position()
+        if identity is None or box is None:
+            self._scan_failure_site = None
+            return
+        self._scan_failure_site = _ScanFailureSite(
+            stage=self._scan_stage or "FEED_INITIAL",
+            viewport_index=self._scan_viewport_index,
+            candidate_index=candidate_index,
+            operation=self._scan_operation,
+            root_handle=root_handle,
+            canonical_identity=identity,
+            box=(float(box["x"]), float(box["y"]), float(box["width"]), float(box["height"])),
+            viewport_size=(viewport["width"], viewport["height"]),
+            scroll_position=position,
+        )
+
+    async def _revalidate_scan_failure(self) -> str:
+        site = self._scan_failure_site
+        if self._page.is_closed():
+            return "CLOSED"
+        if site is None:
+            return "UNKNOWN"
+        if not _same_home_origin(self._page.url):
+            return "CHANGED"
+        try:
+            deadline = self._readiness_deadline(_READINESS_TIMEOUT_MS)
+            await self._wait_for_verified_feed(
+                deadline,
+                timeout_code="SCAN_ROW_UNVERIFIED",
+            )
+            if not await self._visible_feed_evidence():
+                return "CHANGED"
+            viewport = self._page.viewport_size
+            if viewport is None or (
+                viewport["width"], viewport["height"]
+            ) != site.viewport_size:
+                return "CHANGED"
+            position = await self._scan_position()
+            if any(abs(current - previous) > 1 for current, previous in zip(
+                position, site.scroll_position, strict=True
+            )):
+                return "CHANGED"
+            region = await self._content_region()
+            roots, _ = await self._top_level_candidate_roots(region, viewport)
+            matching: list[Locator] = []
+            for root in roots:
+                if await root.evaluate(
+                    "(node, expected) => node === expected",
+                    site.root_handle,
+                ):
+                    matching.append(root)
+            if len(matching) != 1:
+                return "CHANGED"
+            root = matching[0]
+            if not await root.is_visible() or not await self._is_in_visible_scrollports(root):
+                return "CHANGED"
+            box = await root.bounding_box()
+            if box is None or any(
+                abs(current - previous) > 1
+                for current, previous in zip(
+                    (float(box["x"]), float(box["y"]),
+                     float(box["width"]), float(box["height"])),
+                    site.box,
+                    strict=True,
+                )
+            ):
+                return "CHANGED"
+            identity = await self._scan_candidate_identity(root, site.root_handle)
+            return "REUSED" if identity == site.canonical_identity else "CHANGED"
+        except PlaywrightError as error:
+            failure = classify_playwright_failure(self._page, error)
+            return "CLOSED" if failure.error_class == "TARGET_CLOSED" else "UNKNOWN"
+        except UiReadError:
+            return "UNKNOWN"
+
+    async def _dispose_active_scan_candidate_handles(self) -> None:
+        handles = self._active_scan_candidate_handles
+        self._active_scan_candidate_handles = None
+        if handles is None:
+            return
+        for handle in handles.values():
+            try:
+                await handle.dispose()
+            except PlaywrightError:
+                pass
 
     @property
     def skipped_unverified(self) -> int:
@@ -827,6 +1033,7 @@ class ThreadsHomeReader:
         if not 1 <= max_posts <= 20:
             raise UiReadError("POST_LIMIT_INVALID")
         self._last_viewport_limit = max_posts
+        self.last_scan_retry_count = 0
         initial_viewport = self.scrolls == 0
         targets, _ = await self._wait_for_home_targets(
             max_posts,
@@ -1089,12 +1296,63 @@ class ThreadsHomeReader:
                 result = await attempt(deadline)
             except PlaywrightError as error:
                 failure = classify_playwright_failure(self._page, error)
+                if failure_operation == "SCAN_ROW":
+                    row_identity = await self._revalidate_scan_failure()
+                    operation_name = self._scan_operation
+                    if operation_name not in {
+                        "DISCOVER_ROOTS",
+                        "STRUCTURE",
+                        "BOUNDING_BOX",
+                        "READ_CARD",
+                        "READ_BODY",
+                        "STABILITY_CHECK",
+                        "EMIT_ROW",
+                        "FINALIZE",
+                    }:
+                        operation_name = "SCAN_ROW"
+                    emit_failure_diagnostic(
+                        phase=self._failure_phase,
+                        operation=operation_name,
+                        error_class=failure.error_class,
+                        page_closed=failure.page_closed,
+                        context_closed=failure.context_closed,
+                        stage=self._scan_stage,
+                        viewport_index=self._scan_viewport_index,
+                        candidate_index=self._scan_candidate_index,
+                        error_kind=classify_playwright_error_kind(error),
+                        row_identity=(
+                            row_identity if row_identity in {"REUSED", "CHANGED"} else "UNKNOWN"
+                        ),
+                    )
+                    if (
+                        failure.error_class == "TARGET_CLOSED"
+                        or row_identity == "CLOSED"
+                    ):
+                        await self._dispose_active_scan_candidate_handles()
+                        self._scan_failure_site = None
+                        self._scan_stage = None
+                        raise UiReadError("BROWSER_SESSION_UNAVAILABLE") from None
+                    if (
+                        row_identity == "REUSED"
+                        and self.last_scan_retry_count < 1
+                    ):
+                        await self._dispose_active_scan_candidate_handles()
+                        self._scan_failure_site = None
+                        self.last_scan_retry_count += 1
+                        window += 1
+                        print(f"WAITING stage={stage} retry={window}")
+                        continue
+                    await self._dispose_active_scan_candidate_handles()
+                    self._scan_failure_site = None
+                    self._scan_stage = None
+                    raise UiReadError("SCAN_ROW_UNVERIFIED") from None
                 emit_failure_diagnostic(
                     phase=self._failure_phase,
                     operation=failure_operation,
                     error_class=failure.error_class,
                     page_closed=failure.page_closed,
                     context_closed=failure.context_closed,
+                    error_kind=classify_playwright_error_kind(error),
                 )
                 if failure.error_class == "TARGET_CLOSED":
                     raise UiReadError("BROWSER_SESSION_UNAVAILABLE") from None
@@ -1124,6 +1382,10 @@ class ThreadsHomeReader:
                     continue
                 raise UiReadError("UI_READ_UNVERIFIED") from None
             except UiReadError as error:
+                if failure_operation == "SCAN_ROW":
+                    await self._dispose_active_scan_candidate_handles()
+                    self._scan_failure_site = None
+                    self._scan_stage = None
                 if error.code not in allowed_codes:
                     raise
                 final_code = error.code
@@ -1962,6 +2224,11 @@ class ThreadsHomeReader:
         stage: str = "FEED",
         on_row: Callable[[_HomeRowObservation], Awaitable[None]] | None = None,
     ) -> _VisibleTargets:
+        self._scan_stage = stage
+        self._scan_candidate_index = None
+        self._scan_failure_site = None
+        self._set_scan_operation("DISCOVER_ROOTS")
+        await self._dispose_active_scan_candidate_handles()
         await self._discard_pending_viewport_candidates()
         viewport = self._page.viewport_size
         if viewport is None:
@@ -2017,6 +2284,7 @@ class ThreadsHomeReader:
         region = await self._content_region()
         roots, roots_truncated = await self._top_level_candidate_roots(region, viewport)
         counts.roots_truncated = roots_truncated
+        self._set_scan_operation("STRUCTURE")
         structures = await self._collect_structure_diagnostics(
             region,
             roots,
@@ -2033,6 +2301,7 @@ class ThreadsHomeReader:
             candidate: bool = True,
         ) -> None:
             if on_row is not None:
+                self._set_scan_operation("EMIT_ROW")
                 await on_row(
                     _HomeRowObservation(
                         diagnostic,
@@ -2047,10 +2316,13 @@ class ThreadsHomeReader:
             tuple[int, Locator, _CandidateStructure, bool, _CandidateDiagnostic, str]
         ] = []
         candidate_dom_handles: dict[int, JSHandle] = {}
+        self._active_scan_candidate_handles = candidate_dom_handles
         candidate_prior_fingerprints: dict[int, str | None] = {}
         matched_previous_identity_handles: set[int] = set()
         diagnostics: list[_CandidateDiagnostic] = []
         for index, root in enumerate(roots):
+            self._scan_candidate_index = index + 1
+            self._set_scan_operation("STRUCTURE")
             structure = structures[index]
             root_kind = structure.root_kind
             diagnostic = _CandidateDiagnostic(
@@ -2147,6 +2419,8 @@ class ThreadsHomeReader:
         }
         processed_candidates = 0
         for row_index, diagnostic in enumerate(diagnostics):
+            self._scan_candidate_index = row_index + 1
+            self._set_scan_operation("STRUCTURE")
             candidate = candidate_by_index.get(row_index)
             if candidate is None:
                 await emit_row(diagnostic, candidate=False)
@@ -2168,6 +2442,13 @@ class ThreadsHomeReader:
                 diagnostic.reason = "POST_ROOT_IDENTITY_UNAVAILABLE"
                 await emit_row(diagnostic)
                 continue
+            await self._capture_scan_failure_site(
+                root,
+                root_handle,
+                viewport,
+                row_index + 1,
+            )
+            self._set_scan_operation("STRUCTURE")
             if not await self._same_dom_element(root, root_handle):
                 replacement_handle = await root.element_handle()
                 await root_handle.dispose()
@@ -2200,6 +2481,7 @@ class ThreadsHomeReader:
                     diagnostic.reason = "POST_ROOT_IDENTITY_CHANGED"
                     await emit_row(diagnostic)
                     continue
+            self._set_scan_operation("BOUNDING_BOX")
             box = await root.bounding_box()
             if box is None:
                 counts.skipped_rows += 1
@@ -2889,6 +3171,7 @@ class ThreadsHomeReader:
             )
         ):
             counts.coverage_complete = False
+        self._set_scan_operation("FINALIZE")
         signature = (
             tuple(
                 (
@@ -2930,6 +3213,9 @@ class ThreadsHomeReader:
             if id(handle) not in retained_handles:
                 await handle.dispose()
         self._pending_viewport_candidate_identities = tuple(candidate_identities)
+        self._active_scan_candidate_handles = None
+        self._scan_failure_site = None
+        self._scan_stage = None
         return _VisibleTargets(
             tuple(targets),
             scroll_anchor,
@@ -4297,6 +4583,8 @@ class ThreadsHomeReader:
         expected_root_handle: JSHandle | None = None,
         isolated_scope: bool = False,
     ) -> PostTarget:
+        if self._scan_stage is not None:
+            self._set_scan_operation("READ_CARD")
         if not await root.is_visible():
             raise _CardNotReady(root)
         root_handle = await root.element_handle()
@@ -4453,6 +4741,8 @@ class ThreadsHomeReader:
                     ) and await button.is_visible():
                         body_truncated = True
                         break
+                if self._scan_stage is not None:
+                    self._set_scan_operation("READ_BODY")
                 visible_body = await self._read_visible_body_progress(
                     root,
                     root_handle,
@@ -4484,6 +4774,8 @@ class ThreadsHomeReader:
             body_segments = visible_body.segments
             body_truncated = body_truncated or visible_body.truncated
         else:
+            if self._scan_stage is not None:
+                self._set_scan_operation("READ_BODY")
             body, body_available, body_truncated, body_signals = await self._extract_card_body(
                 root,
                 root_handle,
@@ -4561,6 +4853,8 @@ class ThreadsHomeReader:
             # Measure stability between completed samples. DOM extraction can
             # take longer than the interval on a busy feed, so compare actual
             # content and retry once after hydration settles if it changed.
+            if self._scan_stage is not None:
+                self._set_scan_operation("STABILITY_CHECK")
             await asyncio.sleep(max(1, _BODY_STABILITY_INTERVAL_MS) / 1000)
             settled = await self._read_card(
                 root,

@@ -73,6 +73,37 @@ def classify_playwright_failure(page: Page | None, error: PlaywrightError) -> Pl
     return PlaywrightFailure("OTHER", page_closed, context_closed)
 
 
+def classify_playwright_error_kind(error: PlaywrightError) -> str:
+    """Return a fixed, non-content category for scan diagnostics."""
+    if isinstance(error, PlaywrightTimeoutError):
+        return "TIMEOUT"
+    message = str(error).casefold()
+    if "strict mode violation" in message or "strict mode" in message:
+        return "STRICT_MODE"
+    if any(
+        marker in message
+        for marker in (
+            "execution context was destroyed",
+            "cannot find context with specified id",
+            "context was destroyed",
+        )
+    ):
+        return "EXECUTION_CONTEXT"
+    if any(
+        marker in message
+        for marker in (
+            "not attached to the dom",
+            "detached from the frame",
+            "node is detached",
+            "element is not attached",
+        )
+    ):
+        return "ELEMENT_GONE"
+    if "evaluation failed" in message or "javascript error" in message:
+        return "EVALUATION"
+    return "OTHER"
+
+
 def emit_failure_diagnostic(
     *,
     phase: str,
@@ -80,6 +111,11 @@ def emit_failure_diagnostic(
     error_class: str,
     page_closed: bool | None,
     context_closed: bool | None,
+    stage: str | None = None,
+    viewport_index: int | None = None,
+    candidate_index: int | None = None,
+    error_kind: str | None = None,
+    row_identity: str | None = None,
 ) -> None:
     """Print bounded, privacy-safe failure metadata only."""
     phases = {
@@ -96,6 +132,14 @@ def emit_failure_diagnostic(
     }
     operations = {
         "SCAN_ROW",
+        "DISCOVER_ROOTS",
+        "STRUCTURE",
+        "BOUNDING_BOX",
+        "READ_CARD",
+        "READ_BODY",
+        "STABILITY_CHECK",
+        "EMIT_ROW",
+        "FINALIZE",
         "SETTLE",
         "SCROLL",
         "DETAIL",
@@ -116,10 +160,32 @@ def emit_failure_diagnostic(
         "STATE_INVALID",
         "OTHER",
     } else "OTHER"
+    safe_stage = stage if stage in {"FEED_INITIAL", "FEED_SCROLL"} else None
+    safe_kind = error_kind if error_kind in {
+        "TIMEOUT",
+        "STRICT_MODE",
+        "EXECUTION_CONTEXT",
+        "EVALUATION",
+        "ELEMENT_GONE",
+        "OTHER",
+    } else "OTHER"
+    safe_identity = row_identity if row_identity in {"REUSED", "CHANGED", "UNKNOWN"} else "UNKNOWN"
+
+    def index(value: int | None) -> str:
+        return str(value) if isinstance(value, int) and 0 <= value <= 999 else "unknown"
+
+    context = ""
+    if safe_stage is not None:
+        context = (
+            f" stage={safe_stage} viewport={index(viewport_index)} "
+            f"candidate={index(candidate_index)}"
+        )
     print(
-        f"[FAILURE_DIAGNOSTIC] phase={safe_phase} operation={safe_operation} "
-        f"error_class={safe_error} page_closed={flag(page_closed)} "
-        f"context_closed={flag(context_closed)}",
+        f"[FAILURE_DIAGNOSTIC] phase={safe_phase}{context} "
+        f"operation={safe_operation} error_class={safe_error} error_kind={safe_kind} "
+        f"page_closed={flag(page_closed)} context_closed={flag(context_closed)} "
+        f"row_identity_reused={str(safe_identity == 'REUSED').lower() if safe_identity != 'UNKNOWN' else 'unknown'} "
+        f"row_identity_changed={str(safe_identity == 'CHANGED').lower() if safe_identity != 'UNKNOWN' else 'unknown'}",
         flush=True,
     )
 
