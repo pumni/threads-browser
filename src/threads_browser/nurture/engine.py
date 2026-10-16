@@ -482,9 +482,9 @@ async def run_page_workflow(
                     f"scroll_surface={'UNKNOWN' if metrics is None else metrics.scroll_surface_key} "
                     f"body_evidence={'UNKNOWN' if metrics is None else metrics.state} "
                     f"body_incomplete_reason={'UNKNOWN' if metrics is None else metrics.body_incomplete_reason} "
-                    f"body_ranges_expected={metric_count(None if metrics is None else metrics.expected_range_count)} "
-                    f"body_ranges_visited={metric_count(None if metrics is None else metrics.visited_range_count)} "
-                    f"body_ranges_missing={metric_count(None if metrics is None else metrics.missing_range_count)} "
+                    f"expected_range_count={metric_count(None if metrics is None else metrics.expected_range_count)} "
+                    f"visited_range_count={metric_count(None if metrics is None else metrics.visited_range_count)} "
+                    f"missing_subrange_count={metric_count(None if metrics is None else metrics.missing_subrange_count)} "
                     f"scroll_flags={','.join(diagnostic.scroll_reason_flags) or 'NONE'} "
                     f"state={diagnostic.state} reason={diagnostic.reason} "
                     f"observation={'EMITTED' if observation_emitted else 'RECORDED'} "
@@ -709,6 +709,8 @@ async def run_page_workflow(
             )
             state.stop(error.code)
             counts = reader.last_scan_counts
+            counts.coverage_complete = False
+            reader.refresh_viewport_body_coverage_counts()
             rejection_reasons = (
                 ",".join(
                     f"{reason}:{count}"
@@ -726,6 +728,9 @@ async def run_page_workflow(
                 f"body_unknown={counts.body_unknown} classified={viewport_classified} "
                 f"relevant={viewport_relevant} skipped={counts.skipped} "
                 f"rejection_reasons={rejection_reasons} "
+                f"unrepresented_root_count={counts.unrepresented_root_count} "
+                f"unresolved_visited_rows={counts.unresolved_visited_rows} "
+                f"lookahead_rows={counts.lookahead_rows} "
                 f"{_format_structure_diagnostics(counts)}"
             )
             if detail:
@@ -739,7 +744,11 @@ async def run_page_workflow(
                 )
                 _print_url_structure_diagnostics(counts)
                 print(
-                    f"[VIEWPORT {viewport_number}] status=PARTIAL code={error.code}",
+                    f"[VIEWPORT {viewport_number}] status=PARTIAL code={error.code} "
+                    f"coverage={str(counts.coverage_complete).lower()} "
+                    f"unrepresented_root_count={counts.unrepresented_root_count} "
+                    f"unresolved_visited_rows={counts.unresolved_visited_rows} "
+                    f"lookahead_rows={counts.lookahead_rows}",
                     flush=True,
                 )
             if error.code.endswith("NOT_READY") and (
@@ -777,7 +786,13 @@ async def run_page_workflow(
                     **reliability_metrics(),
                 )
             if detail:
-                print(f"[VIEWPORT] status=FAILED code={error.code}")
+                print(
+                    f"[VIEWPORT] status=FAILED code={error.code} "
+                    f"coverage={str(counts.coverage_complete).lower()} "
+                    f"unrepresented_root_count={counts.unrepresented_root_count} "
+                    f"unresolved_visited_rows={counts.unresolved_visited_rows} "
+                    f"lookahead_rows={counts.lookahead_rows}"
+                )
             raise error from None
         state.transition(WorkflowPhase.OBSERVING)
         scan_counts = reader.last_scan_counts
@@ -791,7 +806,10 @@ async def run_page_workflow(
                 f"verified={scan_counts.verified} body_read={scan_counts.body_read} "
                 f"body_unknown={scan_counts.body_unknown} skipped={scan_counts.skipped} "
                 "coverage="
-                f"{str(scan_counts.coverage_complete).lower()}",
+                f"{str(scan_counts.coverage_complete).lower()} "
+                f"unrepresented_root_count={scan_counts.unrepresented_root_count} "
+                f"unresolved_visited_rows={scan_counts.unresolved_visited_rows} "
+                f"lookahead_rows={scan_counts.lookahead_rows}",
                 flush=True,
             )
             print(

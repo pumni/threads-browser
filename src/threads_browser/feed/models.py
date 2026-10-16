@@ -51,6 +51,10 @@ class BodyReadEvidence:
     def __repr__(self) -> str:
         return f"BodyReadEvidence(state={self.state!r}, structural_counts=<safe>)"
 
+    @property
+    def missing_subrange_count(self) -> int | None:
+        return self.missing_range_count
+
 
 @dataclass(frozen=True, slots=True, repr=False)
 class PostTarget:

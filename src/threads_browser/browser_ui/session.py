@@ -78,6 +78,21 @@ def classify_playwright_error_kind(error: PlaywrightError) -> str:
     if isinstance(error, PlaywrightTimeoutError):
         return "TIMEOUT"
     message = str(error).casefold()
+    if any(
+        marker in message
+        for marker in (
+            "maximum call stack size exceeded",
+            "too much recursion",
+            "stack overflow",
+        )
+    ):
+        return "JS_STACK_OVERFLOW"
+    if "rangeerror" in message or "invalid range" in message:
+        return "JS_RANGE_ERROR"
+    if "protocol error" in message and any(
+        marker in message for marker in ("evaluation", "evaluate", "javascript")
+    ):
+        return "EVALUATION_PROTOCOL"
     if "strict mode violation" in message or "strict mode" in message:
         return "STRICT_MODE"
     if any(
@@ -116,6 +131,9 @@ def emit_failure_diagnostic(
     candidate_index: int | None = None,
     error_kind: str | None = None,
     row_identity: str | None = None,
+    body_substep: str | None = None,
+    identity_source: str | None = None,
+    retry_eligibility: str | None = None,
 ) -> None:
     """Print bounded, privacy-safe failure metadata only."""
     phases = {
@@ -166,10 +184,29 @@ def emit_failure_diagnostic(
         "STRICT_MODE",
         "EXECUTION_CONTEXT",
         "EVALUATION",
+        "EVALUATION_PROTOCOL",
         "ELEMENT_GONE",
+        "JS_RANGE_ERROR",
+        "JS_STACK_OVERFLOW",
         "OTHER",
     } else "OTHER"
     safe_identity = row_identity if row_identity in {"REUSED", "CHANGED", "UNKNOWN"} else "UNKNOWN"
+    safe_body_substep = body_substep if body_substep in {
+        "BODY_ROOT_HANDLE",
+        "BODY_RANGE_EVALUATE",
+        "BODY_PROGRESS_MERGE",
+        "BODY_STABILITY_SAMPLE",
+    } else None
+    safe_identity_source = identity_source if identity_source in {
+        "CURRENT_CANONICAL",
+        "CARRIED_VERIFIED",
+        "NONE",
+    } else None
+    safe_retry_eligibility = retry_eligibility if retry_eligibility in {
+        "REUSED",
+        "CHANGED",
+        "INSUFFICIENT",
+    } else None
 
     def index(value: int | None) -> str:
         return str(value) if isinstance(value, int) and 0 <= value <= 999 else "unknown"
@@ -180,12 +217,20 @@ def emit_failure_diagnostic(
             f" stage={safe_stage} viewport={index(viewport_index)} "
             f"candidate={index(candidate_index)}"
         )
+    details = ""
+    if safe_body_substep is not None:
+        details += f" body_substep={safe_body_substep}"
+    if safe_identity_source is not None:
+        details += f" identity_source={safe_identity_source}"
+    if safe_retry_eligibility is not None:
+        details += f" retry_eligibility={safe_retry_eligibility}"
     print(
         f"[FAILURE_DIAGNOSTIC] phase={safe_phase}{context} "
         f"operation={safe_operation} error_class={safe_error} error_kind={safe_kind} "
         f"page_closed={flag(page_closed)} context_closed={flag(context_closed)} "
         f"row_identity_reused={str(safe_identity == 'REUSED').lower() if safe_identity != 'UNKNOWN' else 'unknown'} "
-        f"row_identity_changed={str(safe_identity == 'CHANGED').lower() if safe_identity != 'UNKNOWN' else 'unknown'}",
+        f"row_identity_changed={str(safe_identity == 'CHANGED').lower() if safe_identity != 'UNKNOWN' else 'unknown'}"
+        f"{details}",
         flush=True,
     )
 

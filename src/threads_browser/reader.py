@@ -119,12 +119,6 @@ _SCROLL_ADVANCE_RATIO = 0.4
 _SCROLL_ADVANCE_MIN_PX = 64
 _SCROLL_ADVANCE_MAX_PX = 360
 _MAX_PERMALINK_CANDIDATES = 40
-_SCAN_LINK_EXCLUSION_SELECTOR = (
-    "nav, aside, footer, form, [contenteditable='true'], "
-    "[role='navigation'], [role='menu'], [role='complementary'], "
-    "[role='dialog'], [role='search'], [role='banner'], "
-    "[role='contentinfo'], [role='textbox']"
-)
 _MAX_FEED_ROOTS_PER_TYPE = 40
 _MAX_VISIBLE_ROW_CANDIDATES = 40
 _UNSUPPORTED_CONFIRMATION_SCANS = 3
@@ -157,6 +151,8 @@ class _TrackedRowIdentity:
     dom_handle: JSHandle = field(repr=False)
     observation_id: str = field(repr=False)
     fingerprint: str | None = field(default=None, repr=False)
+    author_fingerprint: str | None = field(default=None, repr=False)
+    body_verified: bool = False
 
     def __repr__(self) -> str:
         return "TrackedRowIdentity(<private>)"
@@ -169,7 +165,11 @@ class _ScanFailureSite:
     candidate_index: int | None
     operation: str
     root_handle: JSHandle = field(repr=False)
-    canonical_identity: str = field(repr=False)
+    canonical_identity: str | None = field(repr=False)
+    identity_source: str
+    author_fingerprint: str | None = field(repr=False)
+    carried_identity: _TrackedRowIdentity | None = field(repr=False)
+    identity_conflict: bool
     box: tuple[float, float, float, float] = field(repr=False)
     viewport_size: tuple[int, int] = field(repr=False)
     scroll_position: tuple[float, float, float] = field(repr=False)
@@ -296,69 +296,34 @@ class ThreadsHomeReader:
                 operation=operation,
             )
 
-    async def _scan_candidate_identity(
-        self,
-        root: Locator,
-        root_handle: JSHandle,
-    ) -> str | None:
-        hrefs = await root.evaluate(
-            _with_scrollport_geometry(
-                """(node, args) => {
-                    /*SCROLLPORT_GEOMETRY*/
-                    if (node !== args.expected) return null;
-                    const visible = element => {
-                        for (let current = element; current;
-                             current = current.parentElement) {
-                            const style = getComputedStyle(current);
-                            if (style.display === "none" ||
-                                style.visibility === "hidden" ||
-                                Number(style.opacity) === 0) return false;
-                        }
-                        return geometryFor(element).intersects;
-                    };
-                    const hrefs = [];
-                    for (const link of node.querySelectorAll("a[href]")) {
-                        if (link.closest(args.quote) || link.closest(args.excluded)) continue;
-                        const nearest = link.parentElement?.closest(args.roots);
-                        const belongs = node.matches(args.roots)
-                            ? nearest === node
-                            : node.contains(link) && !nearest;
-                        if (!belongs || !visible(link)) continue;
-                        hrefs.push(link.getAttribute("href"));
-                        if (hrefs.length > args.maxLinks) break;
-                    }
-                    return hrefs;
-                }"""
-            ),
-            {
-                "expected": root_handle,
-                "roots": _FEED_ROOT_SELECTOR,
-                "quote": _QUOTE_SELECTOR,
-                "excluded": _SCAN_LINK_EXCLUSION_SELECTOR,
-                "maxLinks": _MAX_CARD_LINKS,
-            },
-        )
-        if hrefs is None or len(hrefs) > _MAX_CARD_LINKS:
-            return None
-        post_identities: set[tuple[str, str]] = set()
-        authors: set[str] = set()
-        for href in hrefs:
-            parsed = _post_url(href)
-            if parsed is not None:
-                post_identities.add(parsed)
-            elif _post_url_hint(href):
-                return None
-            else:
-                author = _profile_author(href)
-                if author is not None:
-                    authors.add(author)
-        if len(post_identities) != 1 or len(authors) != 1:
-            return None
-        url, route_author = next(iter(post_identities))
-        author = next(iter(authors))
-        if route_author != author:
-            return None
-        return sha256(f"{url}\n{author}".encode()).hexdigest()
+    def refresh_viewport_body_coverage_counts(self) -> None:
+        visited: set[str] = set()
+        lookahead: set[str] = set()
+        for diagnostic in self.last_candidate_diagnostics:
+            if diagnostic.state in {"NON_POST", "VERIFIED"}:
+                continue
+            identity = (
+                diagnostic.identity_fingerprint
+                or diagnostic.observation_id
+                or f"row:{diagnostic.row_index}"
+            )
+            evidence = diagnostic.read_evidence
+            if evidence is None:
+                continue
+            body_has_entered_clip = (
+                (evidence.visible_text_rect_count or 0) > 0
+                or (evidence.visited_range_count or 0) > 0
+            )
+            if body_has_entered_clip:
+                visited.add(identity)
+            elif (
+                evidence.closest_text_side == "BELOW"
+                and evidence.closest_text_distance_px is not None
+            ):
+                lookahead.add(identity)
+        lookahead.difference_update(visited)
+        self.last_scan_counts.unresolved_visited_rows = len(visited)
+        self.last_scan_counts.lookahead_rows = len(lookahead)
 
     async def _scan_position(self) -> tuple[float, float, float]:
         values = await self._page.evaluate(
@@ -373,15 +338,48 @@ class ThreadsHomeReader:
         root_handle: JSHandle,
         viewport: dict[str, int],
         candidate_index: int,
+        carried_identity: _TrackedRowIdentity | None = None,
     ) -> None:
         self._scan_candidate_index = candidate_index
         self._set_scan_operation("STRUCTURE")
-        identity = await self._scan_candidate_identity(root, root_handle)
+        evidence = await self._feed_rows._candidate_identity_evidence(root, root_handle)
         box = await root.bounding_box()
         position = await self._scan_position()
-        if identity is None or box is None:
+        if not evidence.root_matches or box is None:
             self._scan_failure_site = None
             return
+        identity_source = "NONE"
+        identity = evidence.canonical_fingerprint
+        author_fingerprint = (
+            next(iter(evidence.author_fingerprints))
+            if len(evidence.author_fingerprints) == 1
+            else None
+        )
+        identity_conflict = False
+        if identity is not None:
+            identity_source = "CURRENT_CANONICAL"
+            if carried_identity is not None and carried_identity.fingerprint is not None:
+                identity_conflict = (
+                    identity != carried_identity.fingerprint
+                    or evidence.conflicts_with(
+                        carried_identity.fingerprint,
+                        carried_identity.author_fingerprint,
+                    )
+                )
+        elif (
+            carried_identity is not None
+            and carried_identity.body_verified
+            and carried_identity.fingerprint is not None
+        ):
+            if not evidence.conflicts_with(
+                carried_identity.fingerprint,
+                carried_identity.author_fingerprint,
+            ):
+                identity = carried_identity.fingerprint
+                author_fingerprint = carried_identity.author_fingerprint
+                identity_source = "CARRIED_VERIFIED"
+            else:
+                identity_conflict = True
         self._scan_failure_site = _ScanFailureSite(
             stage=self._scan_stage or "FEED_INITIAL",
             viewport_index=self._scan_viewport_index,
@@ -389,6 +387,10 @@ class ThreadsHomeReader:
             operation=self._scan_operation,
             root_handle=root_handle,
             canonical_identity=identity,
+            identity_source=identity_source,
+            author_fingerprint=author_fingerprint,
+            carried_identity=carried_identity,
+            identity_conflict=identity_conflict,
             box=(float(box["x"]), float(box["y"]), float(box["width"]), float(box["height"])),
             viewport_size=(viewport["width"], viewport["height"]),
             scroll_position=position,
@@ -399,8 +401,10 @@ class ThreadsHomeReader:
         if self._page.is_closed():
             return "CLOSED"
         if site is None:
-            return "UNKNOWN"
+            return "INSUFFICIENT"
         if not _same_home_origin(self._page.url):
+            return "CHANGED"
+        if site.identity_conflict:
             return "CHANGED"
         try:
             deadline = self._readiness_deadline(_READINESS_TIMEOUT_MS)
@@ -445,13 +449,57 @@ class ThreadsHomeReader:
                 )
             ):
                 return "CHANGED"
-            identity = await self._scan_candidate_identity(root, site.root_handle)
-            return "REUSED" if identity == site.canonical_identity else "CHANGED"
+            evidence = await self._feed_rows._candidate_identity_evidence(
+                root,
+                site.root_handle,
+            )
+            if not evidence.root_matches:
+                return "CHANGED"
+            if site.identity_source == "CURRENT_CANONICAL":
+                if site.canonical_identity is None:
+                    return "INSUFFICIENT"
+                if evidence.conflicts_with(
+                    site.canonical_identity,
+                    site.author_fingerprint,
+                ):
+                    return "CHANGED"
+                if evidence.canonical_fingerprint != site.canonical_identity:
+                    return "CHANGED"
+                carried = site.carried_identity
+                if carried is not None and carried.fingerprint is not None and (
+                    carried.fingerprint != site.canonical_identity
+                    or evidence.conflicts_with(
+                        carried.fingerprint,
+                        carried.author_fingerprint,
+                    )
+                ):
+                    return "CHANGED"
+                return "REUSED"
+            if site.identity_source == "CARRIED_VERIFIED":
+                carried = site.carried_identity
+                if (
+                    carried is None
+                    or not any(
+                        identity is carried
+                        for identity in self._last_viewport_candidate_identities
+                    )
+                    or not carried.body_verified
+                    or carried.fingerprint is None
+                    or carried.fingerprint != site.canonical_identity
+                ):
+                    return "INSUFFICIENT"
+                if evidence.conflicts_with(
+                    site.canonical_identity,
+                    site.author_fingerprint,
+                ):
+                    return "CHANGED"
+                return "REUSED"
+            return "INSUFFICIENT"
         except PlaywrightError as error:
             failure = classify_playwright_failure(self._page, error)
-            return "CLOSED" if failure.error_class == "TARGET_CLOSED" else "UNKNOWN"
+            return "CLOSED" if failure.error_class == "TARGET_CLOSED" else "INSUFFICIENT"
         except UiReadError:
-            return "UNKNOWN"
+            return "INSUFFICIENT"
 
     async def _dispose_active_scan_candidate_handles(self) -> None:
         handles = self._active_scan_candidate_handles
@@ -1298,6 +1346,7 @@ class ThreadsHomeReader:
                 failure = classify_playwright_failure(self._page, error)
                 if failure_operation == "SCAN_ROW":
                     row_identity = await self._revalidate_scan_failure()
+                    failure_site = self._scan_failure_site
                     operation_name = self._scan_operation
                     if operation_name not in {
                         "DISCOVER_ROOTS",
@@ -1322,6 +1371,19 @@ class ThreadsHomeReader:
                         error_kind=classify_playwright_error_kind(error),
                         row_identity=(
                             row_identity if row_identity in {"REUSED", "CHANGED"} else "UNKNOWN"
+                        ),
+                        body_substep=(
+                            self._body_text.last_failure_substep
+                            if operation_name == "READ_BODY"
+                            else None
+                        ),
+                        identity_source=(
+                            "NONE" if failure_site is None else failure_site.identity_source
+                        ),
+                        retry_eligibility=(
+                            row_identity
+                            if row_identity in {"REUSED", "CHANGED"}
+                            else "INSUFFICIENT"
                         ),
                     )
                     if (
@@ -2273,6 +2335,9 @@ class ThreadsHomeReader:
         counts.url_structure_counts.clear()
         counts.unsupported_roots = 0
         counts.roots_truncated = False
+        counts.unrepresented_root_count = 0
+        counts.unresolved_visited_rows = 0
+        counts.lookahead_rows = 0
         counts.region_status = "UNSET"
         counts.scroll_surface_status = "NOT_CHECKED"
         counts.structural_reasons.clear()
@@ -2284,6 +2349,7 @@ class ThreadsHomeReader:
         region = await self._content_region()
         roots, roots_truncated = await self._top_level_candidate_roots(region, viewport)
         counts.roots_truncated = roots_truncated
+        counts.unrepresented_root_count = int(roots_truncated)
         self._set_scan_operation("STRUCTURE")
         structures = await self._collect_structure_diagnostics(
             region,
@@ -2300,6 +2366,11 @@ class ThreadsHomeReader:
             fingerprint: str | None = None,
             candidate: bool = True,
         ) -> None:
+            if target is not None:
+                diagnostic.identity_fingerprint = target.fingerprint
+                diagnostic.author_fingerprint = sha256(target.author.encode()).hexdigest()
+            self.last_candidate_diagnostics = tuple(diagnostics)
+            self.refresh_viewport_body_coverage_counts()
             if on_row is not None:
                 self._set_scan_operation("EMIT_ROW")
                 await on_row(
@@ -2313,7 +2384,14 @@ class ThreadsHomeReader:
                 )
 
         candidate_rows: list[
-            tuple[int, Locator, _CandidateStructure, bool, _CandidateDiagnostic, str]
+            tuple[
+                int,
+                Locator,
+                _CandidateStructure,
+                _TrackedRowIdentity | None,
+                _CandidateDiagnostic,
+                str,
+            ]
         ] = []
         candidate_dom_handles: dict[int, JSHandle] = {}
         self._active_scan_candidate_handles = candidate_dom_handles
@@ -2369,6 +2447,8 @@ class ThreadsHomeReader:
             carried_row = carried_identity is not None
             if carried_identity is not None:
                 matched_previous_identity_handles.add(id(carried_identity.dom_handle))
+                diagnostic.identity_fingerprint = carried_identity.fingerprint
+                diagnostic.author_fingerprint = carried_identity.author_fingerprint
             if has_row_cues or semantic_row or carried_row:
                 root_handle = await root.element_handle()
                 if root_handle is not None:
@@ -2388,7 +2468,7 @@ class ThreadsHomeReader:
                         index,
                         root,
                         structure,
-                        carried_row,
+                        carried_identity,
                         diagnostic,
                         diagnostic.observation_id,
                     )
@@ -2397,7 +2477,9 @@ class ThreadsHomeReader:
                 diagnostic.state = "DEFERRED_IDENTITY"
                 diagnostic.reason = "POST_ROOT_UNRESOLVED"
                 diagnostic.observation_id = secrets.token_hex(8)
+                self._record_structure_reason("POST_ROOT_UNRESOLVED")
         self.last_candidate_diagnostics = tuple(diagnostics)
+        self.refresh_viewport_body_coverage_counts()
         unresolved_root_count = sum(
             diagnostic.reason == "POST_ROOT_UNRESOLVED" for diagnostic in diagnostics
         )
@@ -2414,8 +2496,8 @@ class ThreadsHomeReader:
         pending_signals: list[_CardWaitSignal] = []
         scanned_fingerprints: set[str] = set()
         candidate_by_index = {
-            index: (root, structure, carried_row, diagnostic, observation_id)
-            for index, root, structure, carried_row, diagnostic, observation_id in candidate_rows
+            index: (root, structure, carried_identity, diagnostic, observation_id)
+            for index, root, structure, carried_identity, diagnostic, observation_id in candidate_rows
         }
         processed_candidates = 0
         for row_index, diagnostic in enumerate(diagnostics):
@@ -2432,7 +2514,8 @@ class ThreadsHomeReader:
                 await emit_row(diagnostic)
                 continue
             processed_candidates += 1
-            root, structure, carried_row, diagnostic, _ = candidate
+            root, structure, carried_identity, diagnostic, _ = candidate
+            carried_row = carried_identity is not None
             root_handle = candidate_dom_handles.get(row_index)
             if root_handle is None:
                 counts.skipped_rows += 1
@@ -2447,6 +2530,7 @@ class ThreadsHomeReader:
                 root_handle,
                 viewport,
                 row_index + 1,
+                carried_identity=carried_identity,
             )
             self._set_scan_operation("STRUCTURE")
             if not await self._same_dom_element(root, root_handle):
@@ -2467,6 +2551,7 @@ class ThreadsHomeReader:
                 carried_row = False
                 diagnostic.observation_id = secrets.token_hex(8)
                 diagnostic.identity_fingerprint = None
+                diagnostic.author_fingerprint = None
                 structure = await self._inspect_candidate_root(root, viewport)
                 diagnostic.root_kind = structure.root_kind
                 diagnostic.has_visible_time = structure.visible_times > 0
@@ -2613,6 +2698,7 @@ class ThreadsHomeReader:
                     candidate_prior_fingerprints[row_index] = None
                     diagnostic.observation_id = secrets.token_hex(8)
                     diagnostic.identity_fingerprint = None
+                    diagnostic.author_fingerprint = None
                     carried_row = False
                 self.last_scan_timings.read_row_ms += round(
                     (time.perf_counter() - read_started) * 1000
@@ -2847,6 +2933,7 @@ class ThreadsHomeReader:
                         if identity_changed:
                             diagnostic.observation_id = secrets.token_hex(8)
                             diagnostic.identity_fingerprint = None
+                            diagnostic.author_fingerprint = None
                             candidate_prior_fingerprints[row_index] = None
                             carried_row = False
                             diagnostic.state = "REJECTED"
@@ -2891,6 +2978,7 @@ class ThreadsHomeReader:
                         if identity_changed:
                             diagnostic.observation_id = secrets.token_hex(8)
                             diagnostic.identity_fingerprint = None
+                            diagnostic.author_fingerprint = None
                             candidate_prior_fingerprints[row_index] = None
                             carried_row = False
                             diagnostic.state = "REJECTED"
@@ -3171,6 +3259,8 @@ class ThreadsHomeReader:
             )
         ):
             counts.coverage_complete = False
+        self.last_candidate_diagnostics = tuple(diagnostics)
+        self.refresh_viewport_body_coverage_counts()
         self._set_scan_operation("FINALIZE")
         signature = (
             tuple(
@@ -3206,7 +3296,13 @@ class ThreadsHomeReader:
             candidate_roots.append(root)
             candidate_observation_ids.append(stable_id)
             candidate_identities.append(
-                _TrackedRowIdentity(handle, stable_id, diagnostic.identity_fingerprint)
+                _TrackedRowIdentity(
+                    handle,
+                    stable_id,
+                    diagnostic.identity_fingerprint,
+                    diagnostic.author_fingerprint,
+                    diagnostic.state == "VERIFIED",
+                )
             )
         retained_handles = {id(identity.dom_handle) for identity in candidate_identities}
         for handle in candidate_dom_handles.values():
@@ -3724,10 +3820,6 @@ class ThreadsHomeReader:
                 structure.canonical_post_links and structure.profile_anchor_candidates
             ):
                 self._record_structure_reason("DISPLAY_OBSERVATION_ONLY")
-            elif (structure.visible_post_links and not structure.canonical_post_links) or (
-                structure.canonical_post_links and not structure.profile_anchor_candidates
-            ):
-                self._record_structure_reason("POST_ROOT_UNRESOLVED")
 
         unscoped = await region.evaluate(
             """(region, args) => {

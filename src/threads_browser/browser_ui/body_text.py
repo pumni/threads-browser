@@ -22,6 +22,7 @@ from .geometry import with_scrollport_geometry as _with_scrollport_geometry
 _MAX_BODY_CODEPOINTS = 10_000
 _MAX_BODY_TEXT_NODES = 256
 _MAX_BODY_RANGE_CHECKS = 40_000
+_MAX_BODY_RANGE_DEPTH = 32
 _MAX_BODY_PROGRESS_POSTS = 200
 
 
@@ -107,6 +108,7 @@ class BodyTextReader:
         self._body_text_progress: dict[str, dict[str, _BodyTextProgress]] = {}
         self._body_visibility_ranges: dict[str, set[tuple[int, int, int]]] = {}
         self._body_progress_salt = secrets.token_bytes(16)
+        self.last_failure_substep: str | None = None
 
     @classmethod
     def _fragment_text(
@@ -145,6 +147,7 @@ class BodyTextReader:
         scan_counts: _FeedScanCounts,
         isolated_scope: bool = False,
     ) -> _VisibleBodyRead:
+        self.last_failure_substep = "BODY_RANGE_EVALUATE"
         observation = await root.evaluate(
             _with_scrollport_geometry("""(root, args) => {
                 /*SCROLLPORT_GEOMETRY*/
@@ -258,7 +261,12 @@ class BodyTextReader:
                     let nearestBelow = null;
                     let frontier = null;
                     const range = document.createRange();
-                    const inspect = (start, end) => {
+                    const inspect = (start, end, depth = 0) => {
+                        if (depth >= args.maxRangeDepth) {
+                            truncated = true;
+                            limitReached = true;
+                            return;
+                        }
                         if (rangeChecks++ >= args.maxRangeChecks) {
                             truncated = true;
                             limitReached = true;
@@ -335,14 +343,7 @@ class BodyTextReader:
                             return;
                         }
                         if (end - start <= 1) {
-                            const top = Math.min(...rects.map(rect => rect.top));
-                            const bottom = Math.max(...rects.map(rect => rect.bottom));
-                            visible.push({
-                                start, end, text: node.data.slice(start, end), top,
-                                contentY: bottom + metrics.offset,
-                            });
-                            frontier = Math.max(frontier ?? -Infinity,
-                                bottom + metrics.offset);
+                            deferredOther++;
                             return;
                         }
                         let middle = start + Math.floor((end - start) / 2);
@@ -354,8 +355,12 @@ class BodyTextReader:
                                 middle++;
                             }
                         }
-                        inspect(start, middle);
-                        inspect(middle, end);
+                        if (middle <= start || middle >= end) {
+                            deferredOther++;
+                            return;
+                        }
+                        inspect(start, middle, depth + 1);
+                        inspect(middle, end, depth + 1);
                     };
                     inspect(0, length);
                     range.detach();
@@ -442,9 +447,11 @@ class BodyTextReader:
                 "maxChars": _MAX_BODY_CODEPOINTS,
                 "maxNodes": _MAX_BODY_TEXT_NODES,
                 "maxRangeChecks": _MAX_BODY_RANGE_CHECKS,
+                "maxRangeDepth": _MAX_BODY_RANGE_DEPTH,
                 "isolatedScope": isolated_scope,
             },
         )
+        self.last_failure_substep = None
 
         read_evidence = BodyReadEvidence(
             state=str(observation["textEvidence"]),

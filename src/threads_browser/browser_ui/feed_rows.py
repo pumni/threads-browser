@@ -68,6 +68,7 @@ class _CandidateDiagnostic:
     state: str = "NON_POST"
     reason: str = "NO_POST_ROW_EVIDENCE"
     identity_fingerprint: str | None = field(default=None, repr=False)
+    author_fingerprint: str | None = field(default=None, repr=False)
     observation_id: str | None = field(default=None, repr=False)
     read_evidence: BodyReadEvidence | None = field(default=None, repr=False)
     same_scroller_scroll_top_delta: float | None = field(default=None, repr=False)
@@ -99,6 +100,24 @@ class _CandidateStructure:
     offscreen_body_candidates: int = 0
     post_url_links: tuple[tuple[str, bool], ...] = ()
     root_kind: str = "CONTAINER"
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateIdentityEvidence:
+    root_matches: bool
+    canonical_fingerprint: str | None
+    post_fingerprints: frozenset[str] = frozenset()
+    author_fingerprints: frozenset[str] = frozenset()
+
+    def conflicts_with(
+        self,
+        fingerprint: str,
+        author_fingerprint: str | None,
+    ) -> bool:
+        return any(value != fingerprint for value in self.post_fingerprints) or any(
+            author_fingerprint is None or value != author_fingerprint
+            for value in self.author_fingerprints
+        )
 
 
 @dataclass(slots=True)
@@ -145,6 +164,9 @@ class _FeedScanCounts:
     structural_reasons: dict[str, int] = field(default_factory=dict)
     unsupported_roots: int = 0
     roots_truncated: bool = False
+    unrepresented_root_count: int = 0
+    unresolved_visited_rows: int = 0
+    lookahead_rows: int = 0
     region_status: str = "UNSET"
     scroll_surface_status: str = "NOT_CHECKED"
 
@@ -163,6 +185,98 @@ class FeedRowScanner:
     def __init__(self, page: Page) -> None:
         self._page = page
         self.last_scan_counts = _FeedScanCounts()
+
+    async def _candidate_identity_evidence(
+        self,
+        root: Locator,
+        root_handle: JSHandle,
+    ) -> _CandidateIdentityEvidence:
+        links = await root.evaluate(
+            _with_scrollport_geometry(
+                """(node, args) => {
+                    /*SCROLLPORT_GEOMETRY*/
+                    if (node !== args.expected) return null;
+                    const visible = element => {
+                        for (let current = element; current;
+                             current = current.parentElement) {
+                            const style = getComputedStyle(current);
+                            if (style.display === "none" ||
+                                style.visibility === "hidden" ||
+                                Number(style.opacity) === 0) return false;
+                        }
+                        return geometryFor(element).intersects;
+                    };
+                    const links = [];
+                    for (const link of node.querySelectorAll("a[href]")) {
+                        if (link.closest(args.quote) || link.closest(args.excluded)) continue;
+                        const nearest = link.parentElement?.closest(args.roots);
+                        const belongs = node.matches(args.roots)
+                            ? nearest === node
+                            : node.contains(link) && !nearest;
+                        if (!belongs || !visible(link)) continue;
+                        const time = link.querySelector("time");
+                        links.push({
+                            href: link.getAttribute("href"),
+                            timestamp: Boolean(time && visible(time)),
+                        });
+                        if (links.length > args.maxLinks) break;
+                    }
+                    return links;
+                }"""
+            ),
+            {
+                "expected": root_handle,
+                "roots": _FEED_ROOT_SELECTOR,
+                "quote": _QUOTE_SELECTOR,
+                "excluded": (
+                    "nav, aside, footer, form, [contenteditable='true'], "
+                    "[role='navigation'], [role='menu'], "
+                    "[role='complementary'], [role='dialog'], "
+                    "[role='search'], [role='banner'], "
+                    "[role='contentinfo'], [role='textbox']"
+                ),
+                "maxLinks": _MAX_CARD_LINKS,
+            },
+        )
+        if links is None or len(links) > _MAX_CARD_LINKS:
+            return _CandidateIdentityEvidence(False, None)
+
+        post_fingerprints: set[str] = set()
+        timestamp_fingerprints: set[str] = set()
+        route_author_fingerprints: set[str] = set()
+        author_fingerprints: set[str] = set()
+        for item in links:
+            href = item["href"]
+            parsed = _post_url(href)
+            if parsed is not None:
+                url, route_author = parsed
+                fingerprint = sha256(f"{url}\n{route_author}".encode()).hexdigest()
+                route_author_fingerprint = sha256(route_author.encode()).hexdigest()
+                post_fingerprints.add(fingerprint)
+                route_author_fingerprints.add(route_author_fingerprint)
+                if item["timestamp"]:
+                    timestamp_fingerprints.add(fingerprint)
+                continue
+            if _post_url_hint(href):
+                continue
+            author = _profile_author(href)
+            if author is not None:
+                author_fingerprints.add(sha256(author.encode()).hexdigest())
+
+        canonical_fingerprint: str | None = None
+        if (
+            len(post_fingerprints) == 1
+            and len(timestamp_fingerprints) == 1
+            and len(route_author_fingerprints) == 1
+            and author_fingerprints == route_author_fingerprints
+        ):
+            canonical_fingerprint = next(iter(timestamp_fingerprints))
+        return _CandidateIdentityEvidence(
+            True,
+            canonical_fingerprint,
+            frozenset(post_fingerprints),
+            frozenset(author_fingerprints),
+        )
 
     async def _belongs_to_card(
         self,

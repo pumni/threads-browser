@@ -11,12 +11,13 @@ from uuid import uuid4
 
 import pytest
 from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import Route
+from playwright.async_api import Locator, Route
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright as real_async_playwright
 
 from threads_browser import reader as reader_module
 from threads_browser import workflow
+from threads_browser.browser_ui import body_text as body_text_module
 from threads_browser.browser_ui.geometry import with_scrollport_geometry
 from threads_browser.browser_ui.scrolling import (
     MAX_WHEEL_STEP_PX,
@@ -148,7 +149,7 @@ def test_offline_chromium_cli_reads_once_and_resumes_without_double_counting(
     old_relevant_body = "Hiring a backend engineer in Vietnam"
     new_relevant_body = "Hiring a frontend engineer in Vietnam"
     first_feed_html = f"""<!doctype html>
-<html><head><style>article {{ min-height: 900px; }}</style></head><body>
+<html><head><style>article {{ min-height: 840px; }}</style></head><body>
 <nav aria-label="Main" role="navigation">
   <a aria-current="page" aria-label="For you" href="/">For you</a>
   <a aria-label="Profile" href="/@{actor}">Profile</a>
@@ -2538,6 +2539,17 @@ def _synthetic_three_card_feed(actor: str) -> str:
     ("error_message", "expected_class", "expected_kind"),
     [
         ("synthetic protocol failure PRIVATE_MARKER", "OTHER", "OTHER"),
+        (
+            "Protocol error: evaluation failed PRIVATE_MARKER",
+            "OTHER",
+            "EVALUATION_PROTOCOL",
+        ),
+        (
+            "RangeError: Maximum call stack size exceeded PRIVATE_MARKER",
+            "OTHER",
+            "JS_STACK_OVERFLOW",
+        ),
+        ("RangeError: invalid range PRIVATE_MARKER", "OTHER", "JS_RANGE_ERROR"),
         ("Evaluation failed: PRIVATE_MARKER", "OTHER", "EVALUATION"),
         ("strict mode violation: PRIVATE_MARKER", "OTHER", "STRICT_MODE"),
         (
@@ -2546,7 +2558,15 @@ def _synthetic_three_card_feed(actor: str) -> str:
             "EXECUTION_CONTEXT",
         ),
     ],
-    ids=("other", "evaluation", "strict-mode", "execution-context"),
+    ids=(
+        "other",
+        "evaluation-protocol",
+        "stack-overflow",
+        "range-error",
+        "evaluation",
+        "strict-mode",
+        "execution-context",
+    ),
 )
 def test_transient_scan_row_failure_retries_without_replaying_verified_posts(
     tmp_path: Path,
@@ -2570,6 +2590,7 @@ def test_transient_scan_row_failure_retries_without_replaying_verified_posts(
         async def _read_visible_body_progress(self, root, *args, **kwargs):
             if await root.get_attribute("id") == "scan-row-3" and not self.failures:
                 self.failures += 1
+                self._body_text.last_failure_substep = "BODY_RANGE_EVALUATE"
                 raise PlaywrightError(error_message)
             return await super()._read_visible_body_progress(root, *args, **kwargs)
 
@@ -2623,6 +2644,8 @@ def test_transient_scan_row_failure_retries_without_replaying_verified_posts(
         "row_identity_changed=false"
     ) in output
     assert "RECOVERED stage=FEED_INITIAL retry=1" in output
+    assert "body_substep=BODY_RANGE_EVALUATE" in output
+    assert "identity_source=CURRENT_CANONICAL retry_eligibility=REUSED" in output
     assert "PRIVATE_MARKER" not in output
     assert all(f"SYNTHETIC_PRIVATE_ROW_{index}" not in output for index in range(1, 4))
     checkpoint = store.load(
@@ -2635,7 +2658,145 @@ def test_transient_scan_row_failure_retries_without_replaying_verified_posts(
     assert checkpoint.detail_reads == 1
 
 
-@pytest.mark.parametrize("failure_mode", ["persistent", "canonical-change", "root-replaced"])
+def test_read_body_retry_uses_carried_verified_row_after_native_scroll(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    detail_body = "Hiring a backend engineer in Vietnam"
+    feed_html = f"""<!doctype html><html><head><style>
+html, body {{ margin: 0; }}
+nav {{ height: 36px; }}
+article {{ position: relative; box-sizing: border-box; height: 420px; margin: 0; }}
+.identity {{ position: absolute; top: 6px; left: 12px; }}
+.body {{ position: absolute; top: 320px; left: 12px; right: 12px; }}
+.secondary {{ position: absolute; top: 360px; left: 12px; }}
+article:nth-of-type(3) .body {{ top: 70px; }}
+</style></head><body>
+<nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main>
+<article id="scroll-row-1">
+<div class="identity"><a href="/@candidate/post/scroll-row-1"><time>3h</time></a>
+<a href="/@candidate">candidate</a></div>
+<div class="body"><p>A synthetic weather update</p></div>
+<a class="secondary" href="/@candidate/post/related?source=synthetic">related</a>
+</article>
+<article id="scroll-row-2">
+<div class="identity"><a href="/@candidate/post/scroll-row-2"><time>2h</time></a>
+<a href="/@candidate">candidate</a></div>
+<div class="body"><p>A synthetic local event</p></div>
+</article>
+<article id="scroll-row-3">
+<div class="identity"><a href="/@candidate/post/scroll-row-3"><time>1h</time></a>
+<a href="/@candidate">candidate</a></div>
+<div class="body"><p>{detail_body}</p></div>
+</article>
+</main></body></html>"""
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(tmp_path / "data").add("offline", actor, profile)
+    store = CheckpointStore(tmp_path / "data")
+
+    class FailCarriedBodyOnceReader(ThreadsHomeReader):
+        last_instance = None
+        active_reader = None
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.failed = False
+            self.inject_body_failure = False
+            type(self).last_instance = self
+
+        async def _read_visible_body_progress(self, root, *args, **kwargs):
+            if (
+                self._scan_stage == "FEED_SCROLL"
+                and await root.get_attribute("id") == "scroll-row-1"
+                and not self.failed
+            ):
+                self.failed = True
+                self.inject_body_failure = True
+                type(self).active_reader = self
+                try:
+                    return await super()._read_visible_body_progress(root, *args, **kwargs)
+                finally:
+                    self.inject_body_failure = False
+            return await super()._read_visible_body_progress(root, *args, **kwargs)
+
+    original_evaluate = Locator.evaluate
+
+    async def fail_body_range_evaluate(locator, expression, arg=None):
+        active_reader = FailCarriedBodyOnceReader.active_reader
+        if (
+            active_reader is not None
+            and active_reader.inject_body_failure
+            and "bodyTextNodesPresent" in expression
+            and await locator.get_attribute("id") == "scroll-row-1"
+        ):
+            raise PlaywrightError("synthetic body range failure PRIVATE_MARKER")
+        return await original_evaluate(locator, expression, arg)
+
+    monkeypatch.setattr(Locator, "evaluate", fail_body_range_evaluate)
+    monkeypatch.setattr(workflow, "ThreadsHomeReader", FailCarriedBodyOnceReader)
+
+    async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body=(
+                    "<!doctype html><html><body><main><article>"
+                    '<a href="/@candidate/post/scroll-row-3"><time>1h</time></a>'
+                    '<a href="/@candidate">candidate</a>'
+                    f"<p>{detail_body}</p></article></main></body></html>"
+                ),
+            )
+
+        await page.route("**/post/scroll-row-3", serve_detail)
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=3,
+            max_scrolls=1,
+            terms=("hiring", "engineer"),
+        )
+        assert result.status == "COMPLETE"
+        assert result.home_sampled == 3
+        assert result.classified == 3
+        assert result.provenance_verified == 3
+        assert result.unique_verified_posts == 3
+        assert result.detail_reads == 1
+        assert result.scroll_attempts == result.scrolls == 1
+
+    _run_offline_page(feed_html, exercise)
+    output = capsys.readouterr().out
+    assert "operation=READ_BODY" in output
+    assert "body_substep=BODY_RANGE_EVALUATE" in output
+    assert "identity_source=CARRIED_VERIFIED retry_eligibility=REUSED" in output
+    assert "PRIVATE_MARKER" not in output
+    assert "POST_ROOT_UNRESOLVED:1" not in output
+    reader = FailCarriedBodyOnceReader.last_instance
+    assert reader is not None
+    assert reader.last_scan_counts.coverage_complete
+    assert reader.last_scan_counts.unrepresented_root_count == 0
+    assert reader.last_scan_counts.unresolved_visited_rows == 0
+    assert reader.last_scan_counts.structural_reasons.get("POST_ROOT_UNRESOLVED", 0) == 0
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring", "engineer"))),
+    )
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.home_sampled == 3
+    assert checkpoint.detail_reads == 1
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    ["persistent", "canonical-change", "canonical-author-change", "root-replaced"],
+)
 def test_unrevalidated_scan_row_failure_stops_without_checkpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2667,8 +2828,13 @@ def test_unrevalidated_scan_row_failure_stops_without_checkpoint(
                 await root.locator('a[href*="/post/"]').first.evaluate(
                     "node => node.setAttribute('href', '/@candidate/post/rebound-row')"
                 )
+            elif failure_mode == "canonical-author-change" and self.failures == 1:
+                await root.locator('a[href="/@candidate"]').evaluate(
+                    "node => node.setAttribute('href', '/@other-candidate')"
+                )
             elif failure_mode == "root-replaced" and self.failures == 1:
                 await root.evaluate("node => node.replaceWith(node.cloneNode(true))")
+            self._body_text.last_failure_substep = "BODY_RANGE_EVALUATE"
             raise PlaywrightError("synthetic protocol failure PRIVATE_MARKER")
 
         async def _dispose_active_scan_candidate_handles(self):
@@ -2701,6 +2867,12 @@ def test_unrevalidated_scan_row_failure_stops_without_checkpoint(
     _run_offline_page(html, exercise)
     output = capsys.readouterr().out
     assert "PRIVATE_MARKER" not in output
+    assert "body_substep=BODY_RANGE_EVALUATE" in output
+    assert (
+        "retry_eligibility=REUSED" in output
+        if failure_mode == "persistent"
+        else "retry_eligibility=CHANGED" in output
+    ), output
     assert all(f"SYNTHETIC_PRIVATE_ROW_{index}" not in output for index in range(1, 4))
     assert "offline.operator" not in output
     assert "scan-row-3" not in output
@@ -3821,6 +3993,180 @@ font: 16px/18px monospace; overflow-wrap: anywhere; }}
             not 0xD800 <= ord(character) <= 0xDFFF
             for segment in target.visible_segments
             for character in segment.text
+        )
+
+    _run_offline_page(feed_html, exercise)
+
+
+@pytest.mark.parametrize(
+    ("body", "body_top", "body_left", "font", "sequence", "scroll_to_complete"),
+    [
+        ("😀", 682, 0, "32px/48px monospace", "😀", True),
+        ("😀", -20, 0, "32px/48px monospace", "😀", False),
+        ("😀", 200, -10, "32px/48px monospace", "😀", False),
+        (
+            "line\n" * 12 + "👩🏽‍💻" + "\nend",
+            320,
+            0,
+            "24px/32px monospace",
+            "👩🏽‍💻",
+            True,
+        ),
+    ],
+    ids=("bottom-astral", "top-astral", "left-astral", "bottom-zwj"),
+)
+def test_partially_clipped_unicode_ranges_wait_until_fully_visible(
+    body: str,
+    body_top: int,
+    body_left: int,
+    font: str,
+    sequence: str,
+    scroll_to_complete: bool,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    feed_html = f"""<!doctype html><html><head><meta charset="utf-8"><style>
+html, body {{ margin: 0; }}
+article {{ position: relative; height: 1600px; margin: 0; }}
+article p {{ position: absolute; top: {body_top}px; left: {body_left}px; width: 1200px;
+margin: 0; white-space: pre; font: {font}; }}
+</style></head><body><main><article><p>{body}</p></article></main></body></html>"""
+
+    async def exercise(page) -> None:
+        await page.set_viewport_size({"width": 1280, "height": 720})
+        reader = ThreadsHomeReader(page, "offline.operator")
+        root = page.locator("article")
+        root_handle = await root.element_handle()
+        assert root_handle is not None
+        try:
+            first = await reader._read_visible_body_progress(
+                root,
+                root_handle,
+                fingerprint="synthetic-partial-unicode",
+            )
+            assert not first.complete
+            assert first.read_evidence.missing_range_count
+            assert first.read_evidence.visible_text_rect_count
+            assert sequence not in (first.body or "")
+
+            if not scroll_to_complete:
+                return
+            await page.mouse.wheel(0, 288)
+            await page.wait_for_function("window.scrollY > 0")
+            completed = await reader._read_visible_body_progress(
+                root,
+                root_handle,
+                fingerprint="synthetic-partial-unicode",
+            )
+            assert completed.complete
+            assert completed.body is not None
+            assert sequence in completed.body
+            assert completed.read_evidence.missing_range_count == 0
+            assert completed.read_evidence.visited_range_count == (
+                completed.read_evidence.expected_range_count
+            )
+            assert all(
+                not 0xD800 <= ord(character) <= 0xDFFF
+                for segment in completed.segments
+                for character in segment.text
+            )
+        finally:
+            await root_handle.dispose()
+
+    _run_offline_page(feed_html, exercise)
+    output = capsys.readouterr().out
+    assert "RangeError" not in output
+    assert "error_kind=OTHER" not in output
+
+
+def test_body_range_depth_limit_marks_read_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actor = "offline.operator"
+    body = "Synthetic body fragment. " * 100
+    feed_html = f"""<!doctype html><html><head><meta charset="utf-8"><style>
+html, body {{ margin: 0; }}
+nav {{ height: 32px; }}
+article {{ margin: 0; }}
+article p {{ width: 300px; margin: 0; font: 20px/24px monospace; }}
+</style></head><body><nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main><article><a href="/@candidate/post/range-depth"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>{body}</p></article></main></body></html>"""
+    monkeypatch.setattr(body_text_module, "_MAX_BODY_RANGE_DEPTH", 1)
+
+    async def exercise(page) -> None:
+        await page.set_viewport_size({"width": 1280, "height": 720})
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        rows = []
+
+        async def record(row) -> None:
+            if row.target is not None:
+                rows.append(row.target)
+
+        await reader.scan_viewport(1, on_row=record)
+        assert rows
+        target = rows[-1]
+        assert not target.body_complete
+        assert target.read_evidence is not None
+        assert target.read_evidence.body_incomplete_reason == "LIMIT"
+        assert not reader.last_scan_counts.coverage_complete
+
+    _run_offline_page(feed_html, exercise)
+
+
+def test_lookahead_rows_are_separate_from_visited_body_gaps() -> None:
+    actor = "offline.operator"
+    feed_html = f"""<!doctype html><html><head><meta charset="utf-8"><style>
+html, body {{ margin: 0; }}
+nav {{ height: 32px; }}
+article {{ position: relative; box-sizing: border-box; height: 400px; margin: 0; }}
+.identity {{ position: absolute; top: 8px; left: 8px; }}
+.body {{ position: absolute; top: 700px; left: 8px; font: 20px/28px monospace; }}
+</style></head><body><nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main>
+<article><div class="identity"><a href="/@candidate/post/lookahead"><time>now</time></a><a href="/@candidate">candidate</a></div>
+<div class="body"><p>A synthetic lookahead body.</p></div></article>
+<article><div class="identity"><a href="/@candidate/post/lookahead"><time>now</time></a><a href="/@candidate">candidate</a></div>
+<div class="body"><p>A synthetic lookahead body.</p></div></article>
+</main></body></html>"""
+
+    async def exercise(page) -> None:
+        await page.set_viewport_size({"width": 1280, "height": 720})
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        await reader.scan_viewport(4)
+
+        assert not reader.last_scan_counts.coverage_complete
+        assert reader.last_scan_counts.unresolved_visited_rows == 0, [
+            (
+                diagnostic.state,
+                None
+                if diagnostic.read_evidence is None
+                else (
+                    diagnostic.read_evidence.visible_text_rect_count,
+                    diagnostic.read_evidence.closest_text_side,
+                    diagnostic.read_evidence.closest_text_distance_px,
+                ),
+            )
+            for diagnostic in reader.last_candidate_diagnostics
+        ]
+        assert reader.last_scan_counts.lookahead_rows == 1
+        unresolved = [
+            diagnostic
+            for diagnostic in reader.last_candidate_diagnostics
+            if diagnostic.state not in {"NON_POST", "VERIFIED"}
+        ]
+        assert len(unresolved) == 2
+        assert all(diagnostic.read_evidence is not None for diagnostic in unresolved)
+        assert all(
+            diagnostic.read_evidence.visible_text_rect_count == 0
+            and diagnostic.read_evidence.visited_range_count == 0
+            and diagnostic.read_evidence.closest_text_side == "BELOW"
+            for diagnostic in unresolved
         )
 
     _run_offline_page(feed_html, exercise)
