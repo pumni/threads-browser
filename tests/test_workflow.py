@@ -3639,6 +3639,7 @@ def test_public_browser_workflow_owns_profile_lock(tmp_path: Path, monkeypatch) 
         raise UiReadError("BROWSER_SESSION_UNAVAILABLE")
 
     monkeypatch.setattr(workflow, "async_playwright", check_lock_before_browser)
+
     def run() -> None:
         asyncio.run(
             workflow.run_browser_nurture(
