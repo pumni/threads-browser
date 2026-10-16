@@ -282,10 +282,13 @@ async def run_page_workflow(
                 key=lambda target: pending_order[target.fingerprint],
             )
         else:
-            ordered = sorted(
-                targets,
-                key=lambda target: target.fingerprint in dedupe.previously_seen,
-            )
+            ordered = [
+                target
+                for target in targets
+                if target.fingerprint not in dedupe.previously_seen
+            ]
+            if not ordered:
+                return
         selected = await first_actionable(ordered)
         if selected is None:
             return

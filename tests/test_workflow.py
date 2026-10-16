@@ -957,6 +957,81 @@ def test_failed_fallback_detail_is_retried_on_the_next_cycle(
     assert "decision=VERIFIED_FALLBACK" in capsys.readouterr().out
 
 
+def test_completed_fallback_is_not_opened_again_on_unchanged_feed(
+    tmp_path: Path,
+) -> None:
+    actor = "offline.operator"
+    target_url = "https://www.threads.com/@candidate/post/completed-fallback"
+    body = "A synthetic weather update."
+    feed_html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main><article>
+  <a href="/@candidate/post/completed-fallback"><time>now</time></a>
+  <a href="/@candidate">candidate</a><p>{body}</p>
+</article></main></body></html>"""
+    detail_html = f"""<!doctype html><html><body><main><article>
+<a href="/@candidate">candidate</a><p>{body}</p>
+</article></main></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "synthetic-profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+    detail_attempts = 0
+
+    async def serve_detail(route: Route) -> None:
+        nonlocal detail_attempts
+        detail_attempts += 1
+        await route.fulfill(
+            status=200,
+            content_type="text/html",
+            body=detail_html,
+        )
+
+    async def first_cycle(page) -> None:
+        await page.route(target_url, serve_detail)
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=1,
+            max_scrolls=0,
+            terms=("hiring",),
+            detail=True,
+        )
+        assert result.status == "COMPLETE"
+        assert result.detail_reads == 1
+        assert page.url == HOME_URL
+
+    async def second_cycle(page) -> None:
+        await page.route(target_url, serve_detail)
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=1,
+            max_scrolls=0,
+            terms=("hiring",),
+            detail=True,
+        )
+        assert result.detail_reads == 0
+        assert page.url == HOME_URL
+
+    _run_offline_page(feed_html, first_cycle)
+    _run_offline_page(feed_html, second_cycle)
+
+    checkpoint = store.load(
+        account.account_id,
+        policy_fingerprint(canonical_terms(("hiring",))),
+    )
+    assert detail_attempts == 1
+    assert checkpoint.completed_runs == 2
+    assert checkpoint.detail_reads == 1
+    assert checkpoint.pending_read_fingerprints == ()
+
+
 def test_q_stops_pending_detail_without_back_or_checkpoint(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
