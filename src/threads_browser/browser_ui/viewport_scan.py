@@ -567,6 +567,14 @@ class ViewportScanCoordinator:
             card_hydration_wait_ms=state.hooks.card_hydration_wait_ms,
         )
 
+    async def _wait_for_stable_card_dom(self, root: Locator) -> bool:
+        state = self._require_state()
+        return await self._card_provenance.wait_for_stable_card_dom(
+            root,
+            body_stability_interval_ms=state.hooks.body_stability_interval_ms,
+            card_hydration_wait_ms=state.hooks.card_hydration_wait_ms,
+        )
+
     async def _recover_ambiguous_visible_card(self, *args, **kwargs) -> tuple[PostTarget, bool]:
         return await self._require_state().hooks.recover_ambiguous_visible_card(*args, **kwargs)
 
