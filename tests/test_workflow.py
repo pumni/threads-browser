@@ -38,6 +38,7 @@ from threads_browser.storage import (
     AccountStore,
     BrowserAccount,
     BrowserDataError,
+    Checkpoint,
     CheckpointStore,
 )
 from threads_browser.workflow import policy_fingerprint
@@ -2455,6 +2456,8 @@ def test_workflow_skips_detail_when_no_home_candidate_is_actionable(
     profile.mkdir()
     account = AccountStore(tmp_path / "data").add("offline", actor, profile)
     store = CheckpointStore(tmp_path / "data")
+    policy = policy_fingerprint(canonical_terms(("hiring",)))
+    store.save(Checkpoint(account.account_id, policy, completed_runs=4))
     detail_reads = 0
     detail_requests = 0
 
@@ -2488,8 +2491,62 @@ def test_workflow_skips_detail_when_no_home_candidate_is_actionable(
         assert result.status == "NO_ACTIONABLE_TARGET"
         assert result.stop_reason == "NO_ACTIONABLE_TARGET"
         assert result.detail_reads == 0
-        assert result.checkpoint_runs == 0
+        assert result.checkpoint_runs == 4
         assert result.checkpoint_saved is False
+
+    _run_offline_page(html, exercise)
+    checkpoint = store.load(account.account_id, policy)
+    assert checkpoint.completed_runs == 4
+    assert detail_reads == detail_requests == 0
+
+
+def test_checkpoint_save_failure_never_returns_a_saved_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actor = "offline.operator"
+    detail_url = "https://www.threads.com/@candidate/post/weather"
+    html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main><article>
+<a href="/@candidate/post/weather"><time>now</time></a>
+<a href="/@candidate">candidate</a><p>A synthetic weather update</p>
+</article></main></body></html>"""
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    account = AccountStore(tmp_path / "data").add("offline", actor, profile)
+    store = CheckpointStore(tmp_path / "data")
+
+    def fail_save(_checkpoint) -> None:
+        raise BrowserDataError("STATE_INVALID")
+
+    monkeypatch.setattr(store, "save", fail_save)
+
+    async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            await route.fulfill(
+                status=200,
+                content_type="text/html",
+                body="""<!doctype html><html><body><main>
+<div data-pressable-container="true">
+<header><a href="/@candidate">@candidate</a></header>
+<div class="post-body"><p>A synthetic weather update</p></div>
+</div></main></body></html>""",
+            )
+
+        await page.route(detail_url, serve_detail)
+        with pytest.raises(UiReadError) as caught:
+            await workflow.run_page_workflow(
+                page,
+                account,
+                store,
+                max_posts=1,
+                max_scrolls=0,
+                terms=("hiring",),
+            )
+        assert caught.value.code == "INTERNAL_OPERATION_ERROR"
 
     _run_offline_page(html, exercise)
     checkpoint = store.load(
@@ -2497,7 +2554,6 @@ def test_workflow_skips_detail_when_no_home_candidate_is_actionable(
         policy_fingerprint(canonical_terms(("hiring",))),
     )
     assert checkpoint.completed_runs == 0
-    assert detail_reads == detail_requests == 0
 
 
 def test_unresolved_post_root_does_not_block_a_verified_selected_post(
@@ -6484,6 +6540,7 @@ window.addEventListener("wheel", () => {{
         assert result.unresolved_gaps == 0
         assert result.detail_reads == 0
         assert result.checkpoint_runs == 0
+        assert result.checkpoint_saved is False
         # The second row is below-fold lookahead, not an encountered read gap.
         assert result.viewport_coverage_complete
         assert await page.evaluate("window.nativeWheelCount") >= 2

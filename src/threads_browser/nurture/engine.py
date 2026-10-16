@@ -105,6 +105,64 @@ class NurtureResult:
     checkpoint_saved: bool = False
 
 
+def _result_from_observation(
+    *,
+    status: str,
+    stop_reason: str,
+    dedupe: DedupeLedger,
+    stats: WorkflowStats,
+    reader: ThreadsHomeReader,
+    coverage: CoverageLedger,
+    checkpoint_runs: int,
+    detail_reads: int = 0,
+    report_home_counts: bool = True,
+    viewport_coverage_complete: bool | None = None,
+    checkpoint_saved: bool = False,
+) -> NurtureResult:
+    """Snapshot read-only observations separately from cycle/checkpoint disposition.
+
+    Callers may set ``checkpoint_saved`` only after the checkpoint store commits.
+    An existing ``checkpoint_runs`` value alone never marks this attempt saved.
+    """
+    home_sampled = len(dedupe.seen_this_run) if report_home_counts else 0
+    home_new = len(dedupe.new_fingerprints) if report_home_counts else 0
+    return NurtureResult(
+        status=status,
+        stop_reason=stop_reason,
+        home_sampled=home_sampled,
+        home_new=home_new,
+        home_relevant=stats.relevant if report_home_counts else 0,
+        home_irrelevant=stats.irrelevant if report_home_counts else 0,
+        home_unknown=stats.unknown if report_home_counts else 0,
+        duplicates=stats.duplicates,
+        detail_reads=detail_reads,
+        scroll_attempts=reader.scroll_attempts,
+        scrolls=reader.scrolls,
+        checkpoint_runs=checkpoint_runs,
+        home_relevant_ratio=(
+            None if not home_sampled else stats.relevant / home_sampled
+        ),
+        skipped_unverified=reader.skipped_unverified,
+        observed_rows=stats.observed_rows,
+        body_extracted=stats.body_extracted,
+        provenance_verified=stats.provenance_verified,
+        classified=stats.classified,
+        observation_unknown=stats.observation_unknown,
+        unverified_relevant=stats.unverified_relevant,
+        skipped_rows=stats.skipped_rows,
+        viewport_coverage_complete=(
+            stats.viewport_coverage_complete
+            if viewport_coverage_complete is None
+            else viewport_coverage_complete
+        ),
+        **coverage.reliability_metrics(
+            viewport_observations=stats.observed_rows,
+            visible_text_segments=stats.visible_text_segments,
+        ),
+        checkpoint_saved=checkpoint_saved,
+    )
+
+
 async def run_page_workflow(
     page: Page,
     account: BrowserAccount,
@@ -170,12 +228,6 @@ async def run_page_workflow(
     exhaustion_reason = "MAX_SCROLLS"
     pending_scroll_baseline: dict[str, object] | None = None
     actionability_rejected_codes: set[str] = set()
-
-    def reliability_metrics() -> dict[str, int]:
-        return coverage.reliability_metrics(
-            viewport_observations=stats.observed_rows,
-            visible_text_segments=stats.visible_text_segments,
-        )
 
     async def advance_feed(*, scan_after_scroll: bool = False) -> bool:
         nonlocal pending_scroll_baseline
@@ -795,32 +847,15 @@ async def run_page_workflow(
                 stats.skipped_rows += counts.skipped_rows
                 if detail:
                     _detail_stop("VIEWPORT_OBSERVATION_INCOMPLETE")
-                return NurtureResult(
+                return _result_from_observation(
                     status="VIEWPORT_OBSERVATION_INCOMPLETE",
                     stop_reason="VIEWPORT_OBSERVATION_INCOMPLETE",
-                    home_sampled=len(dedupe.seen_this_run),
-                    home_new=len(dedupe.new_fingerprints),
-                    home_relevant=stats.relevant,
-                    home_irrelevant=stats.irrelevant,
-                    home_unknown=stats.unknown,
-                    duplicates=stats.duplicates,
-                    detail_reads=0,
-                    scroll_attempts=reader.scroll_attempts,
-                    scrolls=reader.scrolls,
+                    dedupe=dedupe,
+                    stats=stats,
+                    reader=reader,
+                    coverage=coverage,
                     checkpoint_runs=checkpoint.completed_runs,
-                    home_relevant_ratio=None
-                    if not dedupe.seen_this_run
-                    else stats.relevant / len(dedupe.seen_this_run),
-                    skipped_unverified=reader.skipped_unverified,
-                    observed_rows=stats.observed_rows,
-                    body_extracted=stats.body_extracted,
-                    provenance_verified=stats.provenance_verified,
-                    classified=stats.classified,
-                    observation_unknown=stats.observation_unknown,
-                    unverified_relevant=stats.unverified_relevant,
-                    skipped_rows=stats.skipped_rows,
                     viewport_coverage_complete=False,
-                    **reliability_metrics(),
                 )
             if detail:
                 print(
@@ -1250,64 +1285,28 @@ async def run_page_workflow(
         print("SEARCH_INCOMPLETE reason=UNVERIFIED_RELEVANCE")
         if detail:
             _detail_stop("UNVERIFIED_RELEVANCE_REQUIRES_VERIFICATION")
-        return NurtureResult(
+        return _result_from_observation(
             status="UNVERIFIED_RELEVANCE_REQUIRES_VERIFICATION",
             stop_reason="UNVERIFIED_RELEVANCE_REQUIRES_VERIFICATION",
-            home_sampled=len(dedupe.seen_this_run),
-            home_new=len(dedupe.new_fingerprints),
-            home_relevant=stats.relevant,
-            home_irrelevant=stats.irrelevant,
-            home_unknown=stats.unknown,
-            duplicates=stats.duplicates,
-            detail_reads=0,
-            scroll_attempts=reader.scroll_attempts,
-            scrolls=reader.scrolls,
+            dedupe=dedupe,
+            stats=stats,
+            reader=reader,
+            coverage=coverage,
             checkpoint_runs=checkpoint.completed_runs,
-            home_relevant_ratio=(
-                None if not dedupe.seen_this_run else stats.relevant / len(dedupe.seen_this_run)
-            ),
-            skipped_unverified=reader.skipped_unverified,
-            observed_rows=stats.observed_rows,
-            body_extracted=stats.body_extracted,
-            provenance_verified=stats.provenance_verified,
-            classified=stats.classified,
-            observation_unknown=stats.observation_unknown,
-            unverified_relevant=stats.unverified_relevant,
-            skipped_rows=stats.skipped_rows,
-            viewport_coverage_complete=stats.viewport_coverage_complete,
-            **reliability_metrics(),
         )
     elif selected is None and actionability_rejected_codes:
         print("SEARCH_INCOMPLETE reason=NO_ACTIONABLE_TARGET")
         if detail:
             _detail_stop("NO_ACTIONABLE_TARGET")
         state.stop("NO_ACTIONABLE_TARGET")
-        return NurtureResult(
+        return _result_from_observation(
             status="NO_ACTIONABLE_TARGET",
             stop_reason="NO_ACTIONABLE_TARGET",
-            home_sampled=len(dedupe.seen_this_run),
-            home_new=len(dedupe.new_fingerprints),
-            home_relevant=stats.relevant,
-            home_irrelevant=stats.irrelevant,
-            home_unknown=stats.unknown,
-            duplicates=stats.duplicates,
-            detail_reads=0,
-            scroll_attempts=reader.scroll_attempts,
-            scrolls=reader.scrolls,
+            dedupe=dedupe,
+            stats=stats,
+            reader=reader,
+            coverage=coverage,
             checkpoint_runs=checkpoint.completed_runs,
-            home_relevant_ratio=(
-                None if not dedupe.seen_this_run else stats.relevant / len(dedupe.seen_this_run)
-            ),
-            skipped_unverified=reader.skipped_unverified,
-            observed_rows=stats.observed_rows,
-            body_extracted=stats.body_extracted,
-            provenance_verified=stats.provenance_verified,
-            classified=stats.classified,
-            observation_unknown=stats.observation_unknown,
-            unverified_relevant=stats.unverified_relevant,
-            skipped_rows=stats.skipped_rows,
-            viewport_coverage_complete=stats.viewport_coverage_complete,
-            **reliability_metrics(),
         )
     elif len(dedupe.seen_this_run) == 0 and not coverage.has_skips:
         if show_post_text and stats.previewed_bodies == 0:
@@ -1315,56 +1314,26 @@ async def run_page_workflow(
                 "POST_TEXT status=NONE "
                 f"verified_posts={len(dedupe.seen_this_run)} extracted={stats.previewed_bodies}"
             )
+        empty_result_status = (
+            "UNVERIFIED_RELEVANCE_REQUIRES_VERIFICATION"
+            if stats.unverified_relevant
+            else "OBSERVED_UNVERIFIED_ONLY"
+            if stats.body_extracted
+            else "OBSERVATION_UNCERTAIN_ONLY"
+            if stats.observed_rows
+            else "NO_VERIFIED_POSTS_IN_BUDGET"
+        )
         if detail:
-            _detail_stop(
-                "UNVERIFIED_RELEVANCE_REQUIRES_VERIFICATION"
-                if stats.unverified_relevant
-                else "OBSERVED_UNVERIFIED_ONLY"
-                if stats.body_extracted
-                else "OBSERVATION_UNCERTAIN_ONLY"
-                if stats.observed_rows
-                else "NO_VERIFIED_POSTS_IN_BUDGET"
-            )
-        return NurtureResult(
-            status=(
-                "UNVERIFIED_RELEVANCE_REQUIRES_VERIFICATION"
-                if stats.unverified_relevant
-                else "OBSERVED_UNVERIFIED_ONLY"
-                if stats.body_extracted
-                else "OBSERVATION_UNCERTAIN_ONLY"
-                if stats.observed_rows
-                else "NO_VERIFIED_POSTS_IN_BUDGET"
-            ),
-            stop_reason=(
-                "UNVERIFIED_RELEVANCE_REQUIRES_VERIFICATION"
-                if stats.unverified_relevant
-                else "OBSERVED_UNVERIFIED_ONLY"
-                if stats.body_extracted
-                else "OBSERVATION_UNCERTAIN_ONLY"
-                if stats.observed_rows
-                else "NO_VERIFIED_POSTS_IN_BUDGET"
-            ),
-            home_sampled=0,
-            home_new=0,
-            home_relevant=0,
-            home_irrelevant=0,
-            home_unknown=0,
-            duplicates=stats.duplicates,
-            detail_reads=0,
-            scroll_attempts=reader.scroll_attempts,
-            scrolls=reader.scrolls,
+            _detail_stop(empty_result_status)
+        return _result_from_observation(
+            status=empty_result_status,
+            stop_reason=empty_result_status,
+            dedupe=dedupe,
+            stats=stats,
+            reader=reader,
+            coverage=coverage,
             checkpoint_runs=checkpoint.completed_runs,
-            home_relevant_ratio=None,
-            skipped_unverified=reader.skipped_unverified,
-            observed_rows=stats.observed_rows,
-            body_extracted=stats.body_extracted,
-            provenance_verified=stats.provenance_verified,
-            classified=stats.classified,
-            observation_unknown=stats.observation_unknown,
-            unverified_relevant=stats.unverified_relevant,
-            skipped_rows=stats.skipped_rows,
-            viewport_coverage_complete=stats.viewport_coverage_complete,
-            **reliability_metrics(),
+            report_home_counts=False,
         )
     elif not detail_retry_pending and (
         dedupe.pending_set or (stats.found_relevant and exhaustion_reason == "FEED_END_REACHED")
@@ -1377,32 +1346,14 @@ async def run_page_workflow(
         print(f"SEARCH_INCOMPLETE reason={incomplete_status}")
         if detail:
             _detail_stop(incomplete_status)
-        return NurtureResult(
+        return _result_from_observation(
             status=incomplete_status,
             stop_reason=incomplete_status,
-            home_sampled=len(dedupe.seen_this_run),
-            home_new=len(dedupe.new_fingerprints),
-            home_relevant=stats.relevant,
-            home_irrelevant=stats.irrelevant,
-            home_unknown=stats.unknown,
-            duplicates=stats.duplicates,
-            detail_reads=0,
-            scroll_attempts=reader.scroll_attempts,
-            scrolls=reader.scrolls,
+            dedupe=dedupe,
+            stats=stats,
+            reader=reader,
+            coverage=coverage,
             checkpoint_runs=checkpoint.completed_runs,
-            home_relevant_ratio=(
-                None if not dedupe.seen_this_run else stats.relevant / len(dedupe.seen_this_run)
-            ),
-            skipped_unverified=reader.skipped_unverified,
-            observed_rows=stats.observed_rows,
-            body_extracted=stats.body_extracted,
-            provenance_verified=stats.provenance_verified,
-            classified=stats.classified,
-            observation_unknown=stats.observation_unknown,
-            unverified_relevant=stats.unverified_relevant,
-            skipped_rows=stats.skipped_rows,
-            viewport_coverage_complete=stats.viewport_coverage_complete,
-            **reliability_metrics(),
         )
     elif exhaustion_reason == "FEED_END_REACHED":
         status = "FEED_END_REACHED"
@@ -1465,36 +1416,15 @@ async def run_page_workflow(
             "POST_TEXT status=NONE "
             f"verified_posts={len(dedupe.seen_this_run)} extracted={stats.previewed_bodies}"
         )
-    ratio = None if not dedupe.seen_this_run else stats.relevant / len(dedupe.seen_this_run)
     state.stop(status)
-    return NurtureResult(
+    return _result_from_observation(
         status=status,
         stop_reason="DETAIL_RETRY_PENDING" if detail_retry_pending else exhaustion_reason,
-        home_sampled=len(dedupe.seen_this_run),
-        home_new=len(dedupe.new_fingerprints),
-        home_relevant=stats.relevant,
-        home_irrelevant=stats.irrelevant,
-        home_unknown=stats.unknown,
-        duplicates=stats.duplicates,
+        dedupe=dedupe,
+        stats=stats,
+        reader=reader,
+        coverage=coverage,
         detail_reads=detail_reads,
-        scroll_attempts=reader.scroll_attempts,
-        scrolls=reader.scrolls,
         checkpoint_runs=updated.completed_runs,
-        home_relevant_ratio=ratio,
-        skipped_unverified=reader.skipped_unverified,
-        observed_rows=stats.observed_rows,
-        body_extracted=stats.body_extracted,
-        provenance_verified=stats.provenance_verified,
-        classified=stats.classified,
-        observation_unknown=stats.observation_unknown,
-        unverified_relevant=stats.unverified_relevant,
-        skipped_rows=stats.skipped_rows,
-        viewport_coverage_complete=stats.viewport_coverage_complete,
-        viewport_observations=stats.observed_rows,
-        unique_verified_posts=len(coverage.fully_read),
-        unique_deferred_posts=len(coverage.unique_deferred),
-        unresolved_gaps=(coverage.unresolved_gap_count),
-        unique_provenance_identities=len(coverage.provenance_verified),
-        visible_text_segments=stats.visible_text_segments,
         checkpoint_saved=True,
     )
