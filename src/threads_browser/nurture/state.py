@@ -220,13 +220,40 @@ class CoverageLedger:
         *,
         viewport_observations: int,
         visible_text_segments: int,
-    ) -> dict[str, int]:
+        lookahead_rows: int = 0,
+    ) -> dict[str, int | str]:
+        read_in_progress = len(self.read_in_progress)
+        unresolved_observations = len(self.unresolved_observations)
+        unrepresented_gaps = len(self.unrepresented_gaps)
+        gap_sources = tuple(
+            category
+            for category, count in (
+                ("READ_IN_PROGRESS", read_in_progress),
+                ("UNVERIFIED_OBSERVATION", unresolved_observations),
+                ("UNREPRESENTED_GAP", unrepresented_gaps),
+            )
+            if count
+        )
+        gap_category = (
+            "NONE"
+            if not gap_sources
+            else gap_sources[0]
+            if len(gap_sources) == 1
+            else "MULTIPLE"
+        )
         return {
             "viewport_observations": viewport_observations,
             "unique_provenance_identities": len(self.provenance_verified),
             "unique_verified_posts": len(self.fully_read),
             "unique_deferred_posts": len(self.unique_deferred),
             "unresolved_gaps": self.unresolved_gap_count,
+            "read_in_progress": read_in_progress,
+            "unresolved_observations": unresolved_observations,
+            "unrepresented_gaps": unrepresented_gaps,
+            "gap_sources_total": self.unresolved_gap_count,
+            "stranded_body_ranges": len(self.stranded_body_ranges),
+            "lookahead_rows": lookahead_rows,
+            "gap_category": gap_category,
             "visible_text_segments": visible_text_segments,
         }
 
@@ -278,4 +305,5 @@ class WorkflowStats:
     skipped_rows: int = 0
     viewport_coverage_complete: bool = True
     visible_text_segments: int = 0
+    lookahead_rows: int = 0
     consecutive_moved_no_content: int = 0

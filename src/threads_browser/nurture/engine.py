@@ -103,6 +103,13 @@ class NurtureResult:
     visible_text_segments: int = 0
     stop_reason: str = "UNKNOWN"
     checkpoint_saved: bool = False
+    read_in_progress: int = 0
+    unresolved_observations: int = 0
+    unrepresented_gaps: int = 0
+    gap_sources_total: int = 0
+    stranded_body_ranges: int = 0
+    lookahead_rows: int = 0
+    gap_category: str = "NONE"
 
 
 def _result_from_observation(
@@ -158,6 +165,7 @@ def _result_from_observation(
         **coverage.reliability_metrics(
             viewport_observations=stats.observed_rows,
             visible_text_segments=stats.visible_text_segments,
+            lookahead_rows=stats.lookahead_rows,
         ),
         checkpoint_saved=checkpoint_saved,
     )
@@ -853,6 +861,7 @@ async def _run_page_workflow_cycle(
                 counts.coverage_complete = False
                 stats.observed_rows += counts.observed_rows
                 stats.skipped_rows += counts.skipped_rows
+                stats.lookahead_rows += counts.lookahead_rows
                 if detail:
                     _detail_stop("VIEWPORT_OBSERVATION_INCOMPLETE")
                 return _result_from_observation(
@@ -902,6 +911,7 @@ async def _run_page_workflow_cycle(
         previous_unverified_rows = current_unverified_rows
         stats.observed_rows += scan_counts.observed_rows
         stats.skipped_rows += scan_counts.skipped_rows
+        stats.lookahead_rows += scan_counts.lookahead_rows
         unresolved_rows = [
             row
             for row in reader.last_candidate_diagnostics
