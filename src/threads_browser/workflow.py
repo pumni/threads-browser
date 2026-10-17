@@ -241,32 +241,53 @@ async def run_browser_nurture(
         )
         raise UiReadError("INTERNAL_OPERATION_ERROR") from None
     finally:
-        cleanup_failed = False
         operation_failed = sys.exc_info()[0] is not None
+        async def cleanup_resources() -> bool:
+            cleanup_failed = False
+            try:
+                if context is not None:
+                    try:
+                        async with asyncio.timeout(_CLEANUP_ALLOWANCE_SECONDS):
+                            await context.close()
+                    except TimeoutError:
+                        cleanup_failed = True
+                        _emit_cleanup_failure(timed_out=True)
+                    except Exception:  # noqa: BLE001 - sanitize browser cleanup failures.
+                        cleanup_failed = True
+                        _emit_cleanup_failure(timed_out=False)
+                if manager_start_attempted:
+                    assert playwright_manager is not None
+                    try:
+                        async with asyncio.timeout(_CLEANUP_ALLOWANCE_SECONDS):
+                            await playwright_manager.__aexit__(None, None, None)
+                    except TimeoutError:
+                        cleanup_failed = True
+                        _emit_cleanup_failure(timed_out=True)
+                    except Exception:  # noqa: BLE001 - sanitize browser cleanup failures.
+                        cleanup_failed = True
+                        _emit_cleanup_failure(timed_out=False)
+            finally:
+                lock.release()
+            return cleanup_failed
+
         try:
-            if context is not None:
-                try:
-                    async with asyncio.timeout(_CLEANUP_ALLOWANCE_SECONDS):
-                        await context.close()
-                except TimeoutError:
-                    cleanup_failed = True
-                    _emit_cleanup_failure(timed_out=True)
-                except Exception:  # noqa: BLE001 - sanitize cleanup failures; cancellation is not an Exception.
-                    cleanup_failed = True
-                    _emit_cleanup_failure(timed_out=False)
-            if manager_start_attempted:
-                assert playwright_manager is not None
-                try:
-                    async with asyncio.timeout(_CLEANUP_ALLOWANCE_SECONDS):
-                        await playwright_manager.__aexit__(None, None, None)
-                except TimeoutError:
-                    cleanup_failed = True
-                    _emit_cleanup_failure(timed_out=True)
-                except Exception:  # noqa: BLE001 - sanitize cleanup failures; cancellation is not an Exception.
-                    cleanup_failed = True
-                    _emit_cleanup_failure(timed_out=False)
-        finally:
+            cleanup_task = asyncio.create_task(cleanup_resources())
+        except BaseException:
             lock.release()
+            raise
+        cleanup_cancelled = False
+        while True:
+            try:
+                cleanup_failed = await asyncio.shield(cleanup_task)
+                break
+            except asyncio.CancelledError:
+                current_task = asyncio.current_task()
+                if current_task is None or current_task.cancelling() == 0:
+                    raise
+                current_task.uncancel()
+                cleanup_cancelled = True
+        if cleanup_cancelled and not operation_failed:
+            raise asyncio.CancelledError
         if cleanup_failed and not operation_failed:
             raise UiReadError("BROWSER_CLEANUP_FAILED") from None
 

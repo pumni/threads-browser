@@ -4785,6 +4785,75 @@ def test_external_browser_cancellation_propagates_after_cleanup(
         pass
 
 
+def test_cancellation_during_browser_cleanup_holds_lock_until_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = tmp_path / "dedicated-profile"
+    profile.mkdir()
+    account = BrowserAccount(uuid4(), "offline", "offline.operator", profile)
+    store = CheckpointStore(tmp_path / "data")
+    close_started = asyncio.Event()
+    finish_close = asyncio.Event()
+    lifecycle = {"manager_exited": False}
+
+    class Context:
+        def __init__(self) -> None:
+            self.pages = [object()]
+
+        async def close(self):
+            close_started.set()
+            await finish_close.wait()
+
+    class Chromium:
+        async def launch_persistent_context(self, **_kwargs):
+            return Context()
+
+    class Manager:
+        async def __aenter__(self):
+            return SimpleNamespace(chromium=Chromium())
+
+        async def __aexit__(self, *_args):
+            lifecycle["manager_exited"] = True
+
+    async def successful_cycle(*_args, **_kwargs):
+        return SimpleNamespace(status="COMPLETE")
+
+    monkeypatch.setattr(workflow, "async_playwright", Manager)
+    monkeypatch.setattr(workflow, "_run_page_workflow_unlocked", successful_cycle)
+
+    async def exercise() -> None:
+        task = asyncio.create_task(
+            workflow.run_browser_nurture(
+                account, store, max_posts=1, terms=("hiring",)
+            )
+        )
+        await asyncio.wait_for(close_started.wait(), timeout=2)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+
+        probe = store.profile_lock(account)
+        try:
+            probe.acquire()
+        except BrowserDataError as error:
+            assert error.code == "ACCOUNT_BUSY"
+        else:
+            probe.release()
+            pytest.fail("profile lock was released before browser shutdown")
+
+        finish_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+
+    assert lifecycle["manager_exited"]
+    with store.profile_lock(account):
+        pass
+
+
 @pytest.mark.parametrize("failure", ("timeout", "exception"))
 def test_browser_cleanup_failure_is_reported_after_successful_cycle(
     tmp_path: Path,
