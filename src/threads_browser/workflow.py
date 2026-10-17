@@ -359,10 +359,10 @@ async def _run_managed_browser_operation(
             manager_start_attempted=manager_start_attempted,
             console_output_policy=console_output_policy,
         )
+        if cleanup_failed:
+            raise UiReadError("BROWSER_CLEANUP_FAILED") from None
         if cleanup_cancelled and not operation_failed:
             raise asyncio.CancelledError
-        if cleanup_failed and not operation_failed:
-            raise UiReadError("BROWSER_CLEANUP_FAILED") from None
 
 
 async def _cleanup_managed_browser_operation(
@@ -384,12 +384,21 @@ async def _cleanup_managed_browser_operation(
                 except TimeoutError:
                     cleanup_failed = True
                     _emit_cleanup_failure(
+                        stage="CLOSE_CONTEXT",
                         timed_out=True,
+                        console_output_policy=console_output_policy,
+                    )
+                except asyncio.CancelledError:
+                    cleanup_failed = True
+                    _emit_cleanup_failure(
+                        stage="CLOSE_CONTEXT",
+                        timed_out=False,
                         console_output_policy=console_output_policy,
                     )
                 except Exception:  # noqa: BLE001 - sanitize browser cleanup failures.
                     cleanup_failed = True
                     _emit_cleanup_failure(
+                        stage="CLOSE_CONTEXT",
                         timed_out=False,
                         console_output_policy=console_output_policy,
                     )
@@ -401,16 +410,34 @@ async def _cleanup_managed_browser_operation(
                 except TimeoutError:
                     cleanup_failed = True
                     _emit_cleanup_failure(
+                        stage="STOP_PLAYWRIGHT",
                         timed_out=True,
+                        console_output_policy=console_output_policy,
+                    )
+                except asyncio.CancelledError:
+                    cleanup_failed = True
+                    _emit_cleanup_failure(
+                        stage="STOP_PLAYWRIGHT",
+                        timed_out=False,
                         console_output_policy=console_output_policy,
                     )
                 except Exception:  # noqa: BLE001 - sanitize browser cleanup failures.
                     cleanup_failed = True
                     _emit_cleanup_failure(
+                        stage="STOP_PLAYWRIGHT",
                         timed_out=False,
                         console_output_policy=console_output_policy,
                     )
         finally:
+            if cleanup_failed:
+                try:
+                    lock.mark_cleanup_failed()
+                except BrowserDataError:
+                    _emit_cleanup_failure(
+                        stage="QUARANTINE_LOCK",
+                        timed_out=False,
+                        console_output_policy=console_output_policy,
+                    )
             lock.release()
         return cleanup_failed
 
@@ -434,6 +461,7 @@ async def _cleanup_managed_browser_operation(
 
 def _emit_cleanup_failure(
     *,
+    stage: str,
     timed_out: bool,
     console_output_policy: ConsoleOutputPolicy = ConsoleOutputPolicy.INTERACTIVE,
 ) -> None:
@@ -444,5 +472,6 @@ def _emit_cleanup_failure(
         error_kind="TIMEOUT" if timed_out else "OTHER",
         page_closed=None,
         context_closed=None,
+        stage=stage,
         console_output_policy=console_output_policy,
     )

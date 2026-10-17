@@ -94,6 +94,12 @@ def _parser() -> argparse.ArgumentParser:
 
     commands.add_parser("ls", help="list local account aliases and verification status")
 
+    recover = commands.add_parser(
+        "recover",
+        help="clear an account's browser cleanup block after attended process verification",
+    )
+    recover.add_argument("alias")
+
     terms = commands.add_parser("terms", help="view or replace an account's nurture terms")
     terms.add_argument("alias")
     terms.add_argument("terms", nargs="*", help="replacement relevance terms")

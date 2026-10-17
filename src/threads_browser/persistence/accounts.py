@@ -132,26 +132,32 @@ def _account_path(root: Path, alias: str) -> Path:
 
 
 class ProcessLock:
-    """A non-blocking OS file lock; the OS releases it when the process exits."""
+    """A non-blocking OS file lock with a persistent uncertain-cleanup guard."""
 
     def __init__(self, path: Path) -> None:
         self._path = path
         self._stream: BinaryIO | None = None
 
     def acquire(self) -> None:
+        self._acquire(check_cleanup_guard=True)
+
+    def _acquire(self, *, check_cleanup_guard: bool) -> None:
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             if self._path.parent.is_symlink() or self._path.is_symlink():
                 raise OSError
-            stream = self._path.open("a+b")
+            with self._path.open("a+b") as create_stream:
+                create_stream.seek(0, os.SEEK_END)
+                if create_stream.tell() == 0:
+                    create_stream.write(b"0")
+                    create_stream.flush()
             if os.name != "nt":
                 os.chmod(self._path, 0o600)
+            if self._path.parent.is_symlink() or self._path.is_symlink():
+                raise OSError
+            stream = self._path.open("r+b")
         except OSError:
             raise BrowserDataError("LOCK_UNAVAILABLE") from None
-        stream.seek(0, os.SEEK_END)
-        if stream.tell() == 0:
-            stream.write(b"0")
-            stream.flush()
         stream.seek(0)
         try:
             if os.name == "nt":
@@ -166,6 +172,51 @@ class ProcessLock:
             stream.close()
             raise BrowserDataError("ACCOUNT_BUSY") from None
         self._stream = stream
+        try:
+            stream.seek(1)
+            cleanup_guard = stream.read(1)
+            if not cleanup_guard:
+                stream.seek(1)
+                stream.write(b"0")
+                stream.flush()
+                cleanup_guard = b"0"
+            if check_cleanup_guard and cleanup_guard == b"1":
+                raise BrowserDataError("BROWSER_CLEANUP_FAILED")
+        except BaseException:
+            self.release()
+            raise
+
+    def mark_cleanup_failed(self) -> None:
+        """Persist a quarantine while this process still owns the profile lock."""
+        stream = self._stream
+        if stream is None:
+            raise BrowserDataError("LOCK_UNAVAILABLE")
+        try:
+            stream.seek(1)
+            stream.write(b"1")
+            stream.flush()
+        except OSError:
+            raise BrowserDataError("LOCK_UNAVAILABLE") from None
+
+    def clear_cleanup_failed(self) -> bool:
+        """Clear a quarantine after attended verification that the browser stopped."""
+        self._acquire(check_cleanup_guard=False)
+        try:
+            stream = self._stream
+            if stream is None:
+                raise BrowserDataError("LOCK_UNAVAILABLE")
+            stream.seek(1)
+            cleanup_guard = stream.read(1)
+            if cleanup_guard != b"1":
+                return False
+            stream.seek(1)
+            stream.write(b"0")
+            stream.flush()
+            return True
+        except OSError:
+            raise BrowserDataError("LOCK_UNAVAILABLE") from None
+        finally:
+            self.release()
 
     def release(self) -> None:
         stream = self._stream

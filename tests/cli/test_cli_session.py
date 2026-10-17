@@ -7,7 +7,12 @@ import pytest
 
 from threads_browser import cli, workflow
 from threads_browser.cli import main
-from threads_browser.storage import TermsStore
+from threads_browser.storage import (
+    AccountStore,
+    BrowserDataError,
+    CheckpointStore,
+    TermsStore,
+)
 
 
 def _configure_local_account(root: Path) -> Path:
@@ -160,6 +165,35 @@ def test_session_cli_fails_closed_when_only_an_earlier_boundary_was_saved(
     assert result == 1
     assert "checkpoint_saved=true" in captured.out
     assert "STOP COVERAGE_INCOMPLETE" in captured.err
+
+
+def test_cleanup_recovery_requires_attended_confirmation_and_only_clears_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "private-root"
+    _install_account(root, monkeypatch)
+    monkeypatch.setattr(cli, "_has_interactive_terminal", lambda: True)
+    account = AccountStore(root).get("pilot")
+    store = CheckpointStore(root)
+    lock = store.profile_lock(account)
+    lock.acquire()
+    lock.mark_cleanup_failed()
+    lock.release()
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: "NO")
+    assert main(["recover", "pilot"]) == 1
+    assert capsys.readouterr().err == "CLEANUP_RECOVERY status=NOT_CONFIRMED\n"
+    with pytest.raises(BrowserDataError) as blocked:
+        store.profile_lock(account).acquire()
+    assert blocked.value.code == "BROWSER_CLEANUP_FAILED"
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: "CLOSED")
+    assert main(["recover", "pilot"]) == 0
+    assert capsys.readouterr().out == "CLEANUP_RECOVERY status=UNBLOCKED\n"
+    with store.profile_lock(account):
+        pass
 
 
 @pytest.mark.parametrize("runtime", ("10", "3601", "nan", "inf"))
