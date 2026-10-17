@@ -340,3 +340,26 @@ def test_nurture_summary_includes_only_safe_aggregate_coverage_diagnostics() -> 
     assert "gap_sources_total=1" in output
     assert "gap_category=READ_IN_PROGRESS" in output
     assert "private-" not in output
+
+
+def test_nurture_summary_rejects_unbounded_text_and_non_scalar_counters() -> None:
+    result_values = vars(fake_nurture_result())
+    result_values.update(
+        status="unexpected status text",
+        stop_reason="not a fixed code",
+        ui_status="unexpected ui text",
+        home_sampled="unexpected counter text",
+        gap_category="unexpected gap text",
+        viewport_coverage_complete="unexpected coverage text",
+    )
+    result = SimpleNamespace(**result_values)
+
+    output = cli._format_result(result)
+
+    assert "status=UNKNOWN" in output
+    assert "stop_reason=UNKNOWN" in output
+    assert "ui=UNKNOWN" in output
+    assert "home_sampled=0" in output
+    assert "gap_category=NONE" in output
+    assert "viewport_coverage_complete=false" in output
+    assert "unexpected" not in output

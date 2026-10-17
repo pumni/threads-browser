@@ -7,7 +7,7 @@ A small Python package for local Threads account sessions and bounded, read-only
 Install the package and Chromium:
 
 ```powershell
-uv sync
+uv sync --locked
 uv run playwright install chromium
 ```
 
@@ -38,8 +38,9 @@ uv run tb session local1 --max-runtime-seconds 600 --max-scrolls 8 --max-total-p
 The session keeps one headed Chromium context and profile lock, resumes at the verified Home position after Back, and shares deduplication and coverage state across reads. Runtime includes bounded browser cleanup (more than 10 and at most 3600 seconds); scroll advances are capped at 0–20, distinct verified posts at 1–400, and Detail reads at 1–40. `--max-posts` can lower the per-viewport row cap. It requires an interactive terminal and has no scheduled mode. Safe Detail/Back boundaries are checkpointed as the session proceeds; incomplete coverage stops with a nonzero exit code. `tb run` remains the single-cycle command.
 
 Attended and legacy runs can opt into `--max-runtime-seconds` and
-`--no-readiness-prompt`. For Windows Task Scheduler setup, bounded runtime
-defaults, and the sanitized latest-run status file, see
+`--no-readiness-prompt`. The Windows operations guide covers the safe wrapper,
+bounded runtime defaults, sanitized latest-run status, and the disabled by
+default owner-controlled Task Scheduler activation gate. See
 [`docs/OPERATIONS_WINDOWS.md`](docs/OPERATIONS_WINDOWS.md).
 
 Useful account and term commands:
@@ -102,7 +103,7 @@ Applications can call `threads_browser.workflow.run_browser_nurture(...)` for on
 
 ## Workflow scope and limits
 
-The workflow verifies that For you is active and checks the visible profile control against the expected actor. It discovers candidate rows top-to-bottom, verifies and emits each row before reading the next, then advances with small measured overlapping wheel steps. A row whose permalink or body is outside the page or nested scrollport is `DEFERRED_OFFSCREEN` and is reconsidered after a wheel step. Partial or unknown rows are skipped while the bounded scan continues; a gap does not block a later verified selection. A candidate cap or scroll budget still ends the scan safely, and the result reports `COMPLETE_WITH_SKIPS` when the feed sample contains skipped rows.
+The workflow verifies that For you is active and checks the visible profile control against the expected actor. It discovers candidate rows top-to-bottom, verifies and emits each row before reading the next, then advances with small measured overlapping wheel steps. A row whose permalink or body is outside the page or nested scrollport is `DEFERRED_OFFSCREEN` and is reconsidered after a wheel step. Partial or unknown rows are skipped while the bounded scan continues; a gap does not make that row eligible for Detail or checkpointing. A candidate cap or scroll budget still ends the scan safely. A single-cycle `COMPLETE_WITH_SKIPS` result can checkpoint verified observations while keeping partial or unknown observations unresolved. `viewport_coverage_complete=false` distinguishes that outcome from a complete viewport sample. Session mode also blocks a later Detail read while any session coverage gap remains and preserves only earlier safe checkpoints.
 
 When a relevant post is already visible and scroll budget remains, the workflow first requires one observed feed advance if the feed can scroll. It can then open that post only while its canonical permalink is still visible. If the bounded scan finds no relevant match, it may open a readable, provenance-verified current post as a fallback. Detail may contain a longer body when the Home card was explicitly truncated; the canonical route and matching body must still identify the selected post, and any conflicting author or permalink evidence rejects it. A semantic `main` landmark is optional. If the route is verified but the Detail body is unavailable or unverified, the workflow tries Back once; after Home, For you, account and selected-post identity are reverified, it saves Home progress and leaves the selected post pending for a later Detail attempt. Entering `q` cancels without Back or checkpointing. Back checks the selected post identity rather than its former screen coordinate, and does not reopen Profile after the initial actor check. A wrong route, blocker or lost return context stops without recording a completed run.
 
@@ -113,3 +114,8 @@ Use `uv run tb run local1 --detail` for an opt-in trace of Home/account/For You 
 The command prints `ui=UNVERIFIED_LIVE_UI`. Automated tests use local Chromium fixtures and do not sign in to Threads. These UI assumptions have only been exercised against local fixtures; an authorized operator must complete live headed UAT before relying on current Threads UI compatibility. Unsupported UI, rate limits, challenges, navigation failures, actor mismatches, ambiguous rows, and stalled scrolling stop with a fixed status instead of being bypassed.
 
 The data root defaults to `%LOCALAPPDATA%\ThreadsBrowser` on Windows and `~/.local/share/threads-browser` elsewhere. Set `THREADS_BROWSER_DATA_ROOT` to select another private root. The profile lock coordinates processes using this repository and data root; it does not coordinate with threads-standalone. Never open the same profile in both CLIs concurrently. The browser lane does not use the official API and never likes, follows, comments, replies, posts, or sends messages.
+
+Windows installation, upgrade, rollback, sanitized operation status, and the
+owner-controlled Task Scheduler activation gate are documented in
+[`docs/OPERATIONS_WINDOWS.md`](docs/OPERATIONS_WINDOWS.md). The release go/no-go
+checklist is in [`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md).
