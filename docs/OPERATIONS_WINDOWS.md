@@ -113,7 +113,7 @@ Use the status and fixed stop reason to triage:
 | Status or reason | Operator action |
 | --- | --- |
 | `ACCOUNT_BUSY` | Check for another process using the profile. Do not start a parallel run. |
-| `BROWSER_CLEANUP_FAILED` | Do not retry the profile. Inspect and close the prior managed Chromium process locally, then use attended recovery after verifying it stopped. |
+| `BROWSER_CLEANUP_FAILED` | Do not retry the profile. The run could not durably arm its guard, verify shutdown, or persist a clean guard state. Inspect and close the prior managed Chromium process locally, then use attended recovery after verifying it stopped. |
 | `LOGIN_REQUIRED` | Run `tb login <alias>` in the logged-in desktop session. |
 | `CHALLENGE_REQUIRED` | Open the profile manually and resolve the challenge. Do not automate it. |
 | `RATE_LIMITED` | Stop further attempts and review manually before a later run. |
@@ -121,17 +121,22 @@ Use the status and fixed stop reason to triage:
 | `STOPPED` | Review the fixed cycle status and reason; do not count it as a completed invocation. |
 | `RUNNING` after process exit | Inspect the process and scheduler history; ensure Chromium closed before retrying. |
 
-Cleanup diagnostics identify only the fixed stages `CLOSE_CONTEXT` or
-`STOP_PLAYWRIGHT`; `QUARANTINE_LOCK` means the persistent block itself could not
-be recorded. A recorded cleanup failure leaves a per-profile block so another
-process cannot reuse that profile after the original process exits. If
-`QUARANTINE_LOCK` appears, keep the profile out of use until you have verified
-the prior browser process stopped.
-Inspect and close the prior managed Chromium window/process locally. Once you
-have verified it stopped, run `uv run tb recover <alias>` in the logged-in
-desktop session and type `CLOSED`. This command only clears the block; it does
-not open a browser. If you cannot verify process closure, leave the block in
-place and do not start another run for that profile.
+Before each managed browser launch, the runner durably arms a per-profile guard
+while holding the OS profile lock. It clears the guard, still under that lock,
+only after context close and Playwright manager shutdown both complete
+successfully. An interrupted process or unverified shutdown therefore leaves
+the profile blocked. Cleanup diagnostics identify the fixed stages
+`CLOSE_CONTEXT`, `STOP_PLAYWRIGHT`, or `QUARANTINE_LOCK`; the latter reports
+that the guard could not be durably armed or disarmed, and the returned error
+code is `BROWSER_CLEANUP_FAILED`.
+
+After confirming the prior managed Chromium process stopped, run
+`uv run tb recover <alias>` in the logged-in desktop session and type `CLOSED`.
+Recovery clears only a valid armed guard. A malformed or unknown guard state is
+rejected and cannot be repaired by `tb recover`; do not edit that file or reuse
+the profile until the owner provides recovery instructions. Recovery does not
+open a browser. If you cannot verify process closure, leave the block in place
+and do not start another run for that profile.
 
 Do not configure automatic retries. Sleep pauses headed browser work; logoff
 removes the interactive desktop. Keep Task Scheduler history and any local

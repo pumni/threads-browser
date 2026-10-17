@@ -196,6 +196,36 @@ def test_cleanup_recovery_requires_attended_confirmation_and_only_clears_guard(
         pass
 
 
+def test_cleanup_recovery_rejects_noninteractive_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(cli, "_has_interactive_terminal", lambda: False)
+
+    assert main(["recover", "pilot"]) == 1
+    assert capsys.readouterr().err == "ERROR CLEANUP_RECOVERY_TTY_REQUIRED\n"
+
+
+def test_cleanup_recovery_does_not_repair_corrupt_guard_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    root = tmp_path / "private-root"
+    _install_account(root, monkeypatch)
+    monkeypatch.setattr(cli, "_has_interactive_terminal", lambda: True)
+    account = AccountStore(root).get("pilot")
+    lock = CheckpointStore(root).profile_lock(account)
+    with lock:
+        pass
+    lock._path.write_bytes(b"0x")
+
+    monkeypatch.setattr("builtins.input", lambda _prompt: "CLOSED")
+    assert main(["recover", "pilot"]) == 1
+    assert capsys.readouterr().err == "ERROR BROWSER_CLEANUP_FAILED\n"
+    assert lock._path.read_bytes() == b"0x"
+
+
 @pytest.mark.parametrize("runtime", ("10", "3601", "nan", "inf"))
 def test_session_cli_requires_a_finite_runtime_inside_the_product_cap(
     tmp_path: Path,

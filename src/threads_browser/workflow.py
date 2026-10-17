@@ -305,6 +305,8 @@ async def _run_managed_browser_operation(
     playwright_manager = None
     manager_start_attempted = False
     context = None
+    context_launch_attempted = False
+    session_armed = False
     timeout_scope = None
     operation_timeout = max_runtime_seconds
     context_cleanup_timeout = _CLEANUP_ALLOWANCE_SECONDS
@@ -318,12 +320,23 @@ async def _run_managed_browser_operation(
         )
     try:
         ensure_safe_browser_profile(account.profile_directory)
+        try:
+            lock.arm_uncertain_session()
+        except BrowserDataError:
+            _emit_cleanup_failure(
+                stage="QUARANTINE_LOCK",
+                timed_out=False,
+                console_output_policy=console_output_policy,
+            )
+            raise BrowserDataError("BROWSER_CLEANUP_FAILED") from None
+        session_armed = True
         timeout_scope = asyncio.timeout(operation_timeout)
         try:
             async with timeout_scope:
                 playwright_manager = async_playwright()
                 manager_start_attempted = True
                 playwright = await playwright_manager.__aenter__()
+                context_launch_attempted = True
                 context = await playwright.chromium.launch_persistent_context(
                     user_data_dir=str(account.profile_directory),
                     headless=False,
@@ -376,8 +389,10 @@ async def _run_managed_browser_operation(
         cleanup_failed, cleanup_cancelled = await _cleanup_managed_browser_operation(
             lock,
             context=context,
+            context_launch_attempted=context_launch_attempted,
             playwright_manager=playwright_manager,
             manager_start_attempted=manager_start_attempted,
+            session_armed=session_armed,
             context_cleanup_timeout=context_cleanup_timeout,
             manager_cleanup_timeout=manager_cleanup_timeout,
             console_output_policy=console_output_policy,
@@ -392,8 +407,10 @@ async def _cleanup_managed_browser_operation(
     lock: ProcessLock,
     *,
     context: Any,
+    context_launch_attempted: bool,
     playwright_manager: Any,
     manager_start_attempted: bool,
+    session_armed: bool,
     context_cleanup_timeout: float,
     manager_cleanup_timeout: float,
     console_output_policy: ConsoleOutputPolicy,
@@ -401,11 +418,14 @@ async def _cleanup_managed_browser_operation(
     """Close browser resources within fixed allowances, even when cancelled."""
     async def cleanup_resources() -> bool:
         cleanup_failed = False
+        context_shutdown_verified = not context_launch_attempted
+        manager_shutdown_verified = not manager_start_attempted
         try:
             if context is not None:
                 try:
                     async with asyncio.timeout(context_cleanup_timeout):
                         await context.close()
+                    context_shutdown_verified = True
                 except TimeoutError:
                     cleanup_failed = True
                     _emit_cleanup_failure(
@@ -427,11 +447,19 @@ async def _cleanup_managed_browser_operation(
                         timed_out=False,
                         console_output_policy=console_output_policy,
                     )
+            elif context_launch_attempted:
+                cleanup_failed = True
+                _emit_cleanup_failure(
+                    stage="CLOSE_CONTEXT",
+                    timed_out=False,
+                    console_output_policy=console_output_policy,
+                )
             if manager_start_attempted:
                 assert playwright_manager is not None
                 try:
                     async with asyncio.timeout(manager_cleanup_timeout):
                         await playwright_manager.__aexit__(None, None, None)
+                    manager_shutdown_verified = True
                 except TimeoutError:
                     cleanup_failed = True
                     _emit_cleanup_failure(
@@ -453,16 +481,22 @@ async def _cleanup_managed_browser_operation(
                         timed_out=False,
                         console_output_policy=console_output_policy,
                     )
-        finally:
-            if cleanup_failed:
+            if (
+                session_armed
+                and not cleanup_failed
+                and context_shutdown_verified
+                and manager_shutdown_verified
+            ):
                 try:
-                    lock.mark_cleanup_failed()
+                    lock.disarm_uncertain_session()
                 except BrowserDataError:
+                    cleanup_failed = True
                     _emit_cleanup_failure(
                         stage="QUARANTINE_LOCK",
                         timed_out=False,
                         console_output_policy=console_output_policy,
                     )
+        finally:
             lock.release()
         return cleanup_failed
 
