@@ -143,7 +143,10 @@ async def _assert_bounded_wheel_gestures(page: Page, scrolls: int) -> None:
 
 
 def _offline_playwright_manager(
-    respond: Callable[[Route], Awaitable[None]], *, headless: bool = True
+    respond: Callable[[Route], Awaitable[None]],
+    *,
+    headless: bool = True,
+    on_launch: Callable[[], None] | None = None,
 ):
     class OfflinePlaywrightManager:
         """Persistent Chromium test manager with all requests fulfilled locally."""
@@ -158,6 +161,8 @@ def _offline_playwright_manager(
                     options = dict(kwargs)
                     options["headless"] = headless
                     context = await chromium.launch_persistent_context(**options)
+                    if on_launch is not None:
+                        on_launch()
                     await context.route("**/*", respond)
                     return context
 

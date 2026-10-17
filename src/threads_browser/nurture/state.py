@@ -307,3 +307,15 @@ class WorkflowStats:
     visible_text_segments: int = 0
     lookahead_rows: int = 0
     consecutive_moved_no_content: int = 0
+
+    def accumulate(self, other: WorkflowStats) -> None:
+        """Add one bounded cycle's metrics to this session snapshot."""
+        for name in self.__dataclass_fields__:
+            current = getattr(self, name)
+            value = getattr(other, name)
+            if name == "found_relevant":
+                setattr(self, name, current or value)
+            elif name == "viewport_coverage_complete":
+                setattr(self, name, current and value)
+            else:
+                setattr(self, name, current + value)

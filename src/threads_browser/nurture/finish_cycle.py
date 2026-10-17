@@ -17,6 +17,7 @@ async def finish_cycle(context: CycleContext) -> NurtureResult:
     if context.selected is None and not context.stats.found_relevant:
         _report_search_stop(context)
     if context.selected is not None:
+        context.detail_attempted = context.session_progress is not None
         await _read_selected_detail(context)
 
     outcome = CycleOutcomeResolver(
@@ -36,9 +37,61 @@ async def finish_cycle(context: CycleContext) -> NurtureResult:
         actionability_rejected=bool(context.selector.rejected_codes),
         checkpoint_runs=context.checkpoint.completed_runs,
     )
+    progress = context.session_progress
+    if progress is not None:
+        progress.record_cycle(
+            context.stats,
+            detail_attempted=context.detail_attempted,
+            detail_reads=context.detail_reads,
+            viewport_number=context.viewport_number,
+            previous_unverified_rows=context.previous_unverified_rows,
+        )
     if isinstance(outcome, NurtureResult):
+        if progress is not None:
+            context.state.stop(outcome.status)
+            return progress.result(
+                context.reader,
+                status=outcome.status,
+                stop_reason=outcome.stop_reason,
+            )
         return outcome
     status = outcome
+
+    if progress is not None:
+        if not progress.has_safe_boundary(context.stats):
+            context.state.stop("SESSION_COVERAGE_INCOMPLETE")
+            return progress.result(
+                context.reader,
+                status="SESSION_COVERAGE_INCOMPLETE",
+                stop_reason="COVERAGE_INCOMPLETE",
+            )
+        try:
+            updated = progress.commit(
+                stats=context.stats,
+                reader=context.reader,
+                state=context.state,
+                detail_reads=context.detail_reads,
+            )
+        except BrowserDataError as error:
+            if context.detail:
+                _detail_stop(error.code)
+            raise
+        context.session_checkpoint_committed = True
+        if context.detail:
+            emit_console_diagnostic(
+                context.console_output_policy,
+                f"[CHECKPOINT] status=SAVED completed_runs={updated.completed_runs}",
+            )
+            emit_console_diagnostic(context.console_output_policy, f"[CYCLE] status={status}")
+        context.state.stop(status)
+        return progress.result(
+            context.reader,
+            status=status,
+            stop_reason=(
+                "DETAIL_RETRY_PENDING" if context.detail_retry_pending else context.exhaustion_reason
+            ),
+            checkpoint_saved=True,
+        )
 
     try:
         updated = CheckpointCommitter(

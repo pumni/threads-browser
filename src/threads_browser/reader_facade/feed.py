@@ -47,6 +47,11 @@ from ..feed.urls import (
 class ReaderFeedCompatibility:
     """Compatibility delegates grouped by feed responsibility."""
 
+    async def prepare_home_resume(self) -> None:
+        """Release document-bound scan handles before scanning after verified Back."""
+        await self._root_discovery.invalidate_document_candidates()
+        self._viewport_scan.clear_scan_state()
+
     async def scan_viewport(
         self,
         max_posts: int,
