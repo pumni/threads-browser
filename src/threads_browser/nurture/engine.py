@@ -328,24 +328,31 @@ async def run_page_workflow(
             target for target in targets if target.fingerprint in dedupe.pending_set
         ]
         if dedupe.pending_set:
-            if not pending_targets:
-                return
-            ordered = sorted(
+            ordered_pending = sorted(
                 pending_targets,
                 key=lambda target: pending_order[target.fingerprint],
             )
-        else:
-            ordered = [
-                target
-                for target in targets
-                if target.fingerprint not in dedupe.previously_seen
-            ]
-            if not ordered:
+            selected = await first_actionable(ordered_pending)
+            if selected is not None:
                 return
+            # Keep the existing conservative disposition when this viewport
+            # did not establish complete Home coverage.
+            if coverage.has_skips or not stats.viewport_coverage_complete:
+                return
+        ordered = [
+            target
+            for target in targets
+            if target.fingerprint not in dedupe.previously_seen
+            and target.fingerprint not in dedupe.pending_set
+        ]
+        if not ordered:
+            return
         selected = await first_actionable(ordered)
         if selected is None:
             return
         if selected.fingerprint not in dedupe.pending_set:
+            # Keep the fresh target pending before Detail so a safely
+            # recoverable failure preserves it alongside older entries.
             dedupe.pending.append(selected.fingerprint)
             dedupe.pending_set.add(selected.fingerprint)
 
@@ -1275,6 +1282,8 @@ async def run_page_workflow(
             detail_reads = 1
             dedupe.pending.remove(selected.fingerprint)
             dedupe.pending_set.remove(selected.fingerprint)
+            # COMPLETE describes this verified Detail. Other pending entries
+            # remain in the checkpoint until they become actionable.
             status = "COMPLETE"
     elif (
         selected is None
