@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from threads_browser.nurture.observation import RowObservationFacts
+from threads_browser.nurture.observation import BodyRangeCoverageFacts, RowObservationFacts
 from threads_browser.nurture.state import (
     CoverageLedger,
     DedupeLedger,
@@ -42,8 +42,115 @@ def test_coverage_ledger_preserves_unique_and_unresolved_counts() -> None:
         "unique_verified_posts": 1,
         "unique_deferred_posts": 1,
         "unresolved_gaps": 2,
+        "read_in_progress": 0,
+        "unresolved_observations": 1,
+        "unrepresented_gaps": 1,
+        "gap_sources_total": 2,
+        "stranded_body_ranges": 0,
+        "lookahead_rows": 0,
+        "gap_category": "MULTIPLE",
         "visible_text_segments": 2,
     }
+
+
+def test_coverage_diagnostics_report_sanitized_gap_sources_and_totals() -> None:
+    ledger = CoverageLedger()
+    ledger.observe_row(
+        RowObservationFacts(
+            "private-fingerprint",
+            "private-observation",
+            "private-gap",
+            "PARTIAL_BODY",
+            True,
+            False,
+        )
+    )
+    ledger.observe_row(
+        RowObservationFacts(
+            None,
+            "private-observation-two",
+            "private-gap-two",
+            "POST_ROOT_UNRESOLVED",
+            False,
+            False,
+        )
+    )
+    ledger.observe_row(
+        RowObservationFacts(
+            None,
+            None,
+            "private-gap-three",
+            "POST_ROOT_UNRESOLVED",
+            False,
+            False,
+        )
+    )
+    ledger.observe_body_range(
+        "private-fingerprint",
+        BodyRangeCoverageFacts(
+            body_complete=False,
+            missing_range_count=1,
+            unrecoverable_range_count=1,
+            unrecoverable_range_signature="private-signature",
+        ),
+    )
+
+    metrics = ledger.reliability_metrics(
+        viewport_observations=6,
+        visible_text_segments=4,
+        lookahead_rows=5,
+    )
+
+    assert metrics["unresolved_gaps"] == 3
+    assert metrics["gap_sources_total"] == metrics["unresolved_gaps"]
+    assert metrics["read_in_progress"] == 1
+    assert metrics["unresolved_observations"] == 1
+    assert metrics["unrepresented_gaps"] == 1
+    assert metrics["stranded_body_ranges"] == 1
+    assert metrics["lookahead_rows"] == 5
+    assert metrics["gap_category"] == "MULTIPLE"
+    assert not any(
+        private_value in repr(metrics)
+        for private_value in (
+            "private-fingerprint",
+            "private-observation",
+            "private-gap",
+            "private-signature",
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("facts", "expected_category"),
+    (
+        (
+            RowObservationFacts("private-fingerprint", "obs", "gap", "PARTIAL_BODY", True, False),
+            "READ_IN_PROGRESS",
+        ),
+        (
+            RowObservationFacts(None, "private-observation", "gap", "POST_ROOT_UNRESOLVED", False, False),
+            "UNVERIFIED_OBSERVATION",
+        ),
+        (
+            RowObservationFacts(None, None, "private-gap", "POST_ROOT_UNRESOLVED", False, False),
+            "UNREPRESENTED_GAP",
+        ),
+    ),
+)
+def test_coverage_gap_category_identifies_single_source(
+    facts: RowObservationFacts,
+    expected_category: str,
+) -> None:
+    ledger = CoverageLedger()
+    ledger.observe_row(facts)
+
+    metrics = ledger.reliability_metrics(
+        viewport_observations=1,
+        visible_text_segments=0,
+    )
+
+    assert metrics["gap_category"] == expected_category
+    assert metrics["gap_sources_total"] == metrics["unresolved_gaps"] == 1
 
 
 def test_nurture_state_accepts_observe_scroll_detail_back_cycle() -> None:

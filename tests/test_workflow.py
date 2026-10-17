@@ -7487,6 +7487,7 @@ main {{ display: block; }}
         raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED")
 
     monkeypatch.setattr(ThreadsHomeReader, "actionable_now", reject_target)
+    run_results = []
 
     async def exercise(page) -> None:
         result = await _run_page_workflow_for_test(
@@ -7502,9 +7503,12 @@ main {{ display: block; }}
         assert result.status == "NO_ACTIONABLE_TARGET"
         assert result.scroll_attempts == result.scrolls == max_scrolls
         assert result.unresolved_gaps == 0
+        assert result.gap_sources_total == 0
+        assert result.gap_category == "NONE"
         assert result.viewport_coverage_complete
         assert result.detail_reads == 0
         assert page.url == HOME_URL
+        run_results.append(result)
 
     _run_offline_page(feed_html, exercise, headless=False)
     output = capsys.readouterr().out
@@ -7518,6 +7522,12 @@ main {{ display: block; }}
     assert len(scroll_deltas) == max_scrolls
     assert all(value == pytest.approx(288, abs=1) for value in scroll_deltas)
     assert actionability_checks
+    viewport_lookahead = [
+        int(value)
+        for value in re.findall(r"\[VIEWPORT \d+\].*?lookahead_rows=(\d+)", output)
+    ]
+    assert len(viewport_lookahead) == max_scrolls + 1
+    assert run_results[0].lookahead_rows == sum(viewport_lookahead)
     assert "state=DEFERRED_TEXT_BELOW" in output
     assert "unresolved_gaps=0" in output
     assert "[DETAIL]" not in output
@@ -7595,6 +7605,11 @@ main {{ display: block; }}
         assert result.status == "RELEVANT_POST_NOT_CURRENT"
         assert result.scroll_attempts == result.scrolls == max_scrolls
         assert result.unresolved_gaps == 1
+        assert result.read_in_progress == 1
+        assert result.unresolved_observations == 0
+        assert result.unrepresented_gaps == 0
+        assert result.gap_sources_total == result.unresolved_gaps
+        assert result.gap_category == "READ_IN_PROGRESS"
         assert not result.viewport_coverage_complete
         assert result.detail_reads == 0
         assert page.url == HOME_URL

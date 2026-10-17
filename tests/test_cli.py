@@ -937,6 +937,32 @@ def _fake_nurture_result():
     )
 
 
+def test_nurture_summary_includes_only_safe_aggregate_coverage_diagnostics() -> None:
+    result = SimpleNamespace(
+        **vars(_fake_nurture_result()),
+        unresolved_gaps=1,
+        read_in_progress=1,
+        unresolved_observations=0,
+        unrepresented_gaps=0,
+        stranded_body_ranges=1,
+        lookahead_rows=3,
+        gap_sources_total=1,
+        gap_category="READ_IN_PROGRESS",
+    )
+
+    output = cli._format_result(result)
+
+    assert "unresolved_gaps=1" in output
+    assert "read_in_progress=1" in output
+    assert "unresolved_observations=0" in output
+    assert "unrepresented_gaps=0" in output
+    assert "stranded_body_ranges=1" in output
+    assert "lookahead_rows=3" in output
+    assert "gap_sources_total=1" in output
+    assert "gap_category=READ_IN_PROGRESS" in output
+    assert "private-" not in output
+
+
 def test_project_registers_only_the_short_tb_script() -> None:
     project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]
     assert project["scripts"] == {"tb": "threads_browser.cli:main"}
