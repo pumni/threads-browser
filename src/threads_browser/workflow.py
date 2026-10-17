@@ -13,7 +13,7 @@ from playwright.async_api import Page, async_playwright
 from .browser_ui.session import classify_playwright_failure, emit_failure_diagnostic
 from .nurture.diagnostics import _terminal_safe_post_text
 from .nurture.engine import NurtureResult
-from .nurture.engine import run_page_workflow as _execute_page_workflow
+from .nurture.engine import _run_page_workflow_cycle as _execute_page_workflow
 from .nurture.state import InvalidWorkflowTransition, policy_fingerprint
 from .reader import ThreadsHomeReader, UiReadError
 from .storage import BrowserAccount, BrowserDataError, CheckpointStore, ensure_safe_browser_profile
@@ -23,7 +23,6 @@ __all__ = [
     "_terminal_safe_post_text",
     "policy_fingerprint",
     "run_browser_nurture",
-    "run_page_workflow",
 ]
 
 _CLEANUP_ALLOWANCE_SECONDS = 5
@@ -36,7 +35,7 @@ def _detail_terminal_ready() -> bool:
         return False
 
 
-async def run_page_workflow(
+async def _run_page_workflow_locked(
     page: Page,
     account: BrowserAccount,
     checkpoint_store: CheckpointStore,
@@ -50,41 +49,7 @@ async def run_page_workflow(
     show_observed_text: bool = False,
     detail: bool = False,
 ) -> NurtureResult:
-    """Run the page workflow while protecting its checkpoint transaction."""
-    lock = checkpoint_store.profile_lock(account)
-    lock.acquire()
-    try:
-        return await _run_page_workflow_unlocked(
-            page,
-            account,
-            checkpoint_store,
-            max_posts=max_posts,
-            terms=terms,
-            max_scrolls=max_scrolls,
-            max_total_posts=max_total_posts,
-            readiness_prompt=readiness_prompt,
-            show_post_text=show_post_text,
-            show_observed_text=show_observed_text,
-            detail=detail,
-        )
-    finally:
-        lock.release()
-
-
-async def _run_page_workflow_unlocked(
-    page: Page,
-    account: BrowserAccount,
-    checkpoint_store: CheckpointStore,
-    *,
-    max_posts: int,
-    terms: tuple[str, ...],
-    max_scrolls: int = 8,
-    max_total_posts: int = 40,
-    readiness_prompt: Callable[[str, int], Awaitable[bool]] | None = None,
-    show_post_text: bool = False,
-    show_observed_text: bool = False,
-    detail: bool = False,
-) -> NurtureResult:
+    """Run one page cycle; caller must hold the account profile lock."""
     try:
         return await _execute_page_workflow(
             page,
@@ -189,7 +154,7 @@ async def run_browser_nurture(
                     headless=False,
                 )
                 page = context.pages[0] if context.pages else await context.new_page()
-                return await _run_page_workflow_unlocked(
+                return await _run_page_workflow_locked(
                     page,
                     account,
                     checkpoint_store,

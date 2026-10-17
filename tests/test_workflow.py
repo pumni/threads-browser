@@ -146,6 +146,13 @@ def _mock_persistent_browser(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
     return state
 
 
+async def _run_page_workflow_for_test(page, account, checkpoint_store, **kwargs):
+    with checkpoint_store.profile_lock(account):
+        return await workflow._run_page_workflow_locked(
+            page, account, checkpoint_store, **kwargs
+        )
+
+
 @pytest.fixture(autouse=True)
 def _short_offline_render_settle(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(reader_module, "_RENDER_MIN_DWELL_MS", 25)
@@ -450,7 +457,7 @@ document.querySelector('a[href*="native-cycle"]').addEventListener("click", () =
 
         await page.route("https://www.threads.com/@offline.operator", serve_profile)
         await page.route(post_url, serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -725,7 +732,7 @@ def test_detail_without_landmark_or_identity_links_uses_unique_matching_body(
             await route.fulfill(status=200, content_type="text/html", body=detail_html)
 
         await page.route(target_url, serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -798,7 +805,7 @@ window.addEventListener("pageshow", () => {{
             await route.fulfill(status=200, content_type="text/html", body=detail_html)
 
         await page.route(target_url, serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -930,7 +937,7 @@ def test_detail_verification_failures_return_home_and_keep_retry_pending(
             await route.fulfill(status=200, content_type="text/html", body=detail_html)
 
         await page.route(target_url, serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -1019,7 +1026,7 @@ def test_detail_dom_replacement_does_not_mix_root_and_body_provenance(
             await route.fulfill(status=200, content_type="text/html", body=detail_html)
 
         await page.route(target_url, serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -1084,7 +1091,7 @@ def test_empty_detail_is_reported_unavailable_and_home_progress_is_saved(
             )
 
         await page.route(target_url, serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -1151,7 +1158,7 @@ def test_stale_pending_allows_one_verified_fallback_and_saves_remaining_pending(
             await route.fulfill(status=200, content_type="text/html", body=detail_html)
 
         await page.route(fallback_url, serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -1215,7 +1222,7 @@ def test_stale_pending_detail_failure_keeps_both_entries_for_retry(
             await route.fulfill(status=200, content_type="text/html", body=bad_detail_html)
 
         await page.route(fallback_url, serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -1287,7 +1294,7 @@ def test_current_pending_beats_a_fresh_fallback(
             fresh_url,
             lambda route: serve(fresh_url, fresh_detail, route),
         )
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -1357,7 +1364,7 @@ def test_stale_pending_does_not_reopen_completed_posts_or_navigate_without_actio
 
         await page.route(fresh_url, serve_detail)
         for _ in range(2):
-            result = await workflow.run_page_workflow(
+            result = await _run_page_workflow_for_test(
                 page,
                 account,
                 store,
@@ -1423,7 +1430,7 @@ def test_stale_pending_does_not_mask_incomplete_home_observations(
             await route.fulfill(status=200, content_type="text/html", body=detail_html)
 
         await page.route(fallback_url, serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -1485,7 +1492,7 @@ def test_failed_fallback_retries_and_completed_post_stays_deduped_across_ten_cyc
         await page.route(target_url, serve_detail)
         checkpoints = []
         for cycle in range(10):
-            result = await workflow.run_page_workflow(
+            result = await _run_page_workflow_for_test(
                 page,
                 account,
                 store,
@@ -1569,7 +1576,7 @@ def test_completed_fallback_is_not_opened_again_on_unchanged_feed(
 
     async def first_cycle(page) -> None:
         await page.route(target_url, serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -1583,7 +1590,7 @@ def test_completed_fallback_is_not_opened_again_on_unchanged_feed(
 
     async def second_cycle(page) -> None:
         await page.route(target_url, serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -1652,7 +1659,7 @@ def test_q_stops_pending_detail_without_back_or_checkpoint(
 
         await page.route(target_url, serve_detail)
         with pytest.raises(UiReadError) as caught:
-            await workflow.run_page_workflow(
+            await _run_page_workflow_for_test(
                 page,
                 account,
                 store,
@@ -1805,7 +1812,7 @@ setTimeout(() => {{
 
             await page.route(detail_url, serve_detail)
             monkeypatch.setattr(page, "goto", goto_then_timeout)
-            result = await workflow.run_page_workflow(
+            result = await _run_page_workflow_for_test(
                 page,
                 account,
                 store,
@@ -1984,7 +1991,7 @@ def test_attended_wait_can_extend_then_stop_without_checkpoint(
 
         async def exercise(page) -> None:
             with pytest.raises(UiReadError) as caught:
-                await workflow.run_page_workflow(
+                await _run_page_workflow_for_test(
                     page,
                     account,
                     store,
@@ -2184,7 +2191,7 @@ def test_empty_scan_rescans_new_feed_but_changed_back_anchor_stops_without_check
 
         async def exercise(page) -> None:
             with pytest.raises(UiReadError) as caught:
-                await workflow.run_page_workflow(
+                await _run_page_workflow_for_test(
                     page,
                     account,
                     store,
@@ -2295,7 +2302,7 @@ window.addEventListener("wheel", event => {{
             )
 
         await page.route(target_url, serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -2341,7 +2348,7 @@ window.addEventListener("wheel", () => window.wheelCount++);</script></body></ht
         return False
 
     async def malformed_exercise(page) -> None:
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -2456,7 +2463,7 @@ window.addEventListener("wheel", event => {{
 
         async def exercise(page) -> None:
             with pytest.raises(UiReadError) as caught:
-                await workflow.run_page_workflow(
+                await _run_page_workflow_for_test(
                     page,
                     account,
                     store,
@@ -2533,7 +2540,7 @@ window.addEventListener("pageshow", () => {{
 
             await page.route(detail_url, serve_detail)
             with pytest.raises(UiReadError) as caught:
-                await workflow.run_page_workflow(
+                await _run_page_workflow_for_test(
                     page,
                     account,
                     store,
@@ -2663,7 +2670,7 @@ def test_initial_feed_readiness_deadline_stops_without_checkpoint(
 
         async def exercise(page) -> None:
             with pytest.raises(UiReadError) as caught:
-                await workflow.run_page_workflow(
+                await _run_page_workflow_for_test(
                     page,
                     account,
                     store,
@@ -2746,7 +2753,7 @@ window.addEventListener("wheel", event => {
             await page.route(clean_url, serve_clean_detail)
             await page.route("**/@candidate/post/first", reject_mixed_detail)
             await page.route("**/@quoted/post/second", reject_mixed_detail)
-            result = await workflow.run_page_workflow(
+            result = await _run_page_workflow_for_test(
                 page,
                 account,
                 store,
@@ -2834,7 +2841,7 @@ window.addEventListener("wheel", event => {{
                 )
 
             await page.route(target_url, serve_mismatched_detail)
-            result = await workflow.run_page_workflow(
+            result = await _run_page_workflow_for_test(
                 page,
                 account,
                 store,
@@ -3085,7 +3092,7 @@ def test_workflow_skips_detail_when_no_home_candidate_is_actionable(
             await route.abort()
 
         await page.route(target_url, serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -3144,7 +3151,7 @@ def test_checkpoint_save_failure_never_returns_a_saved_result(
 
         await page.route(detail_url, serve_detail)
         with pytest.raises(UiReadError) as caught:
-            await workflow.run_page_workflow(
+            await _run_page_workflow_for_test(
                 page,
                 account,
                 store,
@@ -3202,7 +3209,7 @@ def test_unresolved_post_root_does_not_block_a_verified_selected_post(
             )
 
         await page.route("**/@candidate/post/clean-unresolved-peer", serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -3355,7 +3362,7 @@ def test_unresolved_ambiguous_row_does_not_block_a_verified_peer_checkpoint(
     store = CheckpointStore(tmp_path / "data")
 
     async def exercise(page) -> None:
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -3453,7 +3460,7 @@ def test_closed_session_during_scan_is_classified_without_checkpoint(
 
     async def exercise(page) -> None:
         with pytest.raises(UiReadError) as caught:
-            await workflow.run_page_workflow(
+            await _run_page_workflow_for_test(
                 page,
                 account,
                 store,
@@ -3519,7 +3526,7 @@ def test_transient_execution_context_scan_error_is_retried_after_reverification(
             )
 
         await page.route("**/post/detached-row", serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -3643,7 +3650,7 @@ def test_transient_scan_row_failure_retries_without_replaying_verified_posts(
             )
 
         await page.route("**/post/scan-row-*", serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -3783,7 +3790,7 @@ article:nth-of-type(3) .body {{ top: 70px; }}
             )
 
         await page.route("**/post/scroll-row-3", serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -3881,7 +3888,7 @@ def test_unrevalidated_scan_row_failure_stops_without_checkpoint(
 
         await page.route("**/post/**", track_detail)
         with pytest.raises(UiReadError) as caught:
-            await workflow.run_page_workflow(
+            await _run_page_workflow_for_test(
                 page,
                 account,
                 store,
@@ -3949,7 +3956,7 @@ def test_invalid_workflow_transition_is_not_mapped_to_browser_loss(
 
     async def exercise(page) -> None:
         with pytest.raises(UiReadError) as caught:
-            await workflow.run_page_workflow(
+            await _run_page_workflow_for_test(
                 page,
                 account,
                 store,
@@ -3998,7 +4005,7 @@ def test_other_playwright_scan_error_is_not_mapped_to_browser_loss(
 
     async def exercise(page) -> None:
         with pytest.raises(UiReadError) as caught:
-            await workflow.run_page_workflow(
+            await _run_page_workflow_for_test(
                 page,
                 account,
                 store,
@@ -4086,7 +4093,7 @@ def test_detail_body_mismatch_returns_home_without_claiming_read(tmp_path: Path)
             )
 
         await page.route(target_url, serve_wrong_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -4425,50 +4432,11 @@ def test_direct_browser_workflow_rejects_busy_profile_and_releases_on_failure(
         pass
 
 
-def test_public_page_workflow_holds_and_releases_the_profile_lock(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    profile = tmp_path / "dedicated-profile"
-    profile.mkdir()
-    account = BrowserAccount(uuid4(), "offline", "offline.operator", profile)
-    store = CheckpointStore(tmp_path / "data")
-    calls = 0
-
-    async def check_lock_held(_page, _account, _store, **_kwargs):
-        nonlocal calls
-        calls += 1
-        probe = store.profile_lock(account)
-        try:
-            probe.acquire()
-        except BrowserDataError as error:
-            assert error.code == "ACCOUNT_BUSY"
-        else:
-            probe.release()
-            pytest.fail("public page workflow did not hold the profile lock")
-        return SimpleNamespace(status="COMPLETE")
-
-    monkeypatch.setattr(workflow, "_execute_page_workflow", check_lock_held)
-
-    result = asyncio.run(
-        workflow.run_page_workflow(
-            object(), account, store, max_posts=1, terms=("hiring",)
-        )
-    )
-
-    assert result.status == "COMPLETE"
-    assert calls == 1
-    with store.profile_lock(account):
-        pass
-
-    with store.profile_lock(account), pytest.raises(BrowserDataError) as busy:
-        asyncio.run(
-            workflow.run_page_workflow(
-                object(), account, store, max_posts=1, terms=("hiring",)
-            )
-        )
-    assert busy.value.code == "ACCOUNT_BUSY"
-    assert calls == 1
+def test_only_managed_browser_workflow_is_a_public_profile_entry_point() -> None:
+    assert "run_browser_nurture" in workflow.__all__
+    assert hasattr(workflow, "run_browser_nurture")
+    assert "run_page_workflow" not in workflow.__all__
+    assert not hasattr(workflow, "run_page_workflow")
 
 
 def test_concurrent_browser_workflows_reject_same_profile_before_checkpoint_access(
@@ -4489,6 +4457,14 @@ def test_concurrent_browser_workflows_reject_same_profile_before_checkpoint_acce
     original_load = store.load
 
     async def read_then_wait(_page, _account, checkpoint_store, **_kwargs):
+        probe = checkpoint_store.profile_lock(account)
+        try:
+            probe.acquire()
+        except BrowserDataError as error:
+            assert error.code == "ACCOUNT_BUSY"
+        else:
+            probe.release()
+            pytest.fail("managed page cycle ran without the profile lock")
         checkpoint_access.append("load")
         checkpoint = checkpoint_store.load(account.account_id, policy)
         engine_entered.set()
@@ -4704,7 +4680,7 @@ def test_browser_runtime_timeout_during_active_detail_closes_context_and_release
 
     monkeypatch.setattr(workflow, "async_playwright", Manager)
     monkeypatch.setattr(workflow, "_detail_terminal_ready", lambda: True)
-    monkeypatch.setattr(workflow, "_run_page_workflow_unlocked", wait_in_detail)
+    monkeypatch.setattr(workflow, "_run_page_workflow_locked", wait_in_detail)
 
     with pytest.raises(UiReadError) as caught:
         asyncio.run(
@@ -4759,7 +4735,7 @@ def test_external_browser_cancellation_propagates_after_cleanup(
         await asyncio.Event().wait()
 
     monkeypatch.setattr(workflow, "async_playwright", Manager)
-    monkeypatch.setattr(workflow, "_run_page_workflow_unlocked", wait_for_cancellation)
+    monkeypatch.setattr(workflow, "_run_page_workflow_locked", wait_for_cancellation)
 
     async def exercise() -> None:
         task = asyncio.create_task(
@@ -4820,7 +4796,7 @@ def test_cancellation_during_browser_cleanup_holds_lock_until_shutdown(
         return SimpleNamespace(status="COMPLETE")
 
     monkeypatch.setattr(workflow, "async_playwright", Manager)
-    monkeypatch.setattr(workflow, "_run_page_workflow_unlocked", successful_cycle)
+    monkeypatch.setattr(workflow, "_run_page_workflow_locked", successful_cycle)
 
     async def exercise() -> None:
         task = asyncio.create_task(
@@ -4890,7 +4866,7 @@ def test_browser_cleanup_failure_is_reported_after_successful_cycle(
         return SimpleNamespace(status="COMPLETE")
 
     monkeypatch.setattr(workflow, "async_playwright", Manager)
-    monkeypatch.setattr(workflow, "_run_page_workflow_unlocked", successful_cycle)
+    monkeypatch.setattr(workflow, "_run_page_workflow_locked", successful_cycle)
     if failure == "timeout":
         monkeypatch.setattr(workflow, "_CLEANUP_ALLOWANCE_SECONDS", 0.01)
 
@@ -4989,7 +4965,7 @@ window.addEventListener("wheel", event => {{
             )
 
         await page.route(detail_url, serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -5068,7 +5044,7 @@ window.addEventListener("wheel", event => {{
             )
 
         await page.route(detail_url, serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -5196,7 +5172,7 @@ window.addEventListener("wheel", event => {{
             )
 
         await page.route(detail_url, serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -5278,7 +5254,7 @@ def test_timestamp_permalink_accepts_safe_trailing_slash_and_ignores_bad_seconda
             )
 
         await page.route(detail_url, serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -5358,7 +5334,7 @@ def test_noncanonical_link_reasons_are_aggregate_private_and_skipped(
     store = CheckpointStore(data_root)
 
     async def exercise(page) -> None:
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -5892,7 +5868,7 @@ article p {{ position: absolute; top: 600px; left: 0; width: 400px;
                 body=detail_html,
             ),
         )
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -5963,7 +5939,7 @@ article p span:first-child {{ position: relative; left: -2px; }}
                 body=detail_html,
             ),
         )
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -6040,7 +6016,7 @@ article.long p {{ margin: 0; font: 16px/24px monospace; overflow-wrap: anywhere;
             )
 
         await page.route("**/@candidate/post/earlier-*", serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -6162,7 +6138,7 @@ window.addEventListener("wheel", event => {{
             )
 
         await page.route("**/@candidate/post/**", serve_verified_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -6250,7 +6226,7 @@ window.addEventListener("wheel", event => {{
     valid_store = CheckpointStore(valid_root / "data")
 
     async def valid_exercise(page) -> None:
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             valid_account,
             valid_store,
@@ -6293,7 +6269,7 @@ window.addEventListener("wheel", event => {{
 
     async def zero_exercise(page) -> None:
         with pytest.raises(UiReadError) as caught:
-            await workflow.run_page_workflow(
+            await _run_page_workflow_for_test(
                 page,
                 zero_account,
                 zero_store,
@@ -6385,7 +6361,7 @@ body {{ font-family: sans-serif; }}
             )
 
         await page.route(detail_url, serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -6469,7 +6445,7 @@ def test_visible_card_without_permalink_is_skipped_without_fingerprint(
     store = CheckpointStore(data_root)
 
     async def exercise(page) -> None:
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -6609,7 +6585,7 @@ nav {{ height: 40px; }}
             )
 
         await page.route(target_url, serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -6702,7 +6678,7 @@ def test_progressive_body_fallback_emits_row_before_reading_next_with_y_jitter(
             )
 
         await page.route(first_url, serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -6784,7 +6760,7 @@ nav {{ height: 36px; }} .card {{ height: 155px; }}
                 ),
             ),
         )
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -6861,7 +6837,7 @@ article {{ box-sizing: border-box; height: 680px; padding-top: 430px; }}
 
         await page.route(target_url, serve_detail)
         with pytest.raises(UiReadError) as caught:
-            await workflow.run_page_workflow(
+            await _run_page_workflow_for_test(
                 page,
                 account,
                 store,
@@ -6927,7 +6903,7 @@ window.addEventListener("wheel", event => {{
     store = CheckpointStore(data_root)
 
     async def exercise(page) -> None:
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -7056,7 +7032,7 @@ window.addEventListener('scroll', () => {{
             )
 
         await page.route(detail_url, serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -7132,7 +7108,7 @@ nav {{ height: 36px; }}
     store = CheckpointStore(data_root)
 
     async def exercise(page) -> None:
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -7276,7 +7252,7 @@ nav {{ height: 32px; }} .card {{ height: 150px; }}
                 ),
             ),
         )
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -7341,7 +7317,7 @@ window.addEventListener("wheel", () => window.nativeWheelCount++);
     store = CheckpointStore(data_root)
 
     async def exercise(page) -> None:
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -7417,7 +7393,7 @@ window.addEventListener("wheel", () => {{
     store = CheckpointStore(data_root)
 
     async def exercise(page) -> None:
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -7544,7 +7520,7 @@ feed.scrollTop = feed.scrollHeight;
             )
 
         await page.route(target_url, serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -7626,7 +7602,7 @@ def test_unverified_display_row_does_not_block_verified_selected_detail(
             )
 
         await page.route(detail_url, serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -7702,7 +7678,7 @@ window.addEventListener("wheel", () => window.wheelCount++);</script>
     store = CheckpointStore(data_root)
 
     async def exercise(page) -> None:
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -7752,7 +7728,7 @@ def test_unmarked_row_body_hydration_is_rescanned_without_early_ready(
     store = CheckpointStore(data_root)
 
     async def exercise(page) -> None:
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -7840,7 +7816,7 @@ def test_unverified_keyword_mismatch_never_becomes_a_verified_match(
     store = CheckpointStore(data_root)
 
     async def exercise(page) -> None:
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -7905,7 +7881,7 @@ window.addEventListener("click", event => {{
     store = CheckpointStore(data_root)
 
     async def exercise(page) -> None:
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -7963,7 +7939,7 @@ def test_explicit_observed_text_preview_contains_only_scoped_unverified_body(
     store = CheckpointStore(data_root)
 
     async def exercise(page) -> None:
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -8010,7 +7986,7 @@ def test_unverified_relevance_is_skipped_while_verified_rows_checkpoint(
     store = CheckpointStore(data_root)
 
     async def exercise(page) -> None:
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -8245,7 +8221,7 @@ nav {{ height: 36px; }}
     store = CheckpointStore(data_root)
 
     async def exercise(page) -> None:
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,
@@ -8349,7 +8325,7 @@ feed.addEventListener('scroll', () => sessionStorage.setItem(
             )
 
         await page.route(detail_url, serve_detail)
-        result = await workflow.run_page_workflow(
+        result = await _run_page_workflow_for_test(
             page,
             account,
             store,

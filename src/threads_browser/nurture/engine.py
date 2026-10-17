@@ -163,7 +163,7 @@ def _result_from_observation(
     )
 
 
-async def run_page_workflow(
+async def _run_page_workflow_cycle(
     page: Page,
     account: BrowserAccount,
     checkpoint_store: CheckpointStore,
@@ -178,6 +178,7 @@ async def run_page_workflow(
     detail: bool = False,
     reader_factory: Callable[..., ThreadsHomeReader] = ThreadsHomeReader,
 ) -> NurtureResult:
+    """Run one internal page cycle under workflow's held profile lock."""
     state = NurtureRunState()
     if account.expected_actor is None:
         raise BrowserDataError("ACCOUNT_NOT_VERIFIED")
