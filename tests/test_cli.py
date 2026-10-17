@@ -545,6 +545,21 @@ def test_scheduled_success_records_only_safe_counts(
     status_json = (root / "operations" / "last_run.json").read_text(encoding="utf-8")
     status = json.loads(status_json)
 
+    assert output.startswith("NURTURE status=COMPLETE_WITH_SKIPS source=HOME_FOR_YOU")
+    assert "home_sampled=12 home_new=3" in output
+    assert "scroll_attempts=2 scrolls=2" in output
+    assert not any(
+        token in output
+        for token in (
+            "row_id=",
+            "[ROW",
+            "[SCROLL_ROW_PROGRESS]",
+            "[SCROLL_GEOMETRY]",
+            "scrollTop_before=",
+            "clip_bottom_px=",
+            "structural_reasons=",
+        )
+    )
     assert status["status"] == "COMPLETE"
     assert status["cycle_status"] == "COMPLETE_WITH_SKIPS"
     assert status["stop_reason"] == "FEED_END_REACHED"

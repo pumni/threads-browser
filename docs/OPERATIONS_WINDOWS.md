@@ -61,8 +61,11 @@ DOM data. A new attempt first writes `RUNNING`; if Windows kills the process
 before cleanup, that status remains and is evidence of an interrupted run.
 Successful completion overwrites the same file, so status storage stays
 bounded. The CLI output contains only operational statuses and counts unless
-an operator explicitly enables a local-only diagnostic mode; the wrapper
-rejects those text-output options in scheduled mode.
+an operator explicitly enables a local-only diagnostic mode. Scheduled mode
+passes an explicit output policy through the browser workflow, suppressing
+row, structure, viewport, and scroll-geometry diagnostics while retaining the
+final aggregate `NURTURE` summary and fixed-code `STOP` / `ERROR` / `WARNING`
+messages. The wrapper rejects those text-output options in scheduled mode.
 
 `COMPLETE` means this invocation saved its checkpoint. A returned cycle that
 stops before saving is recorded as `STOPPED`, returns exit code 1, and preserves

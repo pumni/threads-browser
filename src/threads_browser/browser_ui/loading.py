@@ -12,6 +12,10 @@ from typing import Literal
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Locator, Page, expect
 
+from ..console_output import (
+    ConsoleOutputPolicy,
+    emit_console_diagnostic,
+)
 from ..errors import UiReadError
 
 
@@ -66,8 +70,14 @@ class RenderObservation[T]:
 class LoadingObserver:
     """Wait for visible DOM evidence to settle within explicit time bounds."""
 
-    def __init__(self, page: Page) -> None:
+    def __init__(
+        self,
+        page: Page,
+        *,
+        console_output_policy: ConsoleOutputPolicy = ConsoleOutputPolicy.INTERACTIVE,
+    ) -> None:
         self._page = page
+        self._console_output_policy = console_output_policy
 
     async def wait_for_render_settled[T](
         self,
@@ -103,18 +113,18 @@ class LoadingObserver:
             checks += 1
             if observation is None:
                 if previous_signature is not None:
-                    print(f"RESCAN stage={stage} reason=DOM_CHANGED_AFTER_SCAN")
+                    emit_console_diagnostic(self._console_output_policy, f"RESCAN stage={stage} reason=DOM_CHANGED_AFTER_SCAN")
                 previous_signature = None
                 stable_count = 0
                 if not waiting_reported:
-                    print(f"WAITING stage={stage} reason=RENDER_PENDING")
+                    emit_console_diagnostic(self._console_output_policy, f"WAITING stage={stage} reason=RENDER_PENDING")
                     waiting_reported = True
             else:
                 if observation.signature == previous_signature:
                     stable_count += 1
                 else:
                     if previous_signature is not None:
-                        print(f"RESCAN stage={stage} reason=DOM_CHANGED_AFTER_SCAN")
+                        emit_console_diagnostic(self._console_output_policy, f"RESCAN stage={stage} reason=DOM_CHANGED_AFTER_SCAN")
                     previous_signature = observation.signature
                     stable_count = 1
                 if stable_count >= stable_observations:
@@ -122,7 +132,7 @@ class LoadingObserver:
                         raise UiReadError(observation.terminal_code)
                     if observation.ready_state is None:
                         if not waiting_reported:
-                            print(f"WAITING stage={stage} reason=READABLE_FEED_NOT_CONFIRMED")
+                            emit_console_diagnostic(self._console_output_policy, f"WAITING stage={stage} reason=READABLE_FEED_NOT_CONFIRMED")
                             waiting_reported = True
                     else:
                         if validate is not None:

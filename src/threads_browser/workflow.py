@@ -11,6 +11,7 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page, async_playwright
 
 from .browser_ui.session import classify_playwright_failure, emit_failure_diagnostic
+from .console_output import ConsoleOutputPolicy
 from .nurture.diagnostics import _terminal_safe_post_text
 from .nurture.engine import NurtureResult
 from .nurture.engine import _run_page_workflow_cycle as _execute_page_workflow
@@ -48,6 +49,7 @@ async def _run_page_workflow_locked(
     show_post_text: bool = False,
     show_observed_text: bool = False,
     detail: bool = False,
+    console_output_policy: ConsoleOutputPolicy = ConsoleOutputPolicy.INTERACTIVE,
 ) -> NurtureResult:
     """Run one page cycle; caller must hold the account profile lock."""
     try:
@@ -63,6 +65,7 @@ async def _run_page_workflow_locked(
             show_post_text=show_post_text,
             show_observed_text=show_observed_text,
             detail=detail,
+            console_output_policy=console_output_policy,
             reader_factory=ThreadsHomeReader,
         )
     except UiReadError:
@@ -126,7 +129,12 @@ async def run_browser_nurture(
     show_post_text: bool = False,
     show_observed_text: bool = False,
     detail: bool = False,
+    console_output_policy: ConsoleOutputPolicy = ConsoleOutputPolicy.INTERACTIVE,
 ) -> NurtureResult:
+    if console_output_policy is ConsoleOutputPolicy.SCHEDULED and (
+        detail or show_post_text or show_observed_text
+    ):
+        raise UiReadError("SCHEDULED_TEXT_OUTPUT_INVALID")
     if account.expected_actor is None:
         raise BrowserDataError("ACCOUNT_NOT_VERIFIED")
     if detail and not _detail_terminal_ready():
@@ -166,6 +174,7 @@ async def run_browser_nurture(
                     show_post_text=show_post_text,
                     show_observed_text=show_observed_text,
                     detail=detail,
+                    console_output_policy=console_output_policy,
                 )
         except TimeoutError:
             if timeout_scope is None or not timeout_scope.expired():
