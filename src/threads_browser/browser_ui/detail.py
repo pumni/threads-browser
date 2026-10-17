@@ -35,8 +35,7 @@ _DETAIL_ROOT_SELECTOR = 'article, [role="article"], [data-pressable-container="t
 _DETAIL_QUOTE_SELECTOR = 'blockquote, [role="quote"]'
 _DETAIL_EXCLUDED_SELECTOR = _BODY_EXCLUSION_SELECTOR
 _DETAIL_PENDING_SELECTOR = (
-    '[aria-busy="true"], [role="progressbar"], [data-loading="true"], '
-    '[data-testid*="skeleton" i]'
+    '[aria-busy="true"], [role="progressbar"], [data-loading="true"], [data-testid*="skeleton" i]'
 )
 _MAX_DETAIL_ROOTS = 40
 _MAX_DETAIL_LINKS = 40
@@ -65,6 +64,14 @@ class _DetailRootRead:
     self_permalink_candidates: int
     body: _VisibleBodyRead
     body_matches: bool
+
+
+@dataclass(slots=True)
+class DetailReturnState:
+    """Evidence retained while Detail is open and Back is being verified."""
+
+    anchor: str | None = None
+    target: PostTarget | None = None
 
 
 def _detail_body_matches(target: PostTarget, body: str | None) -> bool:
@@ -106,9 +113,7 @@ class DetailReaderHost(Protocol):
     def _remaining_readiness_ms(self, deadline: float, timeout_code: str) -> int: ...
     def _mark_ui_transition(self) -> None: ...
     async def _check_blocker(self) -> None: ...
-    async def _read_detail_body(
-        self, root: Locator, fingerprint: str
-    ) -> _VisibleBodyRead: ...
+    async def _read_detail_body(self, root: Locator, fingerprint: str) -> _VisibleBodyRead: ...
     async def _await_render_settled(
         self,
         stage: str,
@@ -129,6 +134,21 @@ class DetailReaderHost(Protocol):
     async def _is_outside_content_landmark(self, link: Locator) -> bool: ...
     async def _go_back_to_home(self) -> None: ...
     async def _revalidate_action_target(self, target: PostTarget) -> PostTarget: ...
+    async def _content_region(self) -> Locator: ...
+    async def _is_nested_feed_content(self, element: Locator) -> bool: ...
+    async def _is_inside_quote(self, element: Locator) -> bool: ...
+    async def _resolve_permalink_card(
+        self, link: Locator, post_url: str, author: str
+    ) -> tuple[Locator, dict[str, float]]: ...
+    async def _read_stable_visible_card(
+        self,
+        root: Locator,
+        *,
+        viewport_y: float = 0.0,
+        cached_body_fingerprints: set[str] | None = None,
+    ) -> tuple[PostTarget, bool]: ...
+    @property
+    def _max_permalink_candidates(self) -> int: ...
 
 
 class DetailNavigator:
@@ -145,7 +165,47 @@ class DetailNavigator:
         self._timeout_ms = timeout_ms
         self._console_output_policy = console_output_policy
         self._last_reported_detail_state: tuple[str, _DetailState] | None = None
+        self.return_state = DetailReturnState()
         self.route_verified = False
+
+    async def _revalidate_action_target(self, target: PostTarget) -> PostTarget:
+        region = await self._host._content_region()
+        links = region.locator('a[href*="/post/"]')
+        matches: list[PostTarget] = []
+        for index in range(min(await links.count(), self._host._max_permalink_candidates)):
+            link = links.nth(index)
+            if (
+                not await link.is_visible()
+                or await self._host._is_outside_content_landmark(link)
+                or await self._host._is_nested_feed_content(link)
+                or await self._host._is_inside_quote(link)
+                or not await self._host._is_in_visible_scrollports(link)
+            ):
+                continue
+            href = await link.get_attribute("href")
+            parsed = None if href is None else _post_url(href)
+            if parsed != (target.url, target.author):
+                continue
+            root, box = await self._host._resolve_permalink_card(
+                link,
+                target.url,
+                target.author,
+            )
+            current, body_stable = await self._host._read_stable_visible_card(
+                root,
+                viewport_y=box["y"],
+                cached_body_fingerprints={target.fingerprint},
+            )
+            if (
+                not body_stable
+                or not current.currently_visible
+                or current.fingerprint != target.fingerprint
+            ):
+                raise UiReadError("DETAIL_PROVENANCE_UNVERIFIED")
+            matches.append(current)
+        if len(matches) != 1:
+            raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED")
+        return matches[0]
 
     async def _detail_click_point(self, permalink: Locator) -> tuple[float, float]:
         viewport = self._host._page.viewport_size
@@ -190,7 +250,8 @@ class DetailNavigator:
         if self._last_reported_detail_state == (phase, state):
             return
         self._last_reported_detail_state = (phase, state)
-        emit_console_diagnostic(self._console_output_policy,
+        emit_console_diagnostic(
+            self._console_output_policy,
             f"[DETAIL_STATE] phase={phase} "
             f"route_verified={str(state.route_verified).lower()} "
             f"same_origin={str(state.same_origin).lower()} "
@@ -203,7 +264,7 @@ class DetailNavigator:
             f"body_nodes_visible={state.body_nodes_visible} "
             f"matching_roots={state.matching_roots} "
             f"hydration_pending={str(state.hydration_pending).lower()} "
-            f"terminal_reason={state.terminal_reason}"
+            f"terminal_reason={state.terminal_reason}",
         )
 
     async def _detail_region(self) -> tuple[Locator, int]:
@@ -254,8 +315,11 @@ class DetailNavigator:
                         ? nearest === args.root
                         : args.root.contains(node) && !nearest;
                 }""",
-                {"root": root_handle, "quote": _DETAIL_QUOTE_SELECTOR,
-                 "roots": _DETAIL_ROOT_SELECTOR},
+                {
+                    "root": root_handle,
+                    "quote": _DETAIL_QUOTE_SELECTOR,
+                    "roots": _DETAIL_ROOT_SELECTOR,
+                },
             )
         )
 
@@ -496,17 +560,25 @@ class DetailNavigator:
                 article_roots += 1
             if is_pressable:
                 pressable_roots += 1
-            if (
-                await self._is_top_level_detail_root(root, region)
-                and await self._host._is_in_visible_scrollports(root)
-            ):
+            if await self._is_top_level_detail_root(
+                root, region
+            ) and await self._host._is_in_visible_scrollports(root):
                 candidate_roots.append(root)
 
         self_permalink_candidates = await self._count_self_permalink_candidates(region, target)
         if root_count > _MAX_DETAIL_ROOTS:
             state = _DetailState(
-                True, True, region_count, article_roots, pressable_roots,
-                self_permalink_candidates, 0, 0, 0, pending, "ROOT_AMBIGUOUS",
+                True,
+                True,
+                region_count,
+                article_roots,
+                pressable_roots,
+                self_permalink_candidates,
+                0,
+                0,
+                0,
+                pending,
+                "ROOT_AMBIGUOUS",
             )
             self._report_detail_state("POST_ROUTE", state)
             return (
@@ -527,14 +599,24 @@ class DetailNavigator:
 
         fallback_visible_nodes = 0
         if not any(item.body_matches for item in reads):
-            fallback_roots, fallback_visible_nodes, fallback_incomplete = (
-                await self._fallback_detail_roots(region, target)
-            )
+            (
+                fallback_roots,
+                fallback_visible_nodes,
+                fallback_incomplete,
+            ) = await self._fallback_detail_roots(region, target)
             if fallback_incomplete:
                 state = _DetailState(
-                    True, True, region_count, article_roots, pressable_roots,
-                    self_permalink_candidates, 0, fallback_visible_nodes,
-                    len(fallback_roots), pending, "ROOT_AMBIGUOUS",
+                    True,
+                    True,
+                    region_count,
+                    article_roots,
+                    pressable_roots,
+                    self_permalink_candidates,
+                    0,
+                    fallback_visible_nodes,
+                    len(fallback_roots),
+                    pending,
+                    "ROOT_AMBIGUOUS",
                 )
                 self._report_detail_state("POST_ROUTE", state)
                 return (
@@ -569,7 +651,9 @@ class DetailNavigator:
             reason = "ROOT_AMBIGUOUS"
         elif body_matches and body_matches[0].has_rejected_post_link:
             reason = "SELF_LINK_REJECTED"
-        elif body_matches and body_matches[0].authors and body_matches[0].authors != {target.author}:
+        elif (
+            body_matches and body_matches[0].authors and body_matches[0].authors != {target.author}
+        ):
             reason = "AUTHOR_CONFLICT"
         elif route_and_content_matches:
             read = route_and_content_matches[0]
@@ -597,9 +681,17 @@ class DetailNavigator:
                     read_evidence=read.body.read_evidence,
                 )
                 state = _DetailState(
-                    True, True, region_count, article_roots, pressable_roots,
-                    self_permalink_candidates, author_candidates, body_nodes_visible,
-                    matching_roots, False, "DETAIL_VERIFIED",
+                    True,
+                    True,
+                    region_count,
+                    article_roots,
+                    pressable_roots,
+                    self_permalink_candidates,
+                    author_candidates,
+                    body_nodes_visible,
+                    matching_roots,
+                    False,
+                    "DETAIL_VERIFIED",
                 )
                 self._report_detail_state("POST_ROUTE", state)
                 return (
@@ -624,9 +716,17 @@ class DetailNavigator:
             reason = "BODY_CHANGED"
 
         state = _DetailState(
-            True, True, region_count, article_roots, pressable_roots,
-            self_permalink_candidates, author_candidates, body_nodes_visible,
-            matching_roots, pending, reason,
+            True,
+            True,
+            region_count,
+            article_roots,
+            pressable_roots,
+            self_permalink_candidates,
+            author_candidates,
+            body_nodes_visible,
+            matching_roots,
+            pending,
+            reason,
         )
         self._report_detail_state("POST_ROUTE", state)
         if pending or reason in {
