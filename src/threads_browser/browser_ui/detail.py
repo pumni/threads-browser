@@ -309,6 +309,7 @@ class DetailNavigator:
         authors: set[str] = set()
         self_permalink_candidates = 0
         has_rejected_post_link = False
+        has_mismatched_post_link = False
         for index in range(link_count):
             link = links.nth(index)
             if (
@@ -323,14 +324,23 @@ class DetailNavigator:
                 continue
             parsed_post = _post_url(href)
             if _post_url_hint(href):
-                if parsed_post is None or parsed_post[0] != target.url:
+                if parsed_post is None:
                     has_rejected_post_link = True
+                elif parsed_post[0] != target.url:
+                    has_mismatched_post_link = True
                 else:
                     self_permalink_candidates += 1
                 continue
             author = _profile_author(href)
             if author is not None:
                 authors.add(author)
+        # Broad Detail roots can wrap valid related-post links. Keep the
+        # mismatch fail-closed unless this root also proves the exact target
+        # permalink and author; malformed post-like links always reject.
+        if has_mismatched_post_link and (
+            self_permalink_candidates == 0 or authors != {target.author}
+        ):
+            has_rejected_post_link = True
         body = await self._host._read_detail_body(
             root,
             f"{target.fingerprint}:{root_path}",

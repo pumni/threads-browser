@@ -584,6 +584,57 @@ def test_non_article_permalink_cards_sample_and_verify_detail() -> None:
     _run_offline_page(feed_html, exercise)
 
 
+def test_detail_target_with_nested_and_adjacent_post_links_is_verified() -> None:
+    actor = "offline.operator"
+    target_url = "https://www.threads.com/@candidate/post/detail-with-related-links"
+    body = "Hiring a synthetic engineer for a test fixture."
+    feed_html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main><article>
+  <a href="/@candidate/post/detail-with-related-links"><time>now</time></a>
+  <a href="/@candidate">candidate</a><p>{body}</p>
+</article></main></body></html>"""
+    detail_html = f"""<!doctype html><html><body><main>
+<article id="detail-root">
+  <a href="/@candidate/post/detail-with-related-links"><time>now</time></a>
+  <a href="/@candidate/post/detail-with-related-links">canonical permalink</a>
+  <a href="/@candidate">candidate</a><p>{body}</p>
+  <div class="related-post-links">
+    <a href="/@reply/post/reply-context">synthetic reply</a>
+    <a href="/@quote/post/quote-context">synthetic quote</a>
+  </div>
+</article>
+<aside><a href="/@other/post/adjacent-context">synthetic adjacent post</a></aside>
+</main></body></html>"""
+
+    async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            await route.fulfill(status=200, content_type="text/html", body=detail_html)
+
+        await page.route(target_url, serve_detail)
+        reader = ThreadsHomeReader(page, actor)
+        await reader.open_home()
+        targets = await reader.scan_viewport(1)
+        assert len(targets) == 1
+
+        detail = await reader.read_detail(targets[0])
+        assert reader.detail_route_verified
+        assert detail.url == target_url
+        assert detail.author == "candidate"
+        assert detail.body == body
+        reported = reader._detail_navigator._last_reported_detail_state
+        assert reported is not None
+        assert reported[1].canonical_self_permalink_candidates == 2
+        assert reported[1].matching_roots == 1
+        assert reported[1].terminal_reason == "DETAIL_VERIFIED"
+        await reader.return_to_home()
+        assert page.url == HOME_URL
+
+    _run_offline_page(feed_html, exercise)
+
+
 def test_detail_without_landmark_or_identity_links_uses_unique_matching_body(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -731,6 +782,33 @@ window.addEventListener("pageshow", () => {{
         ),
         (
             (
+                '<div data-pressable-container="true">'
+                '<a href="/@candidate/post/detail-evidence">canonical target</a>'
+                '<a href="/@candidate">candidate</a>'
+                '<a href="/@candidate/post/detail-evidence?view=1">noncanonical link</a>'
+                '<p>{body}</p></div>'
+            ),
+            "DETAIL_PROVENANCE_UNVERIFIED",
+        ),
+        (
+            (
+                '<div data-pressable-container="true"><a href="/@candidate">candidate</a>'
+                '<a href="/@candidate/post/another-post">mismatched post</a>'
+                '<p>{body}</p></div>'
+            ),
+            "DETAIL_PROVENANCE_UNVERIFIED",
+        ),
+        (
+            (
+                '<div data-pressable-container="true">'
+                '<a href="/@candidate/post/detail-evidence">canonical target</a>'
+                '<a href="/@candidate/post/another-post">mismatched post</a>'
+                '<p>{body}</p></div>'
+            ),
+            "DETAIL_PROVENANCE_UNVERIFIED",
+        ),
+        (
+            (
                 '<div data-pressable-container="true"><a href="/@candidate">candidate</a>'
                 '<p>A different synthetic body.</p></div>'
             ),
@@ -738,14 +816,25 @@ window.addEventListener("pageshow", () => {{
         ),
         (
             (
-                '<div data-pressable-container="true"><a href="/@candidate">candidate</a>'
-                '<p>{body}</p></div><div data-pressable-container="true">'
+                '<div data-pressable-container="true" id="selected-post">'
+                '<a href="/@candidate/post/detail-evidence">selected post</a>'
+                '<a href="/@candidate">candidate</a><p>{body}</p></div>'
+                '<div data-pressable-container="true" id="related-reply-or-quote">'
+                '<a href="/@candidate/post/related-context">related post</a>'
                 '<a href="/@candidate">candidate</a><p>{body}</p></div>'
             ),
             "DETAIL_ROOT_AMBIGUOUS",
         ),
     ],
-    ids=("multiple-authors", "rejected-post-link", "changed-body", "duplicate-roots"),
+    ids=(
+        "multiple-authors",
+        "noncanonical-post-link",
+        "target-plus-noncanonical-post-link",
+        "mismatched-post-link",
+        "mismatched-post-link-without-author",
+        "changed-body",
+        "ambiguous-reply-or-quote-root",
+    ),
 )
 def test_detail_verification_failures_return_home_and_keep_retry_pending(
     tmp_path: Path,
@@ -809,6 +898,93 @@ def test_detail_verification_failures_return_home_and_keep_retry_pending(
     )
     assert "route_verified=true" in diagnostics
     assert all(value not in diagnostics for value in (target_url, actor, body, str(profile)))
+
+
+def test_detail_dom_replacement_does_not_mix_root_and_body_provenance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    target_url = "https://www.threads.com/@candidate/post/dom-replacement"
+    body = "Hiring a synthetic target through a DOM hydration fixture."
+    feed_html = f"""<!doctype html><html><body>
+<nav aria-label="Main" role="navigation">
+  <a aria-current="page" aria-label="For you" href="/">For you</a>
+  <a aria-label="Profile" href="/@{actor}">Profile</a>
+</nav><main><article>
+  <a href="/@candidate/post/dom-replacement"><time>now</time></a>
+  <a href="/@candidate">candidate</a><p>{body}</p>
+</article></main></body></html>"""
+    detail_html = f"""<!doctype html><html><body><main>
+<article id="detail-root">
+  <a href="/@candidate/post/dom-replacement"><time>now</time></a>
+  <a href="/@candidate">candidate</a><p>{body}</p>
+</article>
+</main></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "synthetic-profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+    detail_requests = 0
+    root_replacements = 0
+    original_read_detail_body = ThreadsHomeReader._read_detail_body
+    monkeypatch.setattr(reader_module, "_READINESS_TIMEOUT_MS", 1_500)
+    monkeypatch.setattr(reader_module, "_DETAIL_TIMEOUT_MS", 1_000)
+
+    async def replace_root_before_body(self, root, fingerprint):
+        nonlocal root_replacements
+        if root_replacements == 0:
+            root_replacements += 1
+            await self._page.evaluate(
+                """() => {
+                    const oldRoot = document.querySelector("#detail-root");
+                    const replacement = document.createElement("article");
+                    replacement.id = "detail-root";
+                    replacement.innerHTML =
+                      '<a href="/@different"><span>different author</span></a>' +
+                      '<p>Hiring a synthetic target through a DOM hydration fixture.</p>';
+                    oldRoot.replaceWith(replacement);
+                }"""
+            )
+        return await original_read_detail_body(self, root, fingerprint)
+
+    monkeypatch.setattr(ThreadsHomeReader, "_read_detail_body", replace_root_before_body)
+
+    async def exercise(page) -> None:
+        async def serve_detail(route: Route) -> None:
+            nonlocal detail_requests
+            detail_requests += 1
+            await route.fulfill(status=200, content_type="text/html", body=detail_html)
+
+        await page.route(target_url, serve_detail)
+        result = await workflow.run_page_workflow(
+            page,
+            account,
+            store,
+            max_posts=1,
+            max_scrolls=0,
+            terms=("hiring",),
+            detail=True,
+        )
+        assert result.status == "DETAIL_RETRY_PENDING"
+        assert result.detail_reads == 0
+        assert page.url == HOME_URL
+
+    _run_offline_page(feed_html, exercise)
+    policy = policy_fingerprint(canonical_terms(("hiring",)))
+    checkpoint = store.load(account.account_id, policy)
+    assert root_replacements == 1
+    assert detail_requests == 1
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.detail_reads == 0
+    assert len(checkpoint.pending_read_fingerprints) == 1
+    output = capsys.readouterr().out
+    assert "[BACK] post=1 status=RESTORED anchor=IDENTITY_VERIFIED" in output
+    assert "DETAIL_VERIFIED status=PROVENANCE_VERIFIED" not in output
+    detail_states = [line for line in output.splitlines() if line.startswith("[DETAIL_STATE]")]
+    assert any("terminal_reason=AUTHOR_CONFLICT" in line for line in detail_states)
 
 
 def test_empty_detail_is_reported_unavailable_and_home_progress_is_saved(
