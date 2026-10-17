@@ -1060,6 +1060,7 @@ class ThreadsHomeReader:
                     error_class=failure.error_class,
                     page_closed=failure.page_closed,
                     context_closed=failure.context_closed,
+                    console_output_policy=self._console_output_policy,
                 )
                 if not self._detail_mode:
                     emit_console_diagnostic(self._console_output_policy, f"SCROLL attempt={self.scroll_attempts} observed=0")
@@ -1296,6 +1297,7 @@ class ThreadsHomeReader:
                         error_class=failure.error_class,
                         page_closed=failure.page_closed,
                         context_closed=failure.context_closed,
+                        console_output_policy=self._console_output_policy,
                         stage=self._scan_stage,
                         viewport_index=self._scan_viewport_index,
                         candidate_index=self._scan_candidate_index,
@@ -1348,6 +1350,7 @@ class ThreadsHomeReader:
                     error_class=failure.error_class,
                     page_closed=failure.page_closed,
                     context_closed=failure.context_closed,
+                    console_output_policy=self._console_output_policy,
                     error_kind=classify_playwright_error_kind(error),
                 )
                 if failure.error_class == "TARGET_CLOSED":

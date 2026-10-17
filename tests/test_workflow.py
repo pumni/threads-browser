@@ -532,6 +532,150 @@ main {{ display: block; }}
     assert "[SCROLL_GEOMETRY]" in interactive_output
 
 
+def test_scheduled_offline_chromium_cli_suppresses_failure_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    data_root = tmp_path / "data"
+    profile = tmp_path / "synthetic-profile"
+    profile.mkdir()
+    AccountStore(data_root).add("offline", actor, profile)
+    monkeypatch.setenv("THREADS_BROWSER_DATA_ROOT", str(data_root))
+
+    async def respond(route: Route) -> None:
+        if route.request.url == HOME_URL:
+            body = "<!doctype html><html><body><main>Offline fixture</main></body></html>"
+        elif _is_offline_profile_url(route.request.url):
+            body = "<!doctype html><html><body><h1>Local profile</h1></body></html>"
+        else:
+            await route.abort()
+            return
+        await route.fulfill(status=200, content_type="text/html", body=body)
+
+    monkeypatch.setattr(
+        workflow,
+        "async_playwright",
+        lambda: _offline_playwright_manager(respond),
+    )
+
+    async def fail_during_home_open(reader: ThreadsHomeReader) -> None:
+        await reader._page.goto(HOME_URL, wait_until="domcontentloaded")
+        raise PlaywrightError("synthetic controlled failure")
+
+    monkeypatch.setattr(ThreadsHomeReader, "open_home", fail_during_home_open)
+    exit_code = main(
+        [
+            "run",
+            "offline",
+            "--scheduled",
+            "--term",
+            "hiring",
+            "--max-posts",
+            "1",
+            "--max-scrolls",
+            "0",
+            "--max-runtime-seconds",
+            "30",
+        ]
+    )
+    captured = capsys.readouterr()
+    status = json.loads(
+        (data_root / "operations" / "last_run.json").read_text(encoding="utf-8")
+    )
+
+    assert exit_code == 1
+    assert captured.out == ""
+    assert captured.err == "STOP UI_READ_UNVERIFIED\n"
+    assert status["status"] == "FAILED"
+    assert status["stop_reason"] == "UI_READ_UNVERIFIED"
+    assert status["exit_code"] == 1
+    assert "FAILURE_DIAGNOSTIC" not in captured.out + captured.err
+
+
+def test_scheduled_offline_chromium_cli_suppresses_reader_scroll_failure_details(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    actor = "offline.operator"
+    cards = "".join(
+        f'''<article class="card"><a href="/@candidate/post/scroll-failure-{index}">
+<time>now</time></a><a href="/@candidate">candidate</a>
+<p class="body">Synthetic weather update {index}.</p></article>'''
+        for index in range(14)
+    )
+    feed_html = f"""<!doctype html><html><head><meta charset="utf-8"><style>
+html, body {{ margin: 0; }}
+nav {{ height: 36px; }}
+main {{ display: block; }}
+.card {{ position: relative; height: 288px; }}
+.body {{ position: absolute; top: 108px; left: 12px; line-height: 24px; }}
+</style></head><body><nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main>{cards}</main></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "synthetic-profile"
+    profile.mkdir()
+    AccountStore(data_root).add("offline", actor, profile)
+    monkeypatch.setenv("THREADS_BROWSER_DATA_ROOT", str(data_root))
+    wheel_calls = 0
+
+    async def respond(route: Route) -> None:
+        if route.request.url == HOME_URL:
+            body = feed_html
+        elif _is_offline_profile_url(route.request.url):
+            body = "<!doctype html><html><body><h1>Local profile</h1></body></html>"
+        else:
+            await route.abort()
+            return
+        await route.fulfill(status=200, content_type="text/html", body=body)
+
+    async def fail_scroll(self, *_args) -> None:
+        nonlocal wheel_calls
+        wheel_calls += 1
+        raise PlaywrightError("synthetic controlled scroll failure")
+
+    monkeypatch.setattr(
+        workflow,
+        "async_playwright",
+        lambda: _offline_playwright_manager(respond),
+    )
+    monkeypatch.setattr(NativeWheelScrollEngine, "advance", fail_scroll)
+    exit_code = main(
+        [
+            "run",
+            "offline",
+            "--scheduled",
+            "--term",
+            "hiring",
+            "--max-posts",
+            "20",
+            "--max-scrolls",
+            "1",
+            "--max-total-posts",
+            "40",
+            "--max-runtime-seconds",
+            "60",
+        ]
+    )
+    captured = capsys.readouterr()
+    status = json.loads(
+        (data_root / "operations" / "last_run.json").read_text(encoding="utf-8")
+    )
+
+    assert wheel_calls == 1
+    assert exit_code == 1
+    assert captured.out == ""
+    assert captured.err == "STOP UI_READ_UNVERIFIED\n"
+    assert "FAILURE_DIAGNOSTIC" not in captured.out + captured.err
+    assert status["status"] == "FAILED"
+    assert status["stop_reason"] == "UI_READ_UNVERIFIED"
+    assert status["exit_code"] == 1
+
+
 def test_first_viewport_relevance_scrolls_then_reads_and_restores_home(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],

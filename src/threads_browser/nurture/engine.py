@@ -56,6 +56,7 @@ def _reader_playwright_error(
     *,
     phase: str,
     operation: str,
+    console_output_policy: ConsoleOutputPolicy = ConsoleOutputPolicy.INTERACTIVE,
 ) -> UiReadError:
     failure = classify_playwright_failure(page, error)
     emit_failure_diagnostic(
@@ -64,6 +65,7 @@ def _reader_playwright_error(
         error_class=failure.error_class,
         page_closed=failure.page_closed,
         context_closed=failure.context_closed,
+        console_output_policy=console_output_policy,
     )
     code = (
         "BROWSER_SESSION_UNAVAILABLE"
@@ -230,6 +232,7 @@ async def _run_page_workflow_cycle(
                 raw_error,
                 phase=state.phase.value,
                 operation="SETTLE",
+                console_output_policy=console_output_policy,
             )
         )
         state.stop(error.code)
@@ -276,6 +279,7 @@ async def _run_page_workflow_cycle(
                     raw_error,
                     phase=state.phase.value,
                     operation="SCROLL",
+                    console_output_policy=console_output_policy,
                 )
             )
             state.stop(error.code)
@@ -319,6 +323,7 @@ async def _run_page_workflow_cycle(
                         raw_error,
                         phase=state.phase.value,
                         operation="SCAN_ROW",
+                        console_output_policy=console_output_policy,
                     )
                 )
                 if error.code not in {
@@ -818,6 +823,7 @@ async def _run_page_workflow_cycle(
                     raw_error,
                     phase=state.phase.value,
                     operation="SCAN_ROW",
+                    console_output_policy=console_output_policy,
                 )
             )
             state.stop(error.code)
@@ -1219,6 +1225,7 @@ async def _run_page_workflow_cycle(
                     raw_error,
                     phase=state.phase.value,
                     operation="DETAIL",
+                    console_output_policy=console_output_policy,
                 )
             )
             if error.code not in _DETAIL_READ_FAILURES or not getattr(
@@ -1279,6 +1286,7 @@ async def _run_page_workflow_cycle(
                     raw_error,
                     phase=state.phase.value,
                     operation="BACK",
+                    console_output_policy=console_output_policy,
                 )
             )
             state.stop(error.code)
