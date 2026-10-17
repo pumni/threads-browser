@@ -4,6 +4,7 @@ import asyncio
 import re
 import tempfile
 import time
+from dataclasses import replace
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
@@ -117,6 +118,32 @@ def _offline_playwright_manager(respond):
             await self.playwright.stop()
 
     return OfflinePlaywrightManager()
+
+
+def _mock_persistent_browser(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    state = {"launches": 0}
+
+    class Context:
+        def __init__(self) -> None:
+            self.pages = [object()]
+
+        async def close(self) -> None:
+            pass
+
+    class Chromium:
+        async def launch_persistent_context(self, **_kwargs):
+            state["launches"] += 1
+            return Context()
+
+    class Manager:
+        async def __aenter__(self):
+            return SimpleNamespace(chromium=Chromium())
+
+        async def __aexit__(self, *_args):
+            pass
+
+    monkeypatch.setattr(workflow, "async_playwright", Manager)
+    return state
 
 
 @pytest.fixture(autouse=True)
@@ -4398,6 +4425,165 @@ def test_direct_browser_workflow_rejects_busy_profile_and_releases_on_failure(
         pass
 
 
+def test_public_page_workflow_holds_and_releases_the_profile_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = tmp_path / "dedicated-profile"
+    profile.mkdir()
+    account = BrowserAccount(uuid4(), "offline", "offline.operator", profile)
+    store = CheckpointStore(tmp_path / "data")
+    calls = 0
+
+    async def check_lock_held(_page, _account, _store, **_kwargs):
+        nonlocal calls
+        calls += 1
+        probe = store.profile_lock(account)
+        try:
+            probe.acquire()
+        except BrowserDataError as error:
+            assert error.code == "ACCOUNT_BUSY"
+        else:
+            probe.release()
+            pytest.fail("public page workflow did not hold the profile lock")
+        return SimpleNamespace(status="COMPLETE")
+
+    monkeypatch.setattr(workflow, "_execute_page_workflow", check_lock_held)
+
+    result = asyncio.run(
+        workflow.run_page_workflow(
+            object(), account, store, max_posts=1, terms=("hiring",)
+        )
+    )
+
+    assert result.status == "COMPLETE"
+    assert calls == 1
+    with store.profile_lock(account):
+        pass
+
+    with store.profile_lock(account), pytest.raises(BrowserDataError) as busy:
+        asyncio.run(
+            workflow.run_page_workflow(
+                object(), account, store, max_posts=1, terms=("hiring",)
+            )
+        )
+    assert busy.value.code == "ACCOUNT_BUSY"
+    assert calls == 1
+
+
+def test_concurrent_browser_workflows_reject_same_profile_before_checkpoint_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = tmp_path / "dedicated-profile"
+    profile.mkdir()
+    account = BrowserAccount(uuid4(), "offline", "offline.operator", profile)
+    store = CheckpointStore(tmp_path / "data")
+    policy = policy_fingerprint(("hiring",))
+    initial = Checkpoint(account.account_id, policy, completed_runs=7)
+    store.save(initial)
+    browser = _mock_persistent_browser(monkeypatch)
+    engine_entered = asyncio.Event()
+    allow_engine_to_finish = asyncio.Event()
+    checkpoint_access: list[str] = []
+    original_load = store.load
+
+    async def read_then_wait(_page, _account, checkpoint_store, **_kwargs):
+        checkpoint_access.append("load")
+        checkpoint = checkpoint_store.load(account.account_id, policy)
+        engine_entered.set()
+        await allow_engine_to_finish.wait()
+        checkpoint_access.append("save")
+        checkpoint_store.save(replace(checkpoint, completed_runs=8))
+        return SimpleNamespace(status="COMPLETE")
+
+    monkeypatch.setattr(workflow, "_execute_page_workflow", read_then_wait)
+
+    async def exercise() -> None:
+        first = asyncio.create_task(
+            workflow.run_browser_nurture(
+                account, store, max_posts=1, terms=("hiring",)
+            )
+        )
+        try:
+            await asyncio.wait_for(engine_entered.wait(), timeout=2)
+            with pytest.raises(BrowserDataError) as busy:
+                await workflow.run_browser_nurture(
+                    account, store, max_posts=1, terms=("hiring",)
+                )
+            assert busy.value.code == "ACCOUNT_BUSY"
+            assert browser["launches"] == 1
+            assert checkpoint_access == ["load"]
+            assert original_load(account.account_id, policy) == initial
+        finally:
+            allow_engine_to_finish.set()
+        await first
+
+    asyncio.run(exercise())
+
+    assert checkpoint_access == ["load", "save"]
+    assert original_load(account.account_id, policy).completed_runs == 8
+    with store.profile_lock(account):
+        pass
+
+
+def test_browser_workflows_for_different_profiles_can_run_concurrently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "data"
+    accounts = tuple(
+        BrowserAccount(
+            uuid4(),
+            f"offline-{index}",
+            "offline.operator",
+            tmp_path / f"profile-{index}",
+        )
+        for index in (1, 2)
+    )
+    for account in accounts:
+        account.profile_directory.mkdir()
+    store = CheckpointStore(root)
+    browser = _mock_persistent_browser(monkeypatch)
+    entered_profiles: list[Path] = []
+    both_entered = asyncio.Event()
+    allow_completion = asyncio.Event()
+
+    async def wait_for_peer(_page, account, _store, **_kwargs):
+        entered_profiles.append(account.profile_directory)
+        if len(entered_profiles) == 2:
+            both_entered.set()
+        await allow_completion.wait()
+        return SimpleNamespace(status="COMPLETE")
+
+    monkeypatch.setattr(workflow, "_execute_page_workflow", wait_for_peer)
+
+    async def exercise() -> None:
+        attempts = [
+            asyncio.create_task(
+                workflow.run_browser_nurture(
+                    account, store, max_posts=1, terms=("hiring",)
+                )
+            )
+            for account in accounts
+        ]
+        try:
+            await asyncio.wait_for(both_entered.wait(), timeout=2)
+            assert browser["launches"] == 2
+        finally:
+            allow_completion.set()
+        await asyncio.gather(*attempts)
+
+    asyncio.run(exercise())
+
+    assert set(entered_profiles) == {
+        account.profile_directory for account in accounts
+    }
+    for account in accounts:
+        with store.profile_lock(account):
+            pass
+
+
 def test_browser_runtime_timeout_during_launch_releases_profile_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4518,7 +4704,7 @@ def test_browser_runtime_timeout_during_active_detail_closes_context_and_release
 
     monkeypatch.setattr(workflow, "async_playwright", Manager)
     monkeypatch.setattr(workflow, "_detail_terminal_ready", lambda: True)
-    monkeypatch.setattr(workflow, "run_page_workflow", wait_in_detail)
+    monkeypatch.setattr(workflow, "_run_page_workflow_unlocked", wait_in_detail)
 
     with pytest.raises(UiReadError) as caught:
         asyncio.run(
@@ -4573,7 +4759,7 @@ def test_external_browser_cancellation_propagates_after_cleanup(
         await asyncio.Event().wait()
 
     monkeypatch.setattr(workflow, "async_playwright", Manager)
-    monkeypatch.setattr(workflow, "run_page_workflow", wait_for_cancellation)
+    monkeypatch.setattr(workflow, "_run_page_workflow_unlocked", wait_for_cancellation)
 
     async def exercise() -> None:
         task = asyncio.create_task(
@@ -4599,9 +4785,11 @@ def test_external_browser_cancellation_propagates_after_cleanup(
         pass
 
 
-def test_browser_cleanup_timeout_is_reported_after_successful_cycle(
+@pytest.mark.parametrize("failure", ("timeout", "exception"))
+def test_browser_cleanup_failure_is_reported_after_successful_cycle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    failure: str,
 ) -> None:
     profile = tmp_path / "dedicated-profile"
     profile.mkdir()
@@ -4614,7 +4802,9 @@ def test_browser_cleanup_timeout_is_reported_after_successful_cycle(
             self.pages = [object()]
 
         async def close(self):
-            await asyncio.Event().wait()
+            if failure == "timeout":
+                await asyncio.Event().wait()
+            raise RuntimeError("synthetic cleanup failure")
 
     class Chromium:
         async def launch_persistent_context(self, **_kwargs):
@@ -4631,8 +4821,9 @@ def test_browser_cleanup_timeout_is_reported_after_successful_cycle(
         return SimpleNamespace(status="COMPLETE")
 
     monkeypatch.setattr(workflow, "async_playwright", Manager)
-    monkeypatch.setattr(workflow, "run_page_workflow", successful_cycle)
-    monkeypatch.setattr(workflow, "_CLEANUP_ALLOWANCE_SECONDS", 0.01)
+    monkeypatch.setattr(workflow, "_run_page_workflow_unlocked", successful_cycle)
+    if failure == "timeout":
+        monkeypatch.setattr(workflow, "_CLEANUP_ALLOWANCE_SECONDS", 0.01)
 
     with pytest.raises(UiReadError) as caught:
         asyncio.run(

@@ -291,6 +291,88 @@ def test_detail_cli_supports_short_and_legacy_run_without_duplicate_opt_in_text(
     assert "STOP RETURN_CONTEXT_CHANGED" not in failed.err
 
 
+def test_cli_run_uses_the_workflow_lock_once(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    root = tmp_path / "private-root"
+    profile = tmp_path / "synthetic-profile"
+    profile.mkdir()
+    monkeypatch.setenv("THREADS_BROWSER_DATA_ROOT", str(root))
+    assert main(
+        [
+            "account",
+            "add",
+            "pilot",
+            "--actor",
+            "offline.operator",
+            "--profile-dir",
+            str(profile),
+        ]
+    ) == 0
+    TermsStore(root).set("pilot", ("hiring",))
+    capsys.readouterr()
+
+    state = {"launches": 0, "workflow_calls": 0}
+
+    class Context:
+        def __init__(self) -> None:
+            self.pages = [object()]
+
+        async def close(self) -> None:
+            pass
+
+    class Chromium:
+        async def launch_persistent_context(self, **_kwargs):
+            state["launches"] += 1
+            return Context()
+
+    class Manager:
+        async def __aenter__(self):
+            return SimpleNamespace(chromium=Chromium())
+
+        async def __aexit__(self, *_args):
+            pass
+
+    async def check_single_lock(_page, account, checkpoint_store, **_kwargs):
+        state["workflow_calls"] += 1
+        probe = checkpoint_store.profile_lock(account)
+        try:
+            probe.acquire()
+        except BrowserDataError as error:
+            assert error.code == "ACCOUNT_BUSY"
+        else:
+            probe.release()
+            pytest.fail("CLI workflow did not hold the profile lock")
+        return SimpleNamespace(
+            status="NO_VERIFIED_POSTS_IN_BUDGET",
+            stop_reason="NO_VERIFIED_POSTS_IN_BUDGET",
+            ui_status="UNVERIFIED_LIVE_UI",
+            home_sampled=0,
+            home_new=0,
+            home_relevant=0,
+            home_irrelevant=0,
+            home_unknown=0,
+            home_relevant_ratio=None,
+            duplicates=0,
+            detail_reads=0,
+            scroll_attempts=0,
+            scrolls=0,
+            skipped_unverified=0,
+            checkpoint_runs=0,
+        )
+
+    monkeypatch.setattr(workflow, "async_playwright", Manager)
+    monkeypatch.setattr(workflow, "_execute_page_workflow", check_single_lock)
+
+    assert main(["run", "pilot", "--max-posts", "1", "--term", "hiring"]) == 0
+    captured = capsys.readouterr()
+
+    assert "NURTURE status=NO_VERIFIED_POSTS_IN_BUDGET" in captured.out
+    assert state == {"launches": 1, "workflow_calls": 1}
+
+
 def test_runtime_budget_and_prompt_suppression_reach_short_and_legacy_workflows(
     tmp_path: Path,
     monkeypatch,

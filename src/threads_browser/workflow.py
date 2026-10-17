@@ -50,6 +50,41 @@ async def run_page_workflow(
     show_observed_text: bool = False,
     detail: bool = False,
 ) -> NurtureResult:
+    """Run the page workflow while protecting its checkpoint transaction."""
+    lock = checkpoint_store.profile_lock(account)
+    lock.acquire()
+    try:
+        return await _run_page_workflow_unlocked(
+            page,
+            account,
+            checkpoint_store,
+            max_posts=max_posts,
+            terms=terms,
+            max_scrolls=max_scrolls,
+            max_total_posts=max_total_posts,
+            readiness_prompt=readiness_prompt,
+            show_post_text=show_post_text,
+            show_observed_text=show_observed_text,
+            detail=detail,
+        )
+    finally:
+        lock.release()
+
+
+async def _run_page_workflow_unlocked(
+    page: Page,
+    account: BrowserAccount,
+    checkpoint_store: CheckpointStore,
+    *,
+    max_posts: int,
+    terms: tuple[str, ...],
+    max_scrolls: int = 8,
+    max_total_posts: int = 40,
+    readiness_prompt: Callable[[str, int], Awaitable[bool]] | None = None,
+    show_post_text: bool = False,
+    show_observed_text: bool = False,
+    detail: bool = False,
+) -> NurtureResult:
     try:
         return await _execute_page_workflow(
             page,
@@ -135,7 +170,6 @@ async def run_browser_nurture(
         not math.isfinite(max_runtime_seconds) or max_runtime_seconds <= 0
     ):
         raise UiReadError("RUNTIME_LIMIT_INVALID")
-    ensure_safe_browser_profile(account.profile_directory)
     lock = checkpoint_store.profile_lock(account)
     lock.acquire()
     playwright_manager = None
@@ -143,6 +177,7 @@ async def run_browser_nurture(
     context = None
     timeout_scope = None
     try:
+        ensure_safe_browser_profile(account.profile_directory)
         timeout_scope = asyncio.timeout(max_runtime_seconds)
         try:
             async with timeout_scope:
@@ -154,7 +189,7 @@ async def run_browser_nurture(
                     headless=False,
                 )
                 page = context.pages[0] if context.pages else await context.new_page()
-                return await run_page_workflow(
+                return await _run_page_workflow_unlocked(
                     page,
                     account,
                     checkpoint_store,

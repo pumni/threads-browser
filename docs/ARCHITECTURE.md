@@ -38,7 +38,7 @@ src/threads_browser/
 - `browser_ui.card_provenance` owns card-level canonical permalink, author and body verification, ambiguous-row recovery, stable-card revalidation and the run-local Home body cache. It composes `FeedRowScanner`, `BodyTextReader` and `LoadingObserver`; the reader facade retains scan orchestration, counters, fallback permalink traversal and compatibility wrappers.
 - `reader` preserves the current Python API and composes the UI operations for Home observation. It does not access checkpoint files or choose relevance policy.
 - `nurture.engine` coordinates the reader and checkpoint store. `nurture.state` owns the finite run phases, coverage ledger, dedupe ledger and run statistics; diagnostics stay separate from those decisions.
-- `workflow` preserves the current application entry points and owns only the headed browser context lifecycle. It delegates each page run to `nurture.engine`.
+- `workflow` preserves the current application entry points and owns the headed browser context and shared profile-lock lifecycle. Direct page runs hold the same profile lock through checkpoint persistence; browser-owned runs call the internal page runner while retaining that lock. It delegates each page run to `nurture.engine`.
 - `storage` owns persisted account references, terms, locks and versioned fingerprints; never store raw post bodies, cookies or raw URLs.
 - `login` and `account_service` own interactive session establishment; `cli` is only an adapter around these application entry points.
 
