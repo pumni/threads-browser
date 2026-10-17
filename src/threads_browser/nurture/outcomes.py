@@ -103,12 +103,12 @@ class CycleOutcomeResolver:
                 _detail_stop("NO_ACTIONABLE_TARGET")
             self._state.stop("NO_ACTIONABLE_TARGET")
             return self._result("NO_ACTIONABLE_TARGET", checkpoint_runs=checkpoint_runs)
-        elif not self._dedupe.seen_this_run and not self._coverage.has_skips:
+        elif not self._dedupe.home_observed_this_session and not self._coverage.has_skips:
             if self._show_post_text and self._stats.previewed_bodies == 0:
                 emit_console_diagnostic(
                     self._console_output_policy,
                     "POST_TEXT status=NONE "
-                    f"verified_posts={len(self._dedupe.seen_this_run)} "
+                    f"verified_posts={len(self._dedupe.home_observed_this_session)} "
                     f"extracted={self._stats.previewed_bodies}",
                 )
             status = (
@@ -147,7 +147,10 @@ class CycleOutcomeResolver:
             status = "FEED_END_REACHED"
         elif exhaustion_reason == "FEED_NOT_SCROLLABLE":
             status = "FEED_NOT_SCROLLABLE"
-        elif self._stats.unverified_relevant and not self._dedupe.seen_this_run:
+        elif (
+            self._stats.unverified_relevant
+            and not self._dedupe.home_observed_this_session
+        ):
             status = "OBSERVED_UNVERIFIED_ONLY"
         elif self._stats.found_relevant or self._stats.relevant:
             status = "NO_NEW_RELEVANT_POST"

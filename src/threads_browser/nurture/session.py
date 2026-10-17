@@ -68,7 +68,7 @@ async def run_page_workflow_session(
                 status="SESSION_BUDGET_EXHAUSTED",
                 stop_reason="MAX_DETAIL_READS",
             )
-        if len(progress.dedupe.seen_this_run) >= max_total_posts:
+        if len(progress.dedupe.home_observed_this_session) >= max_total_posts:
             return _finalize_session(
                 progress,
                 reader,
@@ -117,7 +117,7 @@ async def run_page_workflow_session(
 
         result = await finish_cycle(context)
         if context.detail_reads:
-            if len(progress.dedupe.seen_this_run) >= max_total_posts:
+            if len(progress.dedupe.home_observed_this_session) >= max_total_posts:
                 return _finalize_session(
                     progress,
                     reader,

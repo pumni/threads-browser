@@ -40,14 +40,20 @@ class CheckpointCommitter:
     ) -> Checkpoint:
         if len(dedupe.pending) > _MAX_SEEN:
             raise BrowserDataError("STATE_INVALID")
-        seen = list(dict.fromkeys((*previous.seen_fingerprints, *dedupe.seen_this_run)))
+        seen = list(
+            dict.fromkeys(
+                (*previous.seen_fingerprints, *dedupe.home_observed_this_session)
+            )
+        )
         if len(seen) > _MAX_SEEN:
             retained_pending = [value for value in seen if value in dedupe.pending_set]
             recent = [value for value in seen if value not in dedupe.pending_set]
             available = _MAX_SEEN - len(retained_pending)
             seen = retained_pending + (recent[-available:] if available else [])
         observed = (
-            dedupe.seen_this_run if observed_fingerprints is None else observed_fingerprints
+            dedupe.home_observed_this_session
+            if observed_fingerprints is None
+            else observed_fingerprints
         )
         newly_seen = (
             dedupe.new_fingerprints if new_fingerprints is None else new_fingerprints

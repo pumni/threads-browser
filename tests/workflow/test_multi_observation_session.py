@@ -555,13 +555,14 @@ def test_wrong_detail_identity_in_later_segment_preserves_prior_checkpoint(
             terms=("hiring",),
             max_scrolls=8,
             max_total_posts=20,
-            max_detail_reads=2,
+            max_detail_reads=4,
             max_runtime_seconds=60,
         )
     )
 
     checkpoint = store.load(account.account_id, policy_fingerprint(("hiring",)))
     assert len(detail_visits) == 2
+    assert len(set(detail_visits)) == 2
     assert len(prior_checkpoints) == 1
     assert result.status == "DETAIL_RETRY_PENDING"
     assert result.detail_reads == 1

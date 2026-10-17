@@ -63,12 +63,20 @@ class DetailBackCoordinator:
         selected_number: int,
         selected_decision: str,
     ) -> DetailCycleOutcome:
+        if selected.fingerprint in self._dedupe.detail_attempted_this_session:
+            self._state.stop("DETAIL_IDENTITY_ALREADY_ATTEMPTED")
+            emit_console_diagnostic(
+                self._console_output_policy,
+                "[DETAIL] status=STOPPED code=DETAIL_IDENTITY_ALREADY_ATTEMPTED",
+            )
+            raise UiReadError("DETAIL_IDENTITY_ALREADY_ATTEMPTED")
+        self._dedupe.detail_attempted_this_session.add(selected.fingerprint)
         self._state.transition(WorkflowPhase.SELECTING)
         if self._detail:
             if selected_decision == "RELEVANT":
                 reason = (
                     "RELEVANT_PENDING"
-                    if selected.fingerprint in self._dedupe.previously_seen
+                    if selected.fingerprint in self._dedupe.checkpoint_seen
                     else "RELEVANT_NEW"
                 )
                 emit_console_diagnostic(
@@ -87,6 +95,7 @@ class DetailBackCoordinator:
         retry_pending = False
         try:
             detail_target = await self._reader.read_detail(selected)
+            self._dedupe.detail_read_this_session.add(selected.fingerprint)
         except (UiReadError, PlaywrightError) as raw_error:
             error = (
                 raw_error

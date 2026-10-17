@@ -74,7 +74,7 @@ def test_result_snapshot_contract(
         seen_fingerprints=("previous-post",),
         pending_fingerprints=("pending-post",),
     )
-    dedupe.seen_this_run.update(("current-one", "current-two"))
+    dedupe.home_observed_this_session.update(("current-one", "current-two"))
     dedupe.new_fingerprints.update(("current-one", "current-two"))
     stats = WorkflowStats(
         duplicates=3,

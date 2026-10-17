@@ -68,7 +68,9 @@ def _result_from_observation(
     Callers may set ``checkpoint_saved`` only after the checkpoint store commits.
     An existing ``checkpoint_runs`` value alone never marks this attempt saved.
     """
-    home_sampled = len(dedupe.seen_this_run) if report_home_counts else 0
+    home_sampled = (
+        len(dedupe.home_observed_this_session) if report_home_counts else 0
+    )
     home_new = len(dedupe.new_fingerprints) if report_home_counts else 0
     return NurtureResult(
         status=status,
