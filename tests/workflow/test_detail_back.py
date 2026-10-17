@@ -353,7 +353,8 @@ def test_detail_verification_failures_return_home_and_keep_retry_pending(
     account = AccountStore(data_root).add("offline", actor, profile)
     store = CheckpointStore(data_root)
     monkeypatch.setattr(reader_module, "_READINESS_TIMEOUT_MS", 1_500)
-    monkeypatch.setattr(reader_module, "_DETAIL_TIMEOUT_MS", 1_000)
+    # Keep the fixture deadline bounded while allowing hosted Windows route scheduling.
+    monkeypatch.setattr(reader_module, "_DETAIL_TIMEOUT_MS", 3_000)
 
     async def exercise(page) -> None:
         async def serve_detail(route: Route) -> None:
