@@ -60,10 +60,10 @@ def _is_offline_profile_url(url: str) -> bool:
     )
 
 
-def _run_offline_page(html: str, exercise) -> None:
+def _run_offline_page(html: str, exercise, *, headless: bool = True) -> None:
     async def run() -> None:
         async with real_async_playwright() as playwright:
-            browser = await playwright.chromium.launch()
+            browser = await playwright.chromium.launch(headless=headless)
             context = await browser.new_context(viewport={"width": 1280, "height": 720})
 
             async def respond(route: Route) -> None:
@@ -7506,7 +7506,7 @@ main {{ display: block; }}
         assert result.detail_reads == 0
         assert page.url == HOME_URL
 
-    _run_offline_page(feed_html, exercise)
+    _run_offline_page(feed_html, exercise, headless=False)
     output = capsys.readouterr().out
     scroll_deltas = [
         float(value)
@@ -7599,7 +7599,7 @@ main {{ display: block; }}
         assert result.detail_reads == 0
         assert page.url == HOME_URL
 
-    _run_offline_page(feed_html, exercise)
+    _run_offline_page(feed_html, exercise, headless=False)
     output = capsys.readouterr().out
     scroll_deltas = [
         float(value)
