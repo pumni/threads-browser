@@ -100,6 +100,9 @@ class NurtureResult:
     unique_verified_posts: int = 0
     unique_deferred_posts: int = 0
     unresolved_gaps: int = 0
+    visible_text_segments: int = 0
+    stop_reason: str = "UNKNOWN"
+    checkpoint_saved: bool = False
     read_in_progress: int = 0
     unresolved_observations: int = 0
     unrepresented_gaps: int = 0
@@ -107,9 +110,6 @@ class NurtureResult:
     stranded_body_ranges: int = 0
     lookahead_rows: int = 0
     gap_category: str = "NONE"
-    visible_text_segments: int = 0
-    stop_reason: str = "UNKNOWN"
-    checkpoint_saved: bool = False
 
 
 def _result_from_observation(
