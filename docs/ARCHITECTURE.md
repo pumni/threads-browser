@@ -5,13 +5,24 @@ This is a small modular monolith, not a service/microservice system.
 ```text
 src/threads_browser/
   __init__.py, __main__.py   Public Python API and CLI module entry
-  cli.py                     Argument parsing, terminal UX, result formatting
+  cli.py                     Command dispatch and managed CLI lifecycle
+  cli_arguments.py           Short and legacy command trees
+  cli_results.py             Privacy-safe aggregate result formatting
+  cli_status.py              Scheduled status transitions and checkpoint lookup
   account_service.py         Account creation and profile-lock orchestration
   login.py                   Human-operated persistent Chromium login
   reader.py                  Compatibility API and UI collaborator composition
   reader_facade/              Feature-group compatibility methods for ThreadsHomeReader
   workflow.py                Compatibility API and headed browser lifecycle
-  storage.py                 Accounts, terms, profile locks, checkpoints and scheduled status
+  storage.py                 Compatibility facade for persistence imports
+  persistence/
+    accounts.py              Account records, actor binding and OS profile locks
+    checkpoints.py           Checkpoint v3 validation and atomic persistence
+    filesystem.py            Private-root and atomic JSON primitives
+    models.py                Redacted account/checkpoint values and storage errors
+    operations.py            Allowlisted latest-run schema and lifecycle validation
+    schema.py                Fixed schema keys, error codes and bounds
+    terms.py                 Per-account literal relevance terms
   errors.py                  Shared UI failure type
   browser_ui/
     geometry.py              Shared viewport and nested-scrollport geometry
@@ -50,8 +61,8 @@ src/threads_browser/
 - `reader` preserves the current Python API and composes the UI operations for Home observation. It does not access checkpoint files or choose relevance policy.
 - `nurture.engine` validates cycles and assembles reader collaborators. `nurture.session` owns the bounded loop that repeats scan and Detail/Back cycles; `nurture.session_state` owns the shared dedupe, coverage and metric ledgers plus checkpoint deltas. `nurture.state` owns the finite phases and per-cycle measurements.
 - `workflow` owns the headed browser context and shared profile-lock lifecycle. Its public persistent-profile entry points are `run_browser_nurture` for one compatible cycle and `run_browser_nurture_session` for multiple observations inside one context. Both acquire the profile lock before browser startup and hold it through checkpoint persistence and browser shutdown attempts. The private page runners require that lock to be held by their caller and must not acquire it again. There is no supported caller-owned `Page` workflow API.
-- `storage` owns persisted account references, terms, locks and versioned fingerprints; never store raw post bodies, cookies or raw URLs.
-- `login` and `account_service` own interactive session establishment; `cli` is only an adapter around these application entry points.
+- `persistence` owns account references, terms, profile locks, checkpoint v3 and the single latest-operation status file. Its filesystem helpers validate the private root and atomically replace bounded JSON. It never stores raw post bodies, cookies or raw URLs. `storage.py` remains the compatibility import facade.
+- `login` and `account_service` own interactive session establishment. `cli.py` dispatches commands; `cli_arguments`, `cli_results`, and `cli_status` separately own parsing, output formatting, and scheduled-run summary transitions.
 
 ## Responsibility boundaries
 
@@ -72,10 +83,11 @@ browser_ui ──> feed, errors, Playwright
 reader ──> browser_ui, feed
 nurture ──> reader, browser_ui, feed, storage, cycle state
 workflow ──> nurture.engine / nurture.session, storage, browser lifecycle
-cli ──> application entry points
+cli ──> application entry points, storage facade
+storage ──> persistence components
 ```
 
-Existing `threads_browser.reader` APIs and `threads_browser.workflow.run_browser_nurture` remain compatibility APIs. The new `run_browser_nurture_session` uses the same lock and headed persistent context while keeping a single global runtime, scroll, verified-post and Detail-read budget. Its CLI command is foreground and attended; it has no scheduled mode. Runtime reserves up to five seconds each for context close and Playwright shutdown. The page runners remain private and can only run inside an owner-held profile-lock lifecycle. New browser interaction code belongs in `browser_ui`; pure feed policy and canonical data belong in `feed`. The reader remains the integration point for feed scans so changes to geometry, row recognition, body hydration and Detail can be tested independently.
+Existing `threads_browser.reader`, `threads_browser.storage`, `threads_browser.workflow.run_browser_nurture`, and `run_browser_nurture_session` imports remain compatibility APIs. A multi-observation session uses the same lock and headed persistent context while keeping a single global runtime, scroll, verified-post and Detail-read budget. Its CLI command is foreground and attended; it has no scheduled mode. Runtime reserves up to five seconds each for context close and Playwright shutdown. The page runners remain private and can only run inside an owner-held profile-lock lifecycle. New browser interaction code belongs in `browser_ui`; pure feed policy and canonical data belong in `feed`; persistence code stays under `persistence`. The reader remains the integration point for feed scans so changes to geometry, row recognition, body hydration and Detail can be tested independently.
 
 ## Evolution
 
@@ -87,4 +99,4 @@ The earlier `feed` extraction's no-behavior-change scope applied to that refacto
 
 `browser_ui.session` verifies the For You shell and account route, and `browser_ui.detail` returns with browser history and revalidates the selected post identity without a second Profile visit. Back does not depend on the post returning to its former screen coordinate. Wheel input, locators, route waits and native scroll events are the default. Shared geometry identifies an actual nested scroll surface, intersects document and nested scrollports for row eligibility, and confirms measured displacement. `feed_rows` discovers candidates, `body_text` tracks visible text fragments and hydration, and each observation is handed to `nurture.engine` immediately. Offscreen rows with verified identity are deferred through overlapping wheel steps; a partial or unknown row is skipped while later verified rows remain eligible. Before a Detail click, the reader revalidates the selected post's canonical identity, author and body, then uses Playwright mouse input at a visible, unobstructed permalink point so the click cannot auto-scroll an offscreen row into view.
 
-`--detail` can report operator-only `discover_ms`, `read_row_ms`, `stabilize_ms` and a fixed `wait_reason` per viewport. These timings contain no body text, actor or URL. Verified observations and unverified display text remain distinct; printing an observation does not make it checkpoint eligible. Partial and unknown rows do not block a later verified selection. Detail verification uses the exact selected route and one unique matching primary body; a main landmark or repeated author/permalink is not required when the route supplies identity, while conflicting identity evidence rejects the Detail. If Detail remains unavailable after bounded waits, one Back attempt can preserve the verified Home observations and leave the selected post pending when Home, account and selected-post identity are reverified. Operator cancellation, navigation or blocker errors, and a lost return context prevent checkpoint completion. The checkpoint atomically records Home observations and successful Detail/Back counts; skipped rows remain eligible for a later cycle, and a run with skips reports `COMPLETE_WITH_SKIPS` while leaving viewport coverage incomplete.
+`--detail` can report operator-only `discover_ms`, `read_row_ms`, `stabilize_ms` and a fixed `wait_reason` per viewport. These timings contain no body text, actor or URL. Verified observations and unverified display text remain distinct; printing an observation does not make it checkpoint eligible. Partial and unknown rows do not become Detail targets or checkpoint input, though a single-cycle run can save other verified observations and report `COMPLETE_WITH_SKIPS` with incomplete viewport coverage. Multi-observation sessions require a safe complete boundary before each Detail read and commit; a later coverage gap stops continuation while earlier committed progress remains. Detail verification uses the exact selected route and one unique matching primary body; a main landmark or repeated author/permalink is not required when the route supplies identity, while conflicting identity evidence rejects the Detail. If Detail remains unavailable after bounded waits, one Back attempt can preserve the verified Home observations and leave the selected post pending when Home, account and selected-post identity are reverified. Operator cancellation, navigation or blocker errors, and a lost return context prevent checkpoint completion.

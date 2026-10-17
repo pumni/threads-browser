@@ -6,13 +6,14 @@ from uuid import uuid4
 
 import pytest
 
-from threads_browser import storage as storage_module
+from threads_browser.persistence import accounts as account_storage_module
 from threads_browser.storage import (
     AccountStore,
     BrowserDataError,
     Checkpoint,
     CheckpointStore,
     profile_lock,
+    write_operation_status,
 )
 
 
@@ -86,6 +87,55 @@ def test_checkpoint_resume_is_strict_atomic_and_contains_only_fingerprints(
         store.load(account_id, policy)
     assert caught.value.code == "STATE_INVALID"
     assert checkpoint_path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "changes",
+    (
+        {"status": "COMPLETE", "exit_code": 0, "checkpoint_runs": None},
+        {"status": "COMPLETE", "exit_code": 0, "checkpoint_runs": 0},
+        {"status": "COMPLETE", "exit_code": 1, "checkpoint_runs": 1},
+        {"status": "FAILED", "exit_code": 0},
+        {"status": "FAILED", "exit_code": 2},
+        {"status": "STOPPED", "finished_at": None},
+        {"status": "RUNNING", "finished_at": "2026-10-17T00:00:00.000Z"},
+    ),
+)
+def test_operation_status_rejects_untruthful_terminal_states_without_overwrite(
+    tmp_path: Path,
+    changes: dict[str, object],
+) -> None:
+    root = tmp_path / "private-root"
+    document: dict[str, object] = {
+        "schema_version": 1,
+        "started_at": "2026-10-17T00:00:00.000Z",
+        "finished_at": None,
+        "duration_seconds": 0.0,
+        "status": "RUNNING",
+        "cycle_status": None,
+        "stop_reason": "RUNNING",
+        "exit_code": None,
+        "checkpoint_runs": None,
+        "counters": {},
+    }
+    write_operation_status(root, document)
+    status_path = root / "operations" / "last_run.json"
+    running_bytes = status_path.read_bytes()
+    document.update(
+        finished_at="2026-10-17T00:00:01.000Z",
+        cycle_status="COMPLETE",
+        stop_reason="COMPLETE",
+        exit_code=0,
+        checkpoint_runs=1,
+        status="COMPLETE",
+    )
+    document.update(changes)
+
+    with pytest.raises(BrowserDataError) as caught:
+        write_operation_status(root, document)
+
+    assert caught.value.code == "STATE_INVALID"
+    assert status_path.read_bytes() == running_bytes
 
 
 def test_account_registration_rejects_invalid_alias_and_missing_profile(
@@ -318,7 +368,7 @@ def test_account_creation_rejects_symlinked_parent_paths(
     except (OSError, NotImplementedError):
         link.mkdir()
         monkeypatch.setattr(
-            storage_module,
+            account_storage_module,
             "_is_link_or_junction",
             lambda path: path == link,
         )

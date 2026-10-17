@@ -5,14 +5,21 @@ from __future__ import annotations
 import argparse
 import asyncio
 import math
-import re
 import sys
 from collections.abc import Sequence
-from datetime import UTC, datetime
 from pathlib import Path
-from time import monotonic
 
 from .account_service import add_local_account, open_account_login
+from .cli_arguments import _parser
+from .cli_results import _format_result
+from .cli_status import (
+    _finish_scheduled_status,
+    _mark_scheduled_failure,
+    _mark_scheduled_result,
+    _new_scheduled_status,
+    _record_known_checkpoint_runs,
+    _safe_status_code,
+)
 from .console_output import ConsoleOutputPolicy
 from .login import LoginStatus
 from .storage import (
@@ -24,223 +31,6 @@ from .storage import (
     resolve_data_root,
     write_operation_status,
 )
-
-
-def _add_legacy_registration_options(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--actor", help="expected visible Threads actor for an existing profile")
-    parser.add_argument("--profile-dir", type=Path)
-    parser.add_argument(
-        "--create-profile",
-        action="store_true",
-        help="create the absent dedicated Chromium profile directory",
-    )
-
-
-def _add_run_options(parser: argparse.ArgumentParser, *, legacy: bool) -> None:
-    parser.add_argument(
-        "--headed",
-        action="store_true",
-        help="accepted for compatibility; Chromium is always visible",
-    )
-    parser.add_argument(
-        "--show-post-text",
-        action="store_true",
-        help="print verified extracted post text to an interactive terminal",
-    )
-    parser.add_argument(
-        "--show-observed-text",
-        action="store_true",
-        help="print identity-unverified observed text to an interactive terminal",
-    )
-    parser.add_argument(
-        "--detail",
-        action="store_true",
-        help="print an operational trace and extracted post text to an interactive terminal",
-    )
-    parser.add_argument(
-        "--max-posts",
-        required=legacy,
-        type=int,
-        default=None if legacy else 20,
-        help="maximum visible post rows per viewport (1-20; default: 20)",
-    )
-    parser.add_argument(
-        "--max-scrolls",
-        type=int,
-        default=8,
-        help="maximum observed read-only feed advances (0-20; default: 8)",
-    )
-    parser.add_argument(
-        "--max-total-posts",
-        type=int,
-        default=40,
-        help="maximum distinct verified posts per run (1-400; default: 40)",
-    )
-    parser.add_argument(
-        "--max-runtime-seconds",
-        type=float,
-        help="optional maximum browser workflow runtime in seconds",
-    )
-    parser.add_argument(
-        "--no-readiness-prompt",
-        action="store_true",
-        help="stop when readiness checks expire instead of waiting for operator input",
-    )
-    parser.add_argument(
-        "--scheduled",
-        action="store_true",
-        help="write a sanitized latest-run summary and suppress operator readiness prompts",
-    )
-    parser.add_argument(
-        "-t",
-        "--term",
-        action="append",
-        dest="terms",
-        required=legacy,
-        help="one-time local relevance term; repeat for more terms",
-    )
-
-
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="tb")
-    commands = parser.add_subparsers(dest="command", required=True)
-
-    add = commands.add_parser("add", help="create a local account")
-    add.add_argument("alias")
-    _add_legacy_registration_options(add)
-
-    login = commands.add_parser("login", help="open an account's persistent Chromium profile")
-    login.add_argument("alias")
-
-    commands.add_parser("ls", help="list local account aliases and verification status")
-
-    terms = commands.add_parser("terms", help="view or replace an account's nurture terms")
-    terms.add_argument("alias")
-    terms.add_argument("terms", nargs="*", help="replacement relevance terms")
-    terms.add_argument("--clear", action="store_true", help="clear saved relevance terms")
-
-    run = commands.add_parser("run", help="run bounded, read-only nurture")
-    run.add_argument("alias")
-    _add_run_options(run, legacy=False)
-
-    session = commands.add_parser(
-        "session",
-        help="continue bounded feed observations and verified Detail reads in one headed session",
-    )
-    session.add_argument("alias")
-    session.add_argument(
-        "--max-posts",
-        type=int,
-        default=20,
-        help="maximum visible post rows per viewport (1-20; default: 20)",
-    )
-    session.add_argument(
-        "--max-scrolls",
-        required=True,
-        type=int,
-        help="maximum measured feed advances for the whole browser session (0-20)",
-    )
-    session.add_argument(
-        "--max-total-posts",
-        required=True,
-        type=int,
-        help="maximum distinct verified posts for the whole session (1-400)",
-    )
-    session.add_argument(
-        "--max-detail-reads",
-        required=True,
-        type=int,
-        help="maximum Detail reads for the whole session (1-40)",
-    )
-    session.add_argument(
-        "--max-runtime-seconds",
-        required=True,
-        type=float,
-        help="maximum total session duration including cleanup (>10 and <=3600)",
-    )
-    session.add_argument(
-        "--no-readiness-prompt",
-        action="store_true",
-        help="stop when readiness checks expire instead of waiting for operator input",
-    )
-    session.add_argument(
-        "-t",
-        "--term",
-        action="append",
-        dest="terms",
-        help="one-time local relevance term; repeat for more terms",
-    )
-
-    account = commands.add_parser("account", help="legacy account management commands")
-    account_commands = account.add_subparsers(dest="account_command", required=True)
-    legacy_add = account_commands.add_parser(
-        "add", help="create a local account or register a dedicated profile"
-    )
-    legacy_add.add_argument("alias")
-    _add_legacy_registration_options(legacy_add)
-    legacy_login = account_commands.add_parser(
-        "login", help="open the account's persistent Chromium profile"
-    )
-    legacy_login.add_argument("alias")
-    legacy_login.add_argument(
-        "--headed",
-        action="store_true",
-        help="accepted for compatibility; login is always visible",
-    )
-
-    nurture = commands.add_parser("nurture", help="legacy bounded nurture command")
-    nurture_commands = nurture.add_subparsers(dest="nurture_command", required=True)
-    legacy_run = nurture_commands.add_parser(
-        "run", help="search Home / For You within bounded budgets"
-    )
-    legacy_run.add_argument("alias")
-    _add_run_options(legacy_run, legacy=True)
-    return parser
-
-
-def _format_result(result: object) -> str:
-    ratio_value = result.home_relevant_ratio
-    ratio = "n/a" if ratio_value is None else f"{ratio_value:.2f}"
-    return (
-        f"NURTURE status={result.status} "
-        "source=HOME_FOR_YOU "
-        f"stop_reason={getattr(result, 'stop_reason', 'UNKNOWN')} "
-        f"ui={result.ui_status} "
-        f"home_sampled={result.home_sampled} "
-        f"home_new={result.home_new} "
-        f"home_relevant={result.home_relevant} "
-        f"home_irrelevant={result.home_irrelevant} "
-        f"home_unknown={result.home_unknown} "
-        f"home_relevant_ratio={ratio} "
-        f"duplicates={result.duplicates} "
-        f"detail_reads={result.detail_reads} "
-        f"scroll_attempts={result.scroll_attempts} "
-        f"scrolls={result.scrolls} "
-        f"skipped_unverified={result.skipped_unverified} "
-        f"checkpoint_runs={result.checkpoint_runs} "
-        f"observed_rows={getattr(result, 'observed_rows', 0)} "
-        f"viewport_row_appearances={getattr(result, 'viewport_observations', getattr(result, 'observed_rows', 0))} "
-        f"body_extracted={getattr(result, 'body_extracted', 0)} "
-        f"provenance_verified={getattr(result, 'provenance_verified', 0)} "
-        f"unique_provenance_identities={getattr(result, 'unique_provenance_identities', getattr(result, 'provenance_verified', 0))} "
-        f"unique_verified_posts={getattr(result, 'unique_verified_posts', 0)} "
-        f"unique_deferred_posts={getattr(result, 'unique_deferred_posts', 0)} "
-        f"unresolved_gaps={getattr(result, 'unresolved_gaps', 0)} "
-        f"read_in_progress={getattr(result, 'read_in_progress', 0)} "
-        f"unresolved_observations={getattr(result, 'unresolved_observations', 0)} "
-        f"unrepresented_gaps={getattr(result, 'unrepresented_gaps', 0)} "
-        f"gap_sources_total={getattr(result, 'gap_sources_total', 0)} "
-        f"stranded_body_ranges={getattr(result, 'stranded_body_ranges', 0)} "
-        f"lookahead_rows={getattr(result, 'lookahead_rows', 0)} "
-        f"gap_category={getattr(result, 'gap_category', 'NONE')} "
-        f"visible_text_segments={getattr(result, 'visible_text_segments', 0)} "
-        f"classified={getattr(result, 'classified', 0)} "
-        f"observation_unknown={getattr(result, 'observation_unknown', 0)} "
-        f"unverified_relevant={getattr(result, 'unverified_relevant', 0)} "
-        f"skipped_rows={getattr(result, 'skipped_rows', 0)} "
-        "viewport_coverage_complete="
-        f"{str(getattr(result, 'viewport_coverage_complete', True)).lower()}"
-    )
 
 
 def _has_interactive_terminal() -> bool:
@@ -320,111 +110,16 @@ def _run_diagnostics_check(args: argparse.Namespace) -> bool:
     return True
 
 
-def _new_scheduled_status() -> tuple[dict[str, object], float]:
-    started_at = datetime.now(UTC).isoformat(timespec="milliseconds").replace(
-        "+00:00", "Z"
-    )
-    return (
-        {
-            "schema_version": 1,
-            "started_at": started_at,
-            "finished_at": None,
-            "duration_seconds": 0.0,
-            "status": "RUNNING",
-            "cycle_status": None,
-            "stop_reason": "RUNNING",
-            "exit_code": None,
-            "checkpoint_runs": None,
-            "counters": {},
-        },
-        monotonic(),
-    )
 
 
-def _safe_status_code(value: object, *, default: str) -> str:
-    if isinstance(value, str) and re.fullmatch(r"[A-Z0-9_]{1,80}", value):
-        return value
-    return default
 
 
-def _mark_scheduled_failure(summary: dict[str, object] | None, reason: str) -> None:
-    if summary is None:
-        return
-    summary.update(
-        status="FAILED",
-        cycle_status=None,
-        stop_reason=_safe_status_code(reason, default="INTERNAL_OPERATION_ERROR"),
-        exit_code=1,
-        checkpoint_runs=None,
-        counters={},
-    )
 
 
-def _mark_scheduled_result(summary: dict[str, object] | None, result: object) -> None:
-    if summary is None:
-        return
-    checkpoint_saved = getattr(result, "checkpoint_saved", False) is True
-    counters = {
-        name: value
-        for name in (
-            "home_sampled",
-            "home_new",
-            "detail_reads",
-            "scroll_attempts",
-            "scrolls",
-            "skipped_unverified",
-            "unique_verified_posts",
-        )
-        if type(value := getattr(result, name, None)) is int and value >= 0
-    }
-    checkpoint_runs = getattr(result, "checkpoint_runs", None)
-    summary.update(
-        status="COMPLETE" if checkpoint_saved else "STOPPED",
-        cycle_status=_safe_status_code(getattr(result, "status", None), default="UNKNOWN"),
-        stop_reason=_safe_status_code(
-            getattr(result, "stop_reason", None), default="UNKNOWN"
-        ),
-        exit_code=0 if checkpoint_saved else 1,
-        checkpoint_runs=(
-            checkpoint_runs
-            if type(checkpoint_runs) is int and checkpoint_runs >= 0
-            else None
-        ),
-        counters=counters,
-    )
 
 
-def _finish_scheduled_status(
-    summary: dict[str, object], started_monotonic: float
-) -> None:
-    if summary["status"] == "RUNNING":
-        _mark_scheduled_failure(summary, "INTERNAL_OPERATION_ERROR")
-    summary["finished_at"] = datetime.now(UTC).isoformat(
-        timespec="milliseconds"
-    ).replace("+00:00", "Z")
-    summary["duration_seconds"] = round(max(0, monotonic() - started_monotonic), 3)
 
 
-def _record_known_checkpoint_runs(
-    summary: dict[str, object] | None,
-    data_root: Path,
-    account: BrowserAccount,
-    terms: tuple[str, ...],
-) -> None:
-    if summary is None:
-        return
-    from .feed.relevance import canonical_terms
-    from .reader import UiReadError
-    from .workflow import policy_fingerprint
-
-    try:
-        checkpoint = CheckpointStore(data_root).load(
-            account.account_id,
-            policy_fingerprint(canonical_terms(terms)),
-        )
-    except (BrowserDataError, UiReadError):
-        return
-    summary["checkpoint_runs"] = checkpoint.completed_runs
 
 
 def _is_login(args: argparse.Namespace) -> bool:
@@ -445,9 +140,288 @@ def _is_run(args: argparse.Namespace) -> bool:
     ) or args.command == "session"
 
 
+def _handle_local_command(
+    args: argparse.Namespace,
+    data_root: Path,
+    accounts: AccountStore,
+) -> int | None:
+    if _is_add(args):
+        if args.actor is None and args.profile_dir is None:
+            add_local_account(args.alias, data_root=data_root)
+        else:
+            accounts.add(
+                args.alias,
+                args.actor,
+                args.profile_dir,
+                create_profile=args.create_profile,
+            )
+        print("ACCOUNT status=REGISTERED")
+        return 0
+
+    if _is_login(args):
+        from .reader import UiReadError
+
+        try:
+            result = asyncio.run(
+                open_account_login(
+                    args.alias,
+                    data_root=data_root,
+                    status_callback=_print_login_status,
+                )
+            )
+        except UiReadError as error:
+            print(f"STOP {error.code}", file=sys.stderr)
+            return 1
+        return 1 if result.status == "CANCELLED" else 0
+
+    if args.command == "ls":
+        listed_accounts = accounts.list()
+        if not listed_accounts:
+            print("No local accounts.")
+        for account in listed_accounts:
+            verification = "VERIFIED" if account.expected_actor is not None else "UNVERIFIED"
+            print(f"{account.alias} {verification}")
+        return 0
+
+    if args.command == "terms":
+        account = accounts.get(args.alias)
+        terms_store = TermsStore(data_root)
+        if args.clear and args.terms:
+            print("ERROR TERMS_ARGUMENTS_INVALID", file=sys.stderr)
+            return 1
+        if args.clear:
+            terms_store.clear(account.alias)
+            print("TERMS status=CLEARED")
+        elif args.terms:
+            try:
+                configured = terms_store.set(account.alias, tuple(args.terms))
+            except BrowserDataError as error:
+                if error.code != "TERMS_INVALID":
+                    raise
+                print("ERROR TERMS_INVALID", file=sys.stderr)
+                return 1
+            print(f"TERMS status=SAVED count={len(configured)}")
+        else:
+            configured = terms_store.get(account.alias)
+            if not configured:
+                print("TERMS status=NOT_CONFIGURED")
+            else:
+                print("\n".join(configured))
+        return 0
+    return None
+
+
+def _validate_run_arguments(
+    args: argparse.Namespace,
+    *,
+    session: bool,
+    scheduled: bool,
+    scheduled_status: dict[str, object] | None,
+) -> bool:
+    if args.command == "nurture" and not args.headed:
+        print("ERROR HEADED_REQUIRED", file=sys.stderr)
+        _mark_scheduled_failure(scheduled_status, "HEADED_REQUIRED")
+        return False
+    if not 1 <= args.max_posts <= 20:
+        print("ERROR POST_LIMIT_INVALID", file=sys.stderr)
+        _mark_scheduled_failure(scheduled_status, "POST_LIMIT_INVALID")
+        return False
+    if not 0 <= args.max_scrolls <= 20:
+        print("ERROR SCROLL_LIMIT_INVALID", file=sys.stderr)
+        _mark_scheduled_failure(scheduled_status, "SCROLL_LIMIT_INVALID")
+        return False
+    if not 1 <= args.max_total_posts <= 400:
+        print("ERROR TOTAL_SCAN_LIMIT_INVALID", file=sys.stderr)
+        _mark_scheduled_failure(scheduled_status, "TOTAL_SCAN_LIMIT_INVALID")
+        return False
+    if args.max_runtime_seconds is not None and (
+        not math.isfinite(args.max_runtime_seconds) or args.max_runtime_seconds <= 0
+    ):
+        print("ERROR RUNTIME_LIMIT_INVALID", file=sys.stderr)
+        _mark_scheduled_failure(scheduled_status, "RUNTIME_LIMIT_INVALID")
+        return False
+    if session and not 10 < args.max_runtime_seconds <= 3600:
+        print("ERROR RUNTIME_LIMIT_INVALID", file=sys.stderr)
+        return False
+    if session and not 1 <= args.max_detail_reads <= 40:
+        print("ERROR DETAIL_READ_LIMIT_INVALID", file=sys.stderr)
+        return False
+    if scheduled and args.max_runtime_seconds is None:
+        print("ERROR SCHEDULED_RUNTIME_REQUIRED", file=sys.stderr)
+        _mark_scheduled_failure(scheduled_status, "SCHEDULED_RUNTIME_REQUIRED")
+        return False
+    return True
+
+
+def _prepare_run_inputs(
+    args: argparse.Namespace,
+    data_root: Path,
+    accounts: AccountStore,
+    scheduled: bool,
+    scheduled_status: dict[str, object] | None,
+) -> tuple[BrowserAccount, tuple[str, ...]] | None:
+    account = accounts.get(args.alias)
+    if account.expected_actor is None:
+        print("ERROR ACCOUNT_NOT_VERIFIED", file=sys.stderr)
+        _mark_scheduled_failure(scheduled_status, "ACCOUNT_NOT_VERIFIED")
+        return None
+    terms = tuple(args.terms) if args.terms else TermsStore(data_root).get(account.alias)
+    if not terms:
+        print("ERROR TERMS_NOT_CONFIGURED", file=sys.stderr)
+        if not scheduled:
+            print(
+                f'Configure terms with: tb terms {account.alias} "hiring"',
+                file=sys.stderr,
+            )
+        _mark_scheduled_failure(scheduled_status, "TERMS_NOT_CONFIGURED")
+        return None
+    return account, terms
+
+
+def _invoke_nurture(
+    args: argparse.Namespace,
+    data_root: Path,
+    account: BrowserAccount,
+    terms: tuple[str, ...],
+    *,
+    session: bool,
+    scheduled: bool,
+) -> object:
+    from .workflow import run_browser_nurture, run_browser_nurture_session
+
+    checkpoint_store = CheckpointStore(data_root)
+    if session:
+        return asyncio.run(
+            run_browser_nurture_session(
+                account,
+                checkpoint_store,
+                max_posts=args.max_posts,
+                terms=terms,
+                max_scrolls=args.max_scrolls,
+                max_total_posts=args.max_total_posts,
+                max_detail_reads=args.max_detail_reads,
+                max_runtime_seconds=args.max_runtime_seconds,
+                readiness_prompt=(
+                    _prompt_readiness_extension if not args.no_readiness_prompt else None
+                ),
+            )
+        )
+    return asyncio.run(
+        run_browser_nurture(
+            account,
+            checkpoint_store,
+            max_posts=args.max_posts,
+            terms=terms,
+            max_scrolls=args.max_scrolls,
+            max_total_posts=args.max_total_posts,
+            max_runtime_seconds=args.max_runtime_seconds,
+            show_post_text=args.show_post_text,
+            show_observed_text=args.show_observed_text,
+            detail=args.detail,
+            **(
+                {"console_output_policy": ConsoleOutputPolicy.SCHEDULED}
+                if scheduled
+                else {}
+            ),
+            readiness_prompt=(
+                _prompt_readiness_extension
+                if not args.no_readiness_prompt and not scheduled and _has_interactive_terminal()
+                else None
+            ),
+        )
+    )
+
+
+def _report_run_result(
+    args: argparse.Namespace,
+    result: object,
+    *,
+    session: bool,
+    scheduled: bool,
+    scheduled_status: dict[str, object] | None,
+) -> int:
+    _mark_scheduled_result(scheduled_status, result)
+    formatted_result = _format_result(result)
+    if session:
+        formatted_result += (
+            " checkpoint_saved="
+            f"{str(getattr(result, 'checkpoint_saved', False) is True).lower()}"
+        )
+    print(formatted_result)
+    session_status = getattr(result, "status", None)
+    if session and session_status not in {"SESSION_COMPLETE", "SESSION_BUDGET_EXHAUSTED"}:
+        reason = _safe_status_code(
+            getattr(result, "stop_reason", None),
+            default=_safe_status_code(session_status, default="SESSION_STOPPED"),
+        )
+        print(f"STOP {reason}", file=sys.stderr)
+        return 1
+    if (scheduled or session) and getattr(result, "checkpoint_saved", False) is not True:
+        reason = _safe_status_code(
+            getattr(result, "stop_reason", None),
+            default=_safe_status_code(getattr(result, "status", None), default="CYCLE_NOT_CHECKPOINTED"),
+        )
+        print(f"STOP {reason}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _handle_run_command(
+    args: argparse.Namespace,
+    data_root: Path,
+    accounts: AccountStore,
+    scheduled_status: dict[str, object] | None,
+) -> int:
+    session = args.command == "session"
+    scheduled = getattr(args, "scheduled", False)
+    if not _validate_run_arguments(
+        args, session=session, scheduled=scheduled, scheduled_status=scheduled_status
+    ):
+        return 1
+    run_inputs = _prepare_run_inputs(
+        args, data_root, accounts, scheduled, scheduled_status
+    )
+    if run_inputs is None:
+        return 1
+    account, terms = run_inputs
+    from .reader import UiReadError
+
+    try:
+        result = _invoke_nurture(
+            args,
+            data_root,
+            account,
+            terms,
+            session=session,
+            scheduled=scheduled,
+        )
+    except UiReadError as error:
+        _mark_scheduled_failure(scheduled_status, error.code)
+        _record_known_checkpoint_runs(scheduled_status, data_root, account, terms)
+        if getattr(args, "detail", False):
+            print(f"[CHECKPOINT] status=NOT_SAVED reason={error.code}", file=sys.stderr)
+            print(f"[STOP] code={error.code}", file=sys.stderr)
+        else:
+            print(f"STOP {error.code}", file=sys.stderr)
+        if error.code == "LOGIN_REQUIRED" and not scheduled:
+            print(f"Run 'tb login {account.alias}' to authenticate.", file=sys.stderr)
+        return 1
+    except BrowserDataError as error:
+        _mark_scheduled_failure(scheduled_status, error.code)
+        _record_known_checkpoint_runs(scheduled_status, data_root, account, terms)
+        print(f"ERROR {error.code}", file=sys.stderr)
+        return 1
+    return _report_run_result(
+        args,
+        result,
+        session=session,
+        scheduled=scheduled,
+        scheduled_status=scheduled_status,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = _parser()
-    args = parser.parse_args(argv)
+    args = _parser().parse_args(argv)
     session = args.command == "session"
     scheduled = _is_run(args) and getattr(args, "scheduled", False)
     if scheduled and (
@@ -468,242 +442,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     data_root: Path | None = None
     scheduled_status_ready = False
-    scheduled_account: BrowserAccount | None = None
-    scheduled_terms: tuple[str, ...] | None = None
     try:
         data_root = resolve_data_root()
         if scheduled_status is not None:
             write_operation_status(data_root, scheduled_status)
             scheduled_status_ready = True
         accounts = AccountStore(data_root)
-        if _is_add(args):
-            if args.actor is None and args.profile_dir is None:
-                add_local_account(args.alias, data_root=data_root)
-            else:
-                accounts.add(
-                    args.alias,
-                    args.actor,
-                    args.profile_dir,
-                    create_profile=args.create_profile,
-                )
-            print("ACCOUNT status=REGISTERED")
-            return 0
-
-        if _is_login(args):
-            from .reader import UiReadError
-
-            try:
-                result = asyncio.run(
-                    open_account_login(
-                        args.alias,
-                        data_root=data_root,
-                        status_callback=_print_login_status,
-                    )
-                )
-            except UiReadError as error:
-                print(f"STOP {error.code}", file=sys.stderr)
-                return 1
-            if result.status == "CANCELLED":
-                print("LOGIN status=CANCELLED")
-                return 1
-            return 0
-
-        if args.command == "ls":
-            listed_accounts = accounts.list()
-            if not listed_accounts:
-                print("No local accounts.")
-            for account in listed_accounts:
-                verification = "VERIFIED" if account.expected_actor is not None else "UNVERIFIED"
-                print(f"{account.alias} {verification}")
-            return 0
-
-        if args.command == "terms":
-            account = accounts.get(args.alias)
-            terms_store = TermsStore(data_root)
-            if args.clear and args.terms:
-                print("ERROR TERMS_ARGUMENTS_INVALID", file=sys.stderr)
-                return 1
-            if args.clear:
-                terms_store.clear(account.alias)
-                print("TERMS status=CLEARED")
-            elif args.terms:
-                try:
-                    configured = terms_store.set(account.alias, tuple(args.terms))
-                except BrowserDataError as error:
-                    if error.code != "TERMS_INVALID":
-                        raise
-                    print("ERROR TERMS_INVALID", file=sys.stderr)
-                    return 1
-                print(f"TERMS status=SAVED count={len(configured)}")
-            else:
-                configured = terms_store.get(account.alias)
-                if not configured:
-                    print("TERMS status=NOT_CONFIGURED")
-                else:
-                    print("\n".join(configured))
-            return 0
-
+        local_result = _handle_local_command(args, data_root, accounts)
+        if local_result is not None:
+            return local_result
         if _is_run(args):
-            legacy = args.command == "nurture"
-            if legacy and not args.headed:
-                print("ERROR HEADED_REQUIRED", file=sys.stderr)
-                _mark_scheduled_failure(scheduled_status, "HEADED_REQUIRED")
-                return 1
-            if not 1 <= args.max_posts <= 20:
-                print("ERROR POST_LIMIT_INVALID", file=sys.stderr)
-                _mark_scheduled_failure(scheduled_status, "POST_LIMIT_INVALID")
-                return 1
-            if not 0 <= args.max_scrolls <= 20:
-                print("ERROR SCROLL_LIMIT_INVALID", file=sys.stderr)
-                _mark_scheduled_failure(scheduled_status, "SCROLL_LIMIT_INVALID")
-                return 1
-            if not 1 <= args.max_total_posts <= 400:
-                print("ERROR TOTAL_SCAN_LIMIT_INVALID", file=sys.stderr)
-                _mark_scheduled_failure(scheduled_status, "TOTAL_SCAN_LIMIT_INVALID")
-                return 1
-            if args.max_runtime_seconds is not None and (
-                not math.isfinite(args.max_runtime_seconds)
-                or args.max_runtime_seconds <= 0
-            ):
-                print("ERROR RUNTIME_LIMIT_INVALID", file=sys.stderr)
-                _mark_scheduled_failure(scheduled_status, "RUNTIME_LIMIT_INVALID")
-                return 1
-            if session and not 10 < args.max_runtime_seconds <= 3600:
-                print("ERROR RUNTIME_LIMIT_INVALID", file=sys.stderr)
-                return 1
-            if session and not 1 <= args.max_detail_reads <= 40:
-                print("ERROR DETAIL_READ_LIMIT_INVALID", file=sys.stderr)
-                return 1
-            if scheduled and args.max_runtime_seconds is None:
-                print("ERROR SCHEDULED_RUNTIME_REQUIRED", file=sys.stderr)
-                _mark_scheduled_failure(scheduled_status, "SCHEDULED_RUNTIME_REQUIRED")
-                return 1
-
-            account = accounts.get(args.alias)
-            scheduled_account = account
-            if account.expected_actor is None:
-                print("ERROR ACCOUNT_NOT_VERIFIED", file=sys.stderr)
-                _mark_scheduled_failure(scheduled_status, "ACCOUNT_NOT_VERIFIED")
-                return 1
-            if args.terms:
-                terms = tuple(args.terms)
-            else:
-                terms = TermsStore(data_root).get(account.alias)
-            if not terms:
-                print("ERROR TERMS_NOT_CONFIGURED", file=sys.stderr)
-                if not scheduled:
-                    print(
-                        f'Configure terms with: tb terms {account.alias} "hiring"',
-                        file=sys.stderr,
-                    )
-                _mark_scheduled_failure(scheduled_status, "TERMS_NOT_CONFIGURED")
-                return 1
-            scheduled_terms = terms
-            from .reader import UiReadError
-            from .workflow import run_browser_nurture, run_browser_nurture_session
-
-            try:
-                if session:
-                    result = asyncio.run(
-                        run_browser_nurture_session(
-                            account,
-                            CheckpointStore(data_root),
-                            max_posts=args.max_posts,
-                            terms=terms,
-                            max_scrolls=args.max_scrolls,
-                            max_total_posts=args.max_total_posts,
-                            max_detail_reads=args.max_detail_reads,
-                            max_runtime_seconds=args.max_runtime_seconds,
-                            readiness_prompt=(
-                                _prompt_readiness_extension
-                                if not args.no_readiness_prompt
-                                else None
-                            ),
-                        )
-                    )
-                else:
-                    result = asyncio.run(
-                        run_browser_nurture(
-                            account,
-                            CheckpointStore(data_root),
-                            max_posts=args.max_posts,
-                            terms=terms,
-                            max_scrolls=args.max_scrolls,
-                            max_total_posts=args.max_total_posts,
-                            max_runtime_seconds=args.max_runtime_seconds,
-                            show_post_text=args.show_post_text,
-                            show_observed_text=args.show_observed_text,
-                            detail=args.detail,
-                            **(
-                                {"console_output_policy": ConsoleOutputPolicy.SCHEDULED}
-                                if scheduled
-                                else {}
-                            ),
-                            readiness_prompt=(
-                                _prompt_readiness_extension
-                                if not args.no_readiness_prompt
-                                and not scheduled
-                                and _has_interactive_terminal()
-                                else None
-                            ),
-                        )
-                    )
-            except UiReadError as error:
-                _mark_scheduled_failure(scheduled_status, error.code)
-                _record_known_checkpoint_runs(
-                    scheduled_status, data_root, account, terms
-                )
-                if getattr(args, "detail", False):
-                    print(
-                        f"[CHECKPOINT] status=NOT_SAVED reason={error.code}",
-                        file=sys.stderr,
-                    )
-                    print(f"[STOP] code={error.code}", file=sys.stderr)
-                else:
-                    print(f"STOP {error.code}", file=sys.stderr)
-                if error.code == "LOGIN_REQUIRED" and not scheduled:
-                    print(f"Run 'tb login {account.alias}' to authenticate.", file=sys.stderr)
-                return 1
-            _mark_scheduled_result(scheduled_status, result)
-            formatted_result = _format_result(result)
-            if session:
-                formatted_result += (
-                    " checkpoint_saved="
-                    f"{str(getattr(result, 'checkpoint_saved', False) is True).lower()}"
-                )
-            print(formatted_result)
-            if session and getattr(result, "status", None) not in {
-                "SESSION_COMPLETE",
-                "SESSION_BUDGET_EXHAUSTED",
-            }:
-                reason = _safe_status_code(
-                    getattr(result, "stop_reason", None),
-                    default=_safe_status_code(
-                        getattr(result, "status", None), default="SESSION_STOPPED"
-                    ),
-                )
-                print(f"STOP {reason}", file=sys.stderr)
-                return 1
-            if (scheduled or session) and getattr(result, "checkpoint_saved", False) is not True:
-                reason = _safe_status_code(
-                    getattr(result, "stop_reason", None),
-                    default=_safe_status_code(
-                        getattr(result, "status", None), default="CYCLE_NOT_CHECKPOINTED"
-                    ),
-                )
-                print(f"STOP {reason}", file=sys.stderr)
-                return 1
-            return 0
+            return _handle_run_command(args, data_root, accounts, scheduled_status)
     except BrowserDataError as error:
         _mark_scheduled_failure(scheduled_status, error.code)
-        if (
-            data_root is not None
-            and scheduled_account is not None
-            and scheduled_terms is not None
-        ):
-            _record_known_checkpoint_runs(
-                scheduled_status, data_root, scheduled_account, scheduled_terms
-            )
         print(f"ERROR {error.code}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:

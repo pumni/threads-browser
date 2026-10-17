@@ -36,6 +36,33 @@ One scheduled-output integration case launches persistent Chromium headed and ch
 - [ ] Confirm exact-head GitHub Actions success; report Windows and Linux lanes separately when both exist.
 - [ ] Do not infer live Threads compatibility from local fixtures; owner UAT remains required.
 
+## Production release gates
+
+- CI runs the offline suite on both `ubuntu-latest` and `windows-latest` with
+  Python 3.13 and `uv sync --locked`. Ubuntu installs Chromium with system
+  dependencies and uses Xvfb; Windows installs the same pinned browser and
+  runs the headed fixtures directly. Pytest's reported skip counts are
+  captured per lane and must not be hidden with broad skip markers.
+- The Windows lane also runs the PowerShell wrapper against a fake `uv`
+  executable and verifies both bounded argument forwarding and exit-code
+  propagation. It does not launch the application, read an account, or start
+  Chromium through the wrapper.
+- `scripts/check_structure.py` compares changed production modules with the PR
+  base. New modules may not exceed 600 lines, new orchestration functions may
+  not exceed 150 lines, and larger existing files/functions may not grow.
+  Function spans are measured from the Python AST. The gate is incremental so
+  unrelated baseline modules do not prevent a focused change from being
+  reviewed.
+- `git diff --check` runs against the PR base and exact commit. Review the
+  workflow result for the same full commit SHA proposed for merge.
+- `COMPLETE` in `operations/last_run.json` means a checkpoint was committed;
+  incomplete Home coverage and skipped rows remain visible in cycle counters
+  and fixed status fields. The status file is an atomic latest-run replacement,
+  not a history store.
+- `docs/RELEASE_CHECKLIST.md` is the ship/no-ship gate. Windows UAT, issue #23
+  disposition, rollback rehearsal, and a separate Task Scheduler decision are
+  owner evidence and cannot be inferred from CI.
+
 ## Baseline test-name mapping
 
 Function names are unchanged. Each baseline node ID maps to the destination module below.

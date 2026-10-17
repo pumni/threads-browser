@@ -97,6 +97,7 @@ def test_package_imports_remain_acyclic_and_layered() -> None:
         "browser_ui": {"reader", "nurture", "storage", "workflow", "cli"},
         "reader": {"nurture", "storage", "workflow"},
         "nurture": {"workflow", "cli"},
+        "persistence": {"browser_ui", "feed", "reader", "nurture", "workflow", "cli"},
     }
     for module, tree in modules.items():
         package = module.split(".")[1]
