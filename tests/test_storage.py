@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 from uuid import uuid4
 
@@ -40,6 +42,59 @@ def test_account_reference_is_redacted_and_profile_lock_is_scoped(tmp_path: Path
         first.release()
     with second:
         pass
+
+
+@pytest.mark.parametrize("legacy_contents", (b"", b"0"))
+def test_profile_lock_accepts_and_normalizes_valid_legacy_state(
+    tmp_path: Path,
+    legacy_contents: bytes,
+) -> None:
+    path = tmp_path / "legacy-profile.lock"
+    path.write_bytes(legacy_contents)
+
+    with account_storage_module.ProcessLock(path):
+        pass
+    assert path.read_bytes() == b"00"
+
+
+@pytest.mark.parametrize("corrupt_contents", (b"x", b"0x", b"10", b"000"))
+def test_profile_lock_rejects_corrupt_guard_without_repair(
+    tmp_path: Path,
+    corrupt_contents: bytes,
+) -> None:
+    path = tmp_path / "corrupt-profile.lock"
+    path.write_bytes(corrupt_contents)
+
+    with pytest.raises(BrowserDataError) as caught:
+        account_storage_module.ProcessLock(path).acquire()
+
+    assert caught.value.code == "BROWSER_CLEANUP_FAILED"
+    assert path.read_bytes() == corrupt_contents
+
+
+def test_armed_profile_guard_survives_abrupt_process_exit(tmp_path: Path) -> None:
+    path = tmp_path / "interrupted-profile.lock"
+    child_code = (
+        "import os, sys; "
+        "from pathlib import Path; "
+        "from threads_browser.persistence.accounts import ProcessLock; "
+        "lock = ProcessLock(Path(sys.argv[1])); "
+        "lock.acquire(); lock.arm_uncertain_session(); os._exit(0)"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", child_code, str(path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert completed.returncode == 0
+    assert path.read_bytes() == b"01"
+    with pytest.raises(BrowserDataError) as caught:
+        account_storage_module.ProcessLock(path).acquire()
+    assert caught.value.code == "BROWSER_CLEANUP_FAILED"
 
 
 def test_checkpoint_resume_is_strict_atomic_and_contains_only_fingerprints(

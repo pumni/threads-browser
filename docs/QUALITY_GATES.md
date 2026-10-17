@@ -31,6 +31,8 @@ One scheduled-output integration case launches persistent Chromium headed and ch
 - [ ] Scroll attempts require measured feed movement and remain within the requested cap.
 - [ ] Pending, deduplication, retry, and checkpoint tests preserve safe prior state and reject incomplete tails.
 - [ ] Profile-lock contention, cancellation, timeout, browser shutdown, and checkpoint failure stay fail-closed.
+- [ ] Every managed nurture launch durably arms its guard under the profile lock; only verified context and Playwright shutdown can disarm it. Persistence failures, interrupted processes, malformed guard state, shutdown failures, recovery, and concurrent access remain fail-closed.
+- [ ] Cleanup failure injection distinguishes context close from Playwright stop; the Windows offline stress test confirms headed Chromium children and locks are released after successful shutdown.
 - [ ] Scheduled stdout and status contain only fixed codes and allowlisted aggregate counters.
 - [ ] Re-run `uv run ruff check .`, `uv run pytest -q --maxfail=1`, and `git diff --check` on the exact review head.
 - [ ] Confirm exact-head GitHub Actions success; report Windows and Linux lanes separately when both exist.

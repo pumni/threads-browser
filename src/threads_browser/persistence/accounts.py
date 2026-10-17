@@ -13,6 +13,10 @@ from .filesystem import _ensure_directory, _ensure_root, _read_json, _write_json
 from .models import BrowserAccount, BrowserDataError
 from .schema import _ACCOUNT_KEYS, _ACTOR, _ALIAS
 
+_PROFILE_LOCK_BYTE = b"0"
+_CLEANUP_GUARD_CLEAN = b"0"
+_CLEANUP_GUARD_ARMED = b"1"
+
 
 def normalize_actor(value: object) -> str:
     if not isinstance(value, str):
@@ -132,26 +136,28 @@ def _account_path(root: Path, alias: str) -> Path:
 
 
 class ProcessLock:
-    """A non-blocking OS file lock; the OS releases it when the process exits."""
+    """A non-blocking OS lock with a durable uncertain-session guard."""
 
     def __init__(self, path: Path) -> None:
         self._path = path
         self._stream: BinaryIO | None = None
 
     def acquire(self) -> None:
+        self._acquire(check_cleanup_guard=True)
+
+    def _acquire(self, *, check_cleanup_guard: bool) -> None:
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             if self._path.parent.is_symlink() or self._path.is_symlink():
                 raise OSError
-            stream = self._path.open("a+b")
+            self._path.touch(exist_ok=True)
             if os.name != "nt":
                 os.chmod(self._path, 0o600)
+            if self._path.parent.is_symlink() or self._path.is_symlink():
+                raise OSError
+            stream = self._path.open("r+b")
         except OSError:
             raise BrowserDataError("LOCK_UNAVAILABLE") from None
-        stream.seek(0, os.SEEK_END)
-        if stream.tell() == 0:
-            stream.write(b"0")
-            stream.flush()
         stream.seek(0)
         try:
             if os.name == "nt":
@@ -166,6 +172,100 @@ class ProcessLock:
             stream.close()
             raise BrowserDataError("ACCOUNT_BUSY") from None
         self._stream = stream
+        try:
+            cleanup_guard = self._read_cleanup_guard(normalize_legacy=True)
+            if check_cleanup_guard and cleanup_guard == _CLEANUP_GUARD_ARMED:
+                raise BrowserDataError("BROWSER_CLEANUP_FAILED")
+        except BaseException:
+            self.release()
+            raise
+
+    def arm_uncertain_session(self) -> None:
+        """Persist an armed guard before launching a browser while holding the OS lock."""
+        stream = self._require_stream()
+        if self._read_cleanup_guard(normalize_legacy=True) != _CLEANUP_GUARD_CLEAN:
+            raise BrowserDataError("BROWSER_CLEANUP_FAILED")
+        self._write_guard_state(stream, _CLEANUP_GUARD_ARMED)
+        if self._read_cleanup_guard(normalize_legacy=False) != _CLEANUP_GUARD_ARMED:
+            raise BrowserDataError("BROWSER_CLEANUP_FAILED")
+
+    def mark_cleanup_failed(self) -> None:
+        """Arm the guard for an already acquired lock (legacy caller compatibility)."""
+        stream = self._require_stream()
+        state = self._read_cleanup_guard(normalize_legacy=True)
+        if state == _CLEANUP_GUARD_ARMED:
+            return
+        self._write_guard_state(stream, _CLEANUP_GUARD_ARMED)
+
+    def disarm_uncertain_session(self) -> None:
+        """Clear an armed guard after verified shutdown, restoring it on write errors."""
+        stream = self._require_stream()
+        if self._read_cleanup_guard(normalize_legacy=False) != _CLEANUP_GUARD_ARMED:
+            raise BrowserDataError("BROWSER_CLEANUP_FAILED")
+        try:
+            self._write_guard_state(stream, _CLEANUP_GUARD_CLEAN)
+            if self._read_cleanup_guard(normalize_legacy=False) != _CLEANUP_GUARD_CLEAN:
+                raise BrowserDataError("BROWSER_CLEANUP_FAILED")
+        except BrowserDataError:
+            try:
+                self._write_guard_state(stream, _CLEANUP_GUARD_ARMED)
+            except BrowserDataError:
+                pass
+            raise BrowserDataError("BROWSER_CLEANUP_FAILED") from None
+
+    def clear_cleanup_failed(self) -> bool:
+        """Clear a quarantine after attended verification that the browser stopped."""
+        self._acquire(check_cleanup_guard=False)
+        try:
+            if self._read_cleanup_guard(normalize_legacy=False) != _CLEANUP_GUARD_ARMED:
+                return False
+            self.disarm_uncertain_session()
+            return True
+        finally:
+            self.release()
+
+    def _require_stream(self) -> BinaryIO:
+        stream = self._stream
+        if stream is None:
+            raise BrowserDataError("LOCK_UNAVAILABLE")
+        return stream
+
+    def _read_cleanup_guard(self, *, normalize_legacy: bool) -> bytes:
+        """Accept only the current two-byte form or known empty/one-byte legacy files."""
+        stream = self._require_stream()
+        stream.seek(0, os.SEEK_END)
+        size = stream.tell()
+        stream.seek(0)
+        if size == 0 and normalize_legacy:
+            self._write_bytes(stream, 0, _PROFILE_LOCK_BYTE + _CLEANUP_GUARD_CLEAN)
+            return _CLEANUP_GUARD_CLEAN
+        if size == 1:
+            if stream.read(1) == _PROFILE_LOCK_BYTE and normalize_legacy:
+                self._write_bytes(stream, 1, _CLEANUP_GUARD_CLEAN)
+                return _CLEANUP_GUARD_CLEAN
+            raise BrowserDataError("BROWSER_CLEANUP_FAILED")
+        if size == 2:
+            contents = stream.read(2)
+            if (
+                contents[:1] == _PROFILE_LOCK_BYTE
+                and contents[1:] in (_CLEANUP_GUARD_CLEAN, _CLEANUP_GUARD_ARMED)
+            ):
+                return contents[1:]
+        raise BrowserDataError("BROWSER_CLEANUP_FAILED")
+
+    def _write_guard_state(self, stream: BinaryIO, state: bytes) -> None:
+        self._write_bytes(stream, 1, state)
+
+    @staticmethod
+    def _write_bytes(stream: BinaryIO, offset: int, contents: bytes) -> None:
+        try:
+            stream.seek(offset)
+            if stream.write(contents) != len(contents):
+                raise OSError
+            stream.flush()
+            os.fsync(stream.fileno())
+        except OSError:
+            raise BrowserDataError("BROWSER_CLEANUP_FAILED") from None
 
     def release(self) -> None:
         stream = self._stream

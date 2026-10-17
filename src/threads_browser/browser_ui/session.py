@@ -183,7 +183,13 @@ def emit_failure_diagnostic(
         "STATE_INVALID",
         "OTHER",
     } else "OTHER"
-    safe_stage = stage if stage in {"FEED_INITIAL", "FEED_SCROLL"} else None
+    safe_stage = stage if stage in {
+        "FEED_INITIAL",
+        "FEED_SCROLL",
+        "CLOSE_CONTEXT",
+        "STOP_PLAYWRIGHT",
+        "QUARANTINE_LOCK",
+    } else None
     safe_kind = error_kind if error_kind in {
         "TIMEOUT",
         "STRICT_MODE",

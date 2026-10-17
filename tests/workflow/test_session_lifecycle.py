@@ -14,6 +14,7 @@ from tests.fixtures.browser import (
 )
 from threads_browser import reader as reader_module
 from threads_browser import workflow
+from threads_browser.persistence import accounts as account_storage_module
 from threads_browser.reader import (
     HOME_URL,
     ThreadsHomeReader,
@@ -343,7 +344,7 @@ def test_browser_workflows_for_different_profiles_can_run_concurrently(
             pass
 
 
-def test_browser_runtime_timeout_during_launch_releases_profile_lock(
+def test_browser_runtime_timeout_during_unverified_context_launch_keeps_guard_armed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -378,11 +379,146 @@ def test_browser_runtime_timeout_during_launch_releases_profile_lock(
             )
         )
 
-    assert caught.value.code == "CYCLE_TIMEOUT"
+    assert caught.value.code == "BROWSER_CLEANUP_FAILED"
     assert manager_state == {"entered": True, "exited": True}
     checkpoint = store.load(account.account_id, policy_fingerprint(("hiring",)))
     assert checkpoint.seen_fingerprints == ()
     assert checkpoint.pending_read_fingerprints == ()
+    with pytest.raises(BrowserDataError) as blocked:
+        store.profile_lock(account).acquire()
+    assert blocked.value.code == "BROWSER_CLEANUP_FAILED"
+    assert store.profile_lock(account).clear_cleanup_failed()
+
+
+def test_guard_persistence_failure_prevents_browser_launch_and_complete_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    profile = tmp_path / "dedicated-profile"
+    profile.mkdir()
+    account = BrowserAccount(uuid4(), "offline", "offline.operator", profile)
+    store = CheckpointStore(tmp_path / "data")
+    fingerprint = policy_fingerprint(("hiring",))
+    prior_checkpoint = Checkpoint(account.account_id, fingerprint, completed_runs=4)
+    store.save(prior_checkpoint)
+    lock = store.profile_lock(account)
+    with lock:
+        pass
+    launches: list[bool] = []
+    original_fsync = account_storage_module.os.fsync
+    fsync_calls = 0
+
+    def fail_after_guard_write(fd: int) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        original_fsync(fd)
+        if fsync_calls == 1:
+            raise OSError("synthetic guard persistence failure")
+
+    def browser_must_not_start():
+        launches.append(True)
+        pytest.fail("Chromium started without a durable uncertain-session guard")
+
+    async def operation_must_not_complete(*_args, **_kwargs):
+        pytest.fail("operation reported COMPLETE without launching a guarded browser")
+
+    monkeypatch.setattr(workflow, "async_playwright", browser_must_not_start)
+    monkeypatch.setattr(workflow, "_execute_page_workflow", operation_must_not_complete)
+    with monkeypatch.context() as persistence_failure:
+        persistence_failure.setattr(account_storage_module.os, "fsync", fail_after_guard_write)
+        with pytest.raises(BrowserDataError) as caught:
+            asyncio.run(
+                workflow.run_browser_nurture(
+                    account,
+                    store,
+                    max_posts=1,
+                    terms=("hiring",),
+                )
+            )
+
+    assert caught.value.code == "BROWSER_CLEANUP_FAILED"
+    assert launches == []
+    assert fsync_calls == 1
+    assert lock._path.read_bytes() == b"01"
+    assert store.load(account.account_id, fingerprint) == prior_checkpoint
+    assert "stage=QUARANTINE_LOCK" in capsys.readouterr().out
+    with pytest.raises(BrowserDataError) as blocked:
+        store.profile_lock(account).acquire()
+    assert blocked.value.code == "BROWSER_CLEANUP_FAILED"
+
+
+def test_guard_disarm_persistence_failure_rearms_after_verified_shutdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    profile = tmp_path / "dedicated-profile"
+    profile.mkdir()
+    account = BrowserAccount(uuid4(), "offline", "offline.operator", profile)
+    store = CheckpointStore(tmp_path / "data")
+    lifecycle = {"context_closed": False, "manager_exited": False}
+    lock = store.profile_lock(account)
+    with lock:
+        pass
+    original_fsync = account_storage_module.os.fsync
+    fsync_calls = 0
+
+    def fail_first_disarm_sync(fd: int) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        original_fsync(fd)
+        if fsync_calls == 2:
+            probe = store.profile_lock(account)
+            with pytest.raises(BrowserDataError) as busy:
+                probe.acquire()
+            assert busy.value.code == "ACCOUNT_BUSY"
+            raise OSError("synthetic guard disarm failure")
+
+    class Context:
+        def __init__(self) -> None:
+            self.pages = [object()]
+
+        async def close(self):
+            lifecycle["context_closed"] = True
+
+    class Chromium:
+        async def launch_persistent_context(self, **_kwargs):
+            return Context()
+
+    class Manager:
+        async def __aenter__(self):
+            return SimpleNamespace(chromium=Chromium())
+
+        async def __aexit__(self, *_args):
+            lifecycle["manager_exited"] = True
+
+    async def successful_cycle(*_args, **_kwargs):
+        return SimpleNamespace(status="COMPLETE")
+
+    monkeypatch.setattr(workflow, "async_playwright", Manager)
+    monkeypatch.setattr(workflow, "_execute_page_workflow", successful_cycle)
+    with monkeypatch.context() as persistence_failure:
+        persistence_failure.setattr(account_storage_module.os, "fsync", fail_first_disarm_sync)
+        with pytest.raises(UiReadError) as caught:
+            asyncio.run(
+                workflow.run_browser_nurture(
+                    account,
+                    store,
+                    max_posts=1,
+                    terms=("hiring",),
+                )
+            )
+
+    assert caught.value.code == "BROWSER_CLEANUP_FAILED"
+    assert lifecycle == {"context_closed": True, "manager_exited": True}
+    assert fsync_calls == 3  # arm, failed clean write, fail-closed re-arm
+    assert lock._path.read_bytes() == b"01"
+    assert "stage=QUARANTINE_LOCK" in capsys.readouterr().out
+    with pytest.raises(BrowserDataError) as blocked:
+        store.profile_lock(account).acquire()
+    assert blocked.value.code == "BROWSER_CLEANUP_FAILED"
+    assert store.profile_lock(account).clear_cleanup_failed()
     with store.profile_lock(account):
         pass
 
@@ -611,26 +747,85 @@ def test_cancellation_during_browser_cleanup_holds_lock_until_shutdown(
         pass
 
 
-@pytest.mark.parametrize("failure", ("timeout", "exception"))
-def test_browser_cleanup_failure_is_reported_after_successful_cycle(
+def test_profile_lock_stays_held_during_playwright_manager_shutdown(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    failure: str,
 ) -> None:
     profile = tmp_path / "dedicated-profile"
     profile.mkdir()
     account = BrowserAccount(uuid4(), "offline", "offline.operator", profile)
     store = CheckpointStore(tmp_path / "data")
-    lifecycle = {"manager_exited": False}
+    manager_stop_started = asyncio.Event()
+    finish_manager_stop = asyncio.Event()
+    lifecycle = {"driver_running": False, "manager_exited": False}
 
     class Context:
         def __init__(self) -> None:
             self.pages = [object()]
 
         async def close(self):
-            if failure == "timeout":
-                await asyncio.Event().wait()
-            raise RuntimeError("synthetic cleanup failure")
+            pass
+
+    class Chromium:
+        async def launch_persistent_context(self, **_kwargs):
+            return Context()
+
+    class Manager:
+        async def __aenter__(self):
+            lifecycle["driver_running"] = True
+            return SimpleNamespace(chromium=Chromium())
+
+        async def __aexit__(self, *_args):
+            manager_stop_started.set()
+            await finish_manager_stop.wait()
+            lifecycle["driver_running"] = False
+            lifecycle["manager_exited"] = True
+
+    async def successful_cycle(*_args, **_kwargs):
+        return SimpleNamespace(status="COMPLETE")
+
+    monkeypatch.setattr(workflow, "async_playwright", Manager)
+    monkeypatch.setattr(workflow, "_run_page_workflow_locked", successful_cycle)
+
+    async def exercise() -> None:
+        task = asyncio.create_task(
+            workflow.run_browser_nurture(account, store, max_posts=1, terms=("hiring",))
+        )
+        await asyncio.wait_for(manager_stop_started.wait(), timeout=2)
+
+        probe = store.profile_lock(account)
+        with pytest.raises(BrowserDataError) as busy:
+            probe.acquire()
+        assert busy.value.code == "ACCOUNT_BUSY"
+
+        finish_manager_stop.set()
+        result = await asyncio.wait_for(task, timeout=2)
+        assert result.status == "COMPLETE"
+
+    asyncio.run(exercise())
+
+    assert lifecycle == {"driver_running": False, "manager_exited": True}
+    with store.profile_lock(account):
+        pass
+
+
+def test_slow_session_context_close_fits_reserved_global_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = tmp_path / "dedicated-profile"
+    profile.mkdir()
+    account = BrowserAccount(uuid4(), "offline", "offline.operator", profile)
+    store = CheckpointStore(tmp_path / "data")
+    lifecycle = {"context_closed": False, "manager_exited": False}
+
+    class Context:
+        def __init__(self) -> None:
+            self.pages = [object()]
+
+        async def close(self):
+            await asyncio.sleep(workflow._CLEANUP_ALLOWANCE_SECONDS + 0.05)
+            lifecycle["context_closed"] = True
 
     class Chromium:
         async def launch_persistent_context(self, **_kwargs):
@@ -642,6 +837,86 @@ def test_browser_cleanup_failure_is_reported_after_successful_cycle(
 
         async def __aexit__(self, *_args):
             lifecycle["manager_exited"] = True
+
+    async def successful_session(*_args, **_kwargs):
+        return SimpleNamespace(
+            status="SESSION_BUDGET_EXHAUSTED",
+            stop_reason="MAX_DETAIL_READS",
+            checkpoint_saved=True,
+        )
+
+    monkeypatch.setattr(workflow, "async_playwright", Manager)
+    monkeypatch.setattr(workflow, "_run_page_workflow_session_locked", successful_session)
+
+    result = asyncio.run(
+        workflow.run_browser_nurture_session(
+            account,
+            store,
+            max_posts=1,
+            terms=("hiring",),
+            max_scrolls=0,
+            max_total_posts=1,
+            max_detail_reads=1,
+            max_runtime_seconds=60,
+        )
+    )
+
+    assert result.status == "SESSION_BUDGET_EXHAUSTED"
+    assert lifecycle == {"context_closed": True, "manager_exited": True}
+    with store.profile_lock(account):
+        pass
+
+
+def test_session_cleanup_allowances_reserve_time_inside_global_budget() -> None:
+    context_allowance, manager_allowance = workflow._session_cleanup_allowances(60)
+    assert context_allowance == 8
+    assert manager_allowance == 5
+    assert 60 - context_allowance - manager_allowance == 47
+
+    context_allowance, manager_allowance = workflow._session_cleanup_allowances(10.1)
+    assert context_allowance + manager_allowance == pytest.approx(10)
+    assert 10.1 - context_allowance - manager_allowance == pytest.approx(0.1)
+
+
+@pytest.mark.parametrize("failure", ("timeout", "exception"))
+def test_browser_cleanup_failure_is_reported_after_successful_cycle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: str,
+) -> None:
+    profile = tmp_path / "dedicated-profile"
+    profile.mkdir()
+    account = BrowserAccount(uuid4(), "offline", "offline.operator", profile)
+    store = CheckpointStore(tmp_path / "data")
+    lifecycle = {"context_closed": False, "manager_exited": False, "driver_running": False}
+    fingerprint = policy_fingerprint(("hiring",))
+    prior_checkpoint = Checkpoint(account.account_id, fingerprint, completed_runs=3)
+    store.save(prior_checkpoint)
+
+    class Context:
+        def __init__(self) -> None:
+            self.pages = [object()]
+
+        async def close(self):
+            if failure == "timeout":
+                await asyncio.Event().wait()
+            if failure == "exception":
+                raise RuntimeError("synthetic cleanup failure")
+            lifecycle["context_closed"] = True
+
+    class Chromium:
+        async def launch_persistent_context(self, **_kwargs):
+            return Context()
+
+    class Manager:
+        async def __aenter__(self):
+            lifecycle["driver_running"] = True
+            return SimpleNamespace(chromium=Chromium())
+
+        async def __aexit__(self, *_args):
+            lifecycle["manager_exited"] = True
+            lifecycle["driver_running"] = False
 
     async def successful_cycle(*_args, **_kwargs):
         return SimpleNamespace(status="COMPLETE")
@@ -662,7 +937,102 @@ def test_browser_cleanup_failure_is_reported_after_successful_cycle(
         )
 
     assert caught.value.code == "BROWSER_CLEANUP_FAILED"
-    assert lifecycle["manager_exited"]
+    assert lifecycle == {
+        "context_closed": False,
+        "manager_exited": True,
+        "driver_running": False,
+    }
+    assert store.load(account.account_id, fingerprint) == prior_checkpoint
+    with pytest.raises(BrowserDataError) as blocked:
+        store.profile_lock(account).acquire()
+    assert blocked.value.code == "BROWSER_CLEANUP_FAILED"
+    diagnostics = capsys.readouterr().out
+    assert "stage=CLOSE_CONTEXT" in diagnostics
+    assert "synthetic cleanup failure" not in diagnostics
+    assert store.profile_lock(account).clear_cleanup_failed()
+    with store.profile_lock(account):
+        pass
+
+
+@pytest.mark.parametrize("failure", ("timeout", "exception", "both_timeout"))
+def test_playwright_manager_cleanup_failure_quarantines_until_confirmed_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: str,
+) -> None:
+    profile = tmp_path / "dedicated-profile"
+    profile.mkdir()
+    account = BrowserAccount(uuid4(), "offline", "offline.operator", profile)
+    store = CheckpointStore(tmp_path / "data")
+    lifecycle = {
+        "context_closed": False,
+        "manager_stop_attempted": False,
+        "driver_running": False,
+    }
+    fingerprint = policy_fingerprint(("hiring",))
+    prior_checkpoint = Checkpoint(account.account_id, fingerprint, completed_runs=2)
+    store.save(prior_checkpoint)
+    monkeypatch.setattr(workflow, "_CLEANUP_ALLOWANCE_SECONDS", 0.01)
+
+    class Context:
+        def __init__(self) -> None:
+            self.pages = [object()]
+
+        async def close(self):
+            if failure == "both_timeout":
+                await asyncio.Event().wait()
+            lifecycle["context_closed"] = True
+
+    class Chromium:
+        async def launch_persistent_context(self, **_kwargs):
+            return Context()
+
+    class Manager:
+        async def __aenter__(self):
+            lifecycle["driver_running"] = True
+            return SimpleNamespace(chromium=Chromium())
+
+        async def __aexit__(self, *_args):
+            lifecycle["manager_stop_attempted"] = True
+            if failure in {"timeout", "both_timeout"}:
+                await asyncio.Event().wait()
+            raise RuntimeError("synthetic manager stop failure")
+
+    async def successful_cycle(*_args, **_kwargs):
+        return SimpleNamespace(status="COMPLETE")
+
+    monkeypatch.setattr(workflow, "async_playwright", Manager)
+    monkeypatch.setattr(workflow, "_run_page_workflow_locked", successful_cycle)
+
+    with pytest.raises(UiReadError) as caught:
+        asyncio.run(
+            workflow.run_browser_nurture(
+                account,
+                store,
+                max_posts=1,
+                terms=("hiring",),
+            )
+        )
+
+    assert caught.value.code == "BROWSER_CLEANUP_FAILED"
+    assert lifecycle == {
+        "context_closed": failure != "both_timeout",
+        "manager_stop_attempted": True,
+        "driver_running": True,
+    }
+    assert store.load(account.account_id, fingerprint) == prior_checkpoint
+    with pytest.raises(BrowserDataError) as blocked:
+        store.profile_lock(account).acquire()
+    assert blocked.value.code == "BROWSER_CLEANUP_FAILED"
+    diagnostics = capsys.readouterr().out
+    assert "stage=STOP_PLAYWRIGHT" in diagnostics
+    assert ("stage=CLOSE_CONTEXT" in diagnostics) is (failure == "both_timeout")
+    assert "synthetic manager stop failure" not in diagnostics
+
+    # Recovery is permitted only after external verification that the child stopped.
+    lifecycle["driver_running"] = False
+    assert store.profile_lock(account).clear_cleanup_failed()
     with store.profile_lock(account):
         pass
 

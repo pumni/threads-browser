@@ -183,6 +183,23 @@ def _handle_local_command(
             print(f"{account.alias} {verification}")
         return 0
 
+    if args.command == "recover":
+        account = accounts.get(args.alias)
+        try:
+            confirmation = input(
+                "Verify the prior managed Chromium process is closed. "
+                "Type CLOSED to clear its cleanup block: "
+            )
+        except EOFError:
+            confirmation = ""
+        if confirmation != "CLOSED":
+            print("CLEANUP_RECOVERY status=NOT_CONFIRMED", file=sys.stderr)
+            return 1
+        cleared = CheckpointStore(data_root).profile_lock(account).clear_cleanup_failed()
+        status = "UNBLOCKED" if cleared else "NOT_REQUIRED"
+        print(f"CLEANUP_RECOVERY status={status}")
+        return 0
+
     if args.command == "terms":
         account = accounts.get(args.alias)
         terms_store = TermsStore(data_root)
@@ -424,6 +441,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     session = args.command == "session"
     scheduled = _is_run(args) and getattr(args, "scheduled", False)
+    if args.command == "recover" and not _has_interactive_terminal():
+        print("ERROR CLEANUP_RECOVERY_TTY_REQUIRED", file=sys.stderr)
+        return 1
     if scheduled and (
         getattr(args, "detail", False)
         or getattr(args, "show_post_text", False)
