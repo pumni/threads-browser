@@ -7639,6 +7639,127 @@ main {{ display: block; }}
     assert checkpoint.pending_read_fingerprints == (stale_fingerprint,)
 
 
+@pytest.mark.parametrize("max_scrolls", (3, 8))
+@pytest.mark.parametrize("body_visible_at_budget_edge", (True, False))
+def test_last_scroll_boundary_distinguishes_partial_body_from_below_viewport_lookahead(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    max_scrolls: int,
+    body_visible_at_budget_edge: bool,
+) -> None:
+    actor = "offline.operator"
+    terms = ("hiring",)
+    boundary_index = max_scrolls + 2
+    boundary_body_top = 90 if body_visible_at_budget_edge else 110
+    boundary_body = "Synthetic weather details remain beyond the viewport. " * 3
+    card_markup = []
+    for index in range(boundary_index + 4):
+        boundary_id = ' id="boundary-body"' if index == boundary_index else ""
+        body = (
+            boundary_body
+            if index == boundary_index
+            else f"Synthetic weather update {index}."
+        )
+        card_markup.append(
+            f'''<article class="card"><a href="/@candidate/post/boundary-{index}">
+<time>now</time></a><a href="/@candidate">candidate</a>
+<p class="body"{boundary_id}>{body}</p></article>'''
+        )
+    cards = "".join(card_markup)
+    feed_html = f"""<!doctype html><html><head><meta charset="utf-8"><style>
+html, body {{ margin: 0; }}
+nav {{ height: 36px; }}
+main {{ display: block; }}
+.card {{ position: relative; height: 288px; }}
+.body {{ position: absolute; top: 108px; left: 12px; width: 320px;
+  margin: 0; line-height: 24px; }}
+#boundary-body {{ top: {boundary_body_top}px; }}
+</style></head><body><nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main>{cards}</main></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "synthetic-profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+    stale_url = "https://www.threads.com/@candidate/post/absent-budget-edge"
+    _, _, _ = _seed_pending_checkpoint(store, account, terms, stale_url)
+    actionability_checks: list[str] = []
+
+    async def reject_target(self, target):
+        actionability_checks.append(target.fingerprint)
+        raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED")
+
+    monkeypatch.setattr(ThreadsHomeReader, "actionable_now", reject_target)
+    observed_results = []
+
+    async def exercise(page) -> None:
+        result = await _run_page_workflow_for_test(
+            page,
+            account,
+            store,
+            max_posts=20,
+            max_scrolls=max_scrolls,
+            max_total_posts=40,
+            terms=terms,
+            detail=True,
+        )
+        geometry = await page.locator("#boundary-body").evaluate(
+            """element => {
+              const rect = element.getBoundingClientRect();
+              return {
+                top: rect.top,
+                bottom: rect.bottom,
+                viewport_height: window.innerHeight,
+              };
+            }"""
+        )
+        assert result.scroll_attempts == result.scrolls == max_scrolls
+        assert result.detail_reads == 0
+        assert result.checkpoint_saved is False
+        assert page.url == HOME_URL
+        observed_results.append((result, geometry))
+
+    _run_offline_page(feed_html, exercise, headless=False)
+    output = capsys.readouterr().out
+    result, geometry = observed_results[0]
+    scroll_deltas = [
+        float(value)
+        for value in re.findall(
+            r"\[SCROLL\] attempt=\d+ status=ADVANCED observed=1 delta_px=([0-9.]+)",
+            output,
+        )
+    ]
+    assert len(scroll_deltas) == max_scrolls
+    assert all(value == pytest.approx(288, abs=1) for value in scroll_deltas)
+
+    if body_visible_at_budget_edge:
+        assert geometry["viewport_height"] - 24 <= geometry["top"] < geometry["viewport_height"]
+        assert geometry["bottom"] > geometry["viewport_height"]
+        assert result.status == "RELEVANT_POST_NOT_CURRENT"
+        assert result.unresolved_gaps == result.gap_sources_total == 1
+        assert result.read_in_progress == 1
+        assert result.unresolved_observations == 0
+        assert result.unrepresented_gaps == 0
+        assert result.gap_category == "READ_IN_PROGRESS"
+        assert not result.viewport_coverage_complete
+        assert not actionability_checks
+    else:
+        assert geometry["top"] >= geometry["viewport_height"]
+        assert result.status == "NO_ACTIONABLE_TARGET"
+        assert result.unresolved_gaps == result.gap_sources_total == 0
+        assert result.read_in_progress == 0
+        assert result.gap_category == "NONE"
+        assert result.viewport_coverage_complete
+        assert actionability_checks
+
+    assert "[DETAIL]" not in output
+    assert "[BACK]" not in output
+    assert all(value not in output for value in (stale_url, actor, str(profile), boundary_body))
+
+
 def test_carried_candidate_status_is_kept_per_row() -> None:
     actor = "offline.operator"
     feed_html = f"""<!doctype html><html><body>
