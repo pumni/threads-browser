@@ -673,6 +673,75 @@ def test_profile_lock_stays_held_during_playwright_manager_shutdown(
         pass
 
 
+def test_slow_session_context_close_fits_reserved_global_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = tmp_path / "dedicated-profile"
+    profile.mkdir()
+    account = BrowserAccount(uuid4(), "offline", "offline.operator", profile)
+    store = CheckpointStore(tmp_path / "data")
+    lifecycle = {"context_closed": False, "manager_exited": False}
+
+    class Context:
+        def __init__(self) -> None:
+            self.pages = [object()]
+
+        async def close(self):
+            await asyncio.sleep(workflow._CLEANUP_ALLOWANCE_SECONDS + 0.05)
+            lifecycle["context_closed"] = True
+
+    class Chromium:
+        async def launch_persistent_context(self, **_kwargs):
+            return Context()
+
+    class Manager:
+        async def __aenter__(self):
+            return SimpleNamespace(chromium=Chromium())
+
+        async def __aexit__(self, *_args):
+            lifecycle["manager_exited"] = True
+
+    async def successful_session(*_args, **_kwargs):
+        return SimpleNamespace(
+            status="SESSION_BUDGET_EXHAUSTED",
+            stop_reason="MAX_DETAIL_READS",
+            checkpoint_saved=True,
+        )
+
+    monkeypatch.setattr(workflow, "async_playwright", Manager)
+    monkeypatch.setattr(workflow, "_run_page_workflow_session_locked", successful_session)
+
+    result = asyncio.run(
+        workflow.run_browser_nurture_session(
+            account,
+            store,
+            max_posts=1,
+            terms=("hiring",),
+            max_scrolls=0,
+            max_total_posts=1,
+            max_detail_reads=1,
+            max_runtime_seconds=60,
+        )
+    )
+
+    assert result.status == "SESSION_BUDGET_EXHAUSTED"
+    assert lifecycle == {"context_closed": True, "manager_exited": True}
+    with store.profile_lock(account):
+        pass
+
+
+def test_session_cleanup_allowances_reserve_time_inside_global_budget() -> None:
+    context_allowance, manager_allowance = workflow._session_cleanup_allowances(60)
+    assert context_allowance == 8
+    assert manager_allowance == 5
+    assert 60 - context_allowance - manager_allowance == 47
+
+    context_allowance, manager_allowance = workflow._session_cleanup_allowances(10.1)
+    assert context_allowance + manager_allowance == pytest.approx(10)
+    assert 10.1 - context_allowance - manager_allowance == pytest.approx(0.1)
+
+
 @pytest.mark.parametrize("failure", ("timeout", "exception"))
 def test_browser_cleanup_failure_is_reported_after_successful_cycle(
     tmp_path: Path,

@@ -36,6 +36,20 @@ __all__ = [
 ]
 
 _CLEANUP_ALLOWANCE_SECONDS = 5
+# Hosted Windows CI observed context close exceed the former five-second bound.
+_SESSION_CONTEXT_CLEANUP_ALLOWANCE_SECONDS = 8
+_SESSION_MANAGER_CLEANUP_ALLOWANCE_SECONDS = 5
+_MIN_SESSION_OPERATION_SECONDS = 0.1
+
+
+def _session_cleanup_allowances(max_runtime_seconds: float) -> tuple[float, float]:
+    """Reserve bounded teardown time inside the requested session runtime."""
+    context_allowance = _SESSION_CONTEXT_CLEANUP_ALLOWANCE_SECONDS
+    manager_allowance = _SESSION_MANAGER_CLEANUP_ALLOWANCE_SECONDS
+    total_allowance = context_allowance + manager_allowance
+    available_for_cleanup = max_runtime_seconds - _MIN_SESSION_OPERATION_SECONDS
+    scale = min(1.0, available_for_cleanup / total_allowance)
+    return context_allowance * scale, manager_allowance * scale
 
 
 def _detail_terminal_ready() -> bool:
@@ -293,8 +307,15 @@ async def _run_managed_browser_operation(
     context = None
     timeout_scope = None
     operation_timeout = max_runtime_seconds
+    context_cleanup_timeout = _CLEANUP_ALLOWANCE_SECONDS
+    manager_cleanup_timeout = _CLEANUP_ALLOWANCE_SECONDS
     if reserve_cleanup and max_runtime_seconds is not None:
-        operation_timeout = max_runtime_seconds - 2 * _CLEANUP_ALLOWANCE_SECONDS
+        context_cleanup_timeout, manager_cleanup_timeout = _session_cleanup_allowances(
+            max_runtime_seconds
+        )
+        operation_timeout = (
+            max_runtime_seconds - context_cleanup_timeout - manager_cleanup_timeout
+        )
     try:
         ensure_safe_browser_profile(account.profile_directory)
         timeout_scope = asyncio.timeout(operation_timeout)
@@ -357,6 +378,8 @@ async def _run_managed_browser_operation(
             context=context,
             playwright_manager=playwright_manager,
             manager_start_attempted=manager_start_attempted,
+            context_cleanup_timeout=context_cleanup_timeout,
+            manager_cleanup_timeout=manager_cleanup_timeout,
             console_output_policy=console_output_policy,
         )
         if cleanup_failed:
@@ -371,6 +394,8 @@ async def _cleanup_managed_browser_operation(
     context: Any,
     playwright_manager: Any,
     manager_start_attempted: bool,
+    context_cleanup_timeout: float,
+    manager_cleanup_timeout: float,
     console_output_policy: ConsoleOutputPolicy,
 ) -> tuple[bool, bool]:
     """Close browser resources within fixed allowances, even when cancelled."""
@@ -379,7 +404,7 @@ async def _cleanup_managed_browser_operation(
         try:
             if context is not None:
                 try:
-                    async with asyncio.timeout(_CLEANUP_ALLOWANCE_SECONDS):
+                    async with asyncio.timeout(context_cleanup_timeout):
                         await context.close()
                 except TimeoutError:
                     cleanup_failed = True
@@ -405,7 +430,7 @@ async def _cleanup_managed_browser_operation(
             if manager_start_attempted:
                 assert playwright_manager is not None
                 try:
-                    async with asyncio.timeout(_CLEANUP_ALLOWANCE_SECONDS):
+                    async with asyncio.timeout(manager_cleanup_timeout):
                         await playwright_manager.__aexit__(None, None, None)
                 except TimeoutError:
                     cleanup_failed = True
