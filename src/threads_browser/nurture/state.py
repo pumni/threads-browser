@@ -260,10 +260,14 @@ class CoverageLedger:
 
 @dataclass(slots=True)
 class DedupeLedger:
-    previously_seen: set[str]
+    """Keep checkpoint history, Home observations, and Detail visits distinct."""
+
+    checkpoint_seen: set[str]
     pending: list[str]
     pending_set: set[str]
-    seen_this_run: set[str] = field(default_factory=set)
+    home_observed_this_session: set[str] = field(default_factory=set)
+    detail_attempted_this_session: set[str] = field(default_factory=set)
+    detail_read_this_session: set[str] = field(default_factory=set)
     new_fingerprints: set[str] = field(default_factory=set)
     decisions_by_fingerprint: dict[str, str] = field(default_factory=dict)
     post_numbers: dict[str, int] = field(default_factory=dict)
@@ -281,7 +285,7 @@ class DedupeLedger:
     ) -> DedupeLedger:
         pending = list(pending_fingerprints)
         return cls(
-            previously_seen=set(seen_fingerprints),
+            checkpoint_seen=set(seen_fingerprints),
             pending=pending,
             pending_set=set(pending),
         )

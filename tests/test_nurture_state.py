@@ -185,11 +185,15 @@ def test_dedupe_ledger_keeps_checkpoint_and_current_run_sets_separate() -> None:
         pending_fingerprints=("pending-post",),
     )
 
-    ledger.seen_this_run.add("new-post")
+    ledger.home_observed_this_session.add("new-post")
     ledger.new_fingerprints.add("new-post")
+    ledger.detail_attempted_this_session.update(("read-post", "retry-post"))
+    ledger.detail_read_this_session.add("read-post")
 
-    assert ledger.previously_seen == {"seen-post"}
+    assert ledger.checkpoint_seen == {"seen-post"}
     assert ledger.pending == ["pending-post"]
     assert ledger.pending_set == {"pending-post"}
-    assert ledger.seen_this_run == {"new-post"}
+    assert ledger.home_observed_this_session == {"new-post"}
     assert ledger.new_fingerprints == {"new-post"}
+    assert ledger.detail_attempted_this_session == {"read-post", "retry-post"}
+    assert ledger.detail_read_this_session == {"read-post"}

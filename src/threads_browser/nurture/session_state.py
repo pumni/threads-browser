@@ -69,7 +69,9 @@ class SessionProgress:
     ) -> Checkpoint:
         if not self.has_safe_boundary(stats):
             raise ValueError("cannot commit an incomplete session observation")
-        observed = self.dedupe.seen_this_run - self.committed_fingerprints
+        observed = (
+            self.dedupe.home_observed_this_session - self.committed_fingerprints
+        )
         newly_seen = self.dedupe.new_fingerprints - self.committed_new_fingerprints
         scroll_attempts = reader.scroll_attempts - self.committed_scroll_attempts
         scrolls = reader.scrolls - self.committed_scrolls
@@ -95,7 +97,7 @@ class SessionProgress:
             completed_runs_delta=completed_runs_delta,
         )
         self.checkpoint = updated
-        self.committed_fingerprints.update(self.dedupe.seen_this_run)
+        self.committed_fingerprints.update(self.dedupe.home_observed_this_session)
         self.committed_new_fingerprints.update(self.dedupe.new_fingerprints)
         self.committed_scroll_attempts = reader.scroll_attempts
         self.committed_scrolls = reader.scrolls

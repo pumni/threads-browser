@@ -141,7 +141,7 @@ async def finish_cycle(context: CycleContext) -> NurtureResult:
         emit_console_diagnostic(
             context.console_output_policy,
             "POST_TEXT status=NONE "
-            f"verified_posts={len(context.dedupe.seen_this_run)} "
+            f"verified_posts={len(context.dedupe.home_observed_this_session)} "
             f"extracted={context.stats.previewed_bodies}",
         )
     context.state.stop(status)

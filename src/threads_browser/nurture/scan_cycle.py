@@ -24,7 +24,7 @@ from .state import WorkflowPhase
 async def scan_home_feed(context: CycleContext) -> NurtureResult | None:
     """Observe bounded viewports and select only a currently actionable target."""
     while True:
-        remaining = context.max_total_posts - len(context.dedupe.seen_this_run)
+        remaining = context.max_total_posts - len(context.dedupe.home_observed_this_session)
         if remaining <= 0:
             context.exhaustion_reason = "MAX_TOTAL_POSTS"
             break
@@ -75,7 +75,7 @@ async def _scan_viewport(
     try:
         await context.reader.scan_viewport(
             scan_limit,
-            scanned_fingerprints=context.dedupe.seen_this_run,
+            scanned_fingerprints=context.dedupe.home_observed_this_session,
             on_row=observer.observe,
         )
         context.reader.last_scan_counts.new_verified_rows = len(
@@ -144,7 +144,9 @@ def _handle_scan_failure(
             flush=True,
         )
     if error.code.endswith("NOT_READY") and (
-        context.dedupe.seen_this_run or context.stats.body_extracted or context.stats.observed_rows
+        context.dedupe.home_observed_this_session
+        or context.stats.body_extracted
+        or context.stats.observed_rows
     ):
         context.stats.observed_rows += counts.observed_rows
         context.stats.skipped_rows += counts.skipped_rows
@@ -303,13 +305,19 @@ async def _select_or_advance(
 ) -> bool:
     if observer.viewport_relevant_targets:
         observer.viewport_relevant_targets.sort(
-            key=lambda target: target.fingerprint in context.dedupe.previously_seen
+            key=lambda target: target.fingerprint in context.dedupe.checkpoint_seen
         )
         if context.max_scrolls > 0 and context.reader.scroll_attempts == 0:
             if await context.scroll_controller.advance(
-                scan_after_scroll=len(context.dedupe.seen_this_run) >= context.max_total_posts
+                scan_after_scroll=(
+                    len(context.dedupe.home_observed_this_session)
+                    >= context.max_total_posts
+                )
             ):
-                if len(context.dedupe.seen_this_run) >= context.max_total_posts:
+                if (
+                    len(context.dedupe.home_observed_this_session)
+                    >= context.max_total_posts
+                ):
                     context.selected = await _select_still_visible(context)
                     if context.selected is not None:
                         return True
@@ -325,7 +333,7 @@ async def _select_or_advance(
         if context.selected is not None:
             return True
 
-    seen_count = len(context.dedupe.seen_this_run)
+    seen_count = len(context.dedupe.home_observed_this_session)
     if seen_count >= context.max_total_posts:
         context.exhaustion_reason = "MAX_TOTAL_POSTS"
         if context.max_scrolls == 0 or context.reader.scroll_attempts > 0:
@@ -362,5 +370,5 @@ async def _select_still_visible(context: CycleContext) -> PostTarget | None:
         and context.dedupe.decisions_by_fingerprint.get(target.fingerprint) == "RELEVANT"
         and classify_body(target.body, context.normalized_terms) == "RELEVANT"
     ]
-    still_visible.sort(key=lambda target: target.fingerprint in context.dedupe.previously_seen)
+    still_visible.sort(key=lambda target: target.fingerprint in context.dedupe.checkpoint_seen)
     return await context.selector.first_actionable(still_visible)

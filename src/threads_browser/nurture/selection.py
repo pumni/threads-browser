@@ -43,6 +43,8 @@ class VerifiedTargetSelector:
 
     async def first_actionable(self, targets: list[PostTarget]) -> PostTarget | None:
         for target in targets:
+            if target.fingerprint in self._dedupe.detail_attempted_this_session:
+                continue
             try:
                 current = await self._reader.actionable_now(target)
             except (UiReadError, PlaywrightError) as raw_error:
@@ -86,7 +88,10 @@ class VerifiedTargetSelector:
             fingerprint: index for index, fingerprint in enumerate(self._dedupe.pending)
         }
         pending_targets = [
-            target for target in targets if target.fingerprint in self._dedupe.pending_set
+            target
+            for target in targets
+            if target.fingerprint in self._dedupe.pending_set
+            and target.fingerprint not in self._dedupe.detail_attempted_this_session
         ]
         if self._dedupe.pending_set:
             ordered_pending = sorted(
@@ -102,8 +107,9 @@ class VerifiedTargetSelector:
         ordered = [
             target
             for target in targets
-            if target.fingerprint not in self._dedupe.previously_seen
+            if target.fingerprint not in self._dedupe.checkpoint_seen
             and target.fingerprint not in self._dedupe.pending_set
+            and target.fingerprint not in self._dedupe.detail_attempted_this_session
         ]
         if not ordered:
             return None

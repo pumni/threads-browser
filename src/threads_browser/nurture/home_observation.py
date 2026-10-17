@@ -208,7 +208,7 @@ class HomeRowObserver:
             return
 
         self._record_verified_segments(target, row.diagnostic.row_index)
-        if target.fingerprint in self.dedupe.seen_this_run:
+        if target.fingerprint in self.dedupe.home_observed_this_session:
             self._record_seen_target(target)
             return
         self._record_new_verified_target(target)
@@ -247,7 +247,7 @@ class HomeRowObserver:
 
     def _record_seen_target(self, target: PostTarget) -> None:
         fingerprint = target.fingerprint
-        if fingerprint in self.dedupe.previously_seen:
+        if fingerprint in self.dedupe.checkpoint_seen:
             if fingerprint in self.dedupe.checkpoint_overlap:
                 self.stats.duplicates += 1
             else:
@@ -273,12 +273,12 @@ class HomeRowObserver:
 
     def _record_new_verified_target(self, target: PostTarget) -> None:
         fingerprint = target.fingerprint
-        self.dedupe.seen_this_run.add(fingerprint)
+        self.dedupe.home_observed_this_session.add(fingerprint)
         self.dedupe.next_post_number += 1
         self.dedupe.post_numbers[fingerprint] = self.dedupe.next_post_number
         self.stats.body_extracted += int(bool(target.body and target.body.strip()))
         self.viewport_classified += 1
-        is_new = fingerprint not in self.dedupe.previously_seen
+        is_new = fingerprint not in self.dedupe.checkpoint_seen
         if is_new:
             self.dedupe.new_fingerprints.add(fingerprint)
         decision = classify_body(target.body, self.normalized_terms)
