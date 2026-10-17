@@ -22,4 +22,4 @@ jobs:
       - run: uv sync --locked
       - run: uv run ruff check .
       - run: uv run playwright install --with-deps chromium
-      - run: uv run pytest -q --maxfail=1
+      - run: xvfb-run -a uv run pytest -q --maxfail=1
