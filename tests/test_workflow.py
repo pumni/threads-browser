@@ -7440,6 +7440,190 @@ window.addEventListener("wheel", () => {{
     assert checkpoint.detail_reads == 0
 
 
+@pytest.mark.parametrize("max_scrolls", (3, 8))
+def test_continuous_below_viewport_lookahead_does_not_block_fallback(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    max_scrolls: int,
+) -> None:
+    actor = "offline.operator"
+    stale_url = "https://www.threads.com/@candidate/post/absent-boundary-pending"
+    terms = ("hiring",)
+    # At a 720px viewport, rows are 288px tall and the new last row's body
+    # starts at the lower viewport boundary. Each 288px wheel brings the old
+    # lookahead body fully into view while another row becomes lookahead.
+    cards = "".join(
+        f'''<article class="card"><a href="/@candidate/post/lookahead-{index}">
+<time>now</time></a><a href="/@candidate">candidate</a>
+<p class="body">Synthetic weather update {index}.</p></article>'''
+        for index in range(20)
+    )
+    feed_html = f"""<!doctype html><html><head><meta charset="utf-8"><style>
+html, body {{ margin: 0; }}
+nav {{ height: 36px; }}
+main {{ display: block; }}
+.card {{ position: relative; height: 288px; }}
+.body {{ position: absolute; top: 108px; left: 12px; line-height: 24px; }}
+</style></head><body><nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main>{cards}</main></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "synthetic-profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+    policy, stale_fingerprint, _ = _seed_pending_checkpoint(
+        store,
+        account,
+        terms,
+        stale_url,
+    )
+    actionability_checks: list[str] = []
+
+    async def reject_target(self, target):
+        actionability_checks.append(target.fingerprint)
+        raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED")
+
+    monkeypatch.setattr(ThreadsHomeReader, "actionable_now", reject_target)
+
+    async def exercise(page) -> None:
+        result = await _run_page_workflow_for_test(
+            page,
+            account,
+            store,
+            max_posts=20,
+            max_scrolls=max_scrolls,
+            max_total_posts=40,
+            terms=terms,
+            detail=True,
+        )
+        assert result.status == "NO_ACTIONABLE_TARGET"
+        assert result.scroll_attempts == result.scrolls == max_scrolls
+        assert result.unresolved_gaps == 0
+        assert result.viewport_coverage_complete
+        assert result.detail_reads == 0
+        assert page.url == HOME_URL
+
+    _run_offline_page(feed_html, exercise)
+    output = capsys.readouterr().out
+    scroll_deltas = [
+        float(value)
+        for value in re.findall(
+            r"\[SCROLL\] attempt=\d+ status=ADVANCED observed=1 delta_px=([0-9.]+)",
+            output,
+        )
+    ]
+    assert len(scroll_deltas) == max_scrolls
+    assert all(value == pytest.approx(288, abs=1) for value in scroll_deltas)
+    assert actionability_checks
+    assert "state=DEFERRED_TEXT_BELOW" in output
+    assert "unresolved_gaps=0" in output
+    assert "[DETAIL]" not in output
+    assert "[BACK]" not in output
+    assert "[CHECKPOINT] status=NOT_SAVED reason=NO_ACTIONABLE_TARGET" in output
+    assert all(value not in output for value in (stale_url, actor, str(profile)))
+    checkpoint = store.load(account.account_id, policy)
+    assert checkpoint.schema_version == 3
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.pending_read_fingerprints == (stale_fingerprint,)
+
+
+@pytest.mark.parametrize("max_scrolls", (3, 8))
+def test_encountered_incomplete_body_keeps_fallback_blocked_after_scrolls(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    max_scrolls: int,
+) -> None:
+    actor = "offline.operator"
+    stale_url = "https://www.threads.com/@candidate/post/absent-incomplete-pending"
+    terms = ("hiring",)
+    long_body = " ".join(["Synthetic weather remains unresolved."] * 120)
+    cards = "".join(
+        f'''<article class="card"><a href="/@candidate/post/verified-{index}">
+<time>now</time></a><a href="/@candidate">candidate</a>
+<p class="body">Synthetic weather update {index}.</p></article>'''
+        for index in range(12)
+    )
+    feed_html = f"""<!doctype html><html><head><meta charset="utf-8"><style>
+html, body {{ margin: 0; }}
+nav {{ height: 36px; }}
+main {{ display: block; }}
+.card {{ position: relative; height: 288px; }}
+.body {{ position: absolute; top: 108px; left: 12px; line-height: 24px; }}
+.incomplete {{ height: 288px; }}
+.incomplete .body {{ top: 80px; width: 220px; height: 24px; overflow: hidden; }}
+</style></head><body><nav aria-label="Main" role="navigation">
+<a aria-current="page" aria-label="For you" href="/">For you</a>
+<a aria-label="Profile" href="/@{actor}">Profile</a></nav>
+<main><article class="card incomplete">
+<a href="/@candidate/post/incomplete"><time>now</time></a>
+<a href="/@candidate">candidate</a><p class="body">{long_body}</p></article>
+{cards}</main></body></html>"""
+    data_root = tmp_path / "data"
+    profile = tmp_path / "synthetic-profile"
+    profile.mkdir()
+    account = AccountStore(data_root).add("offline", actor, profile)
+    store = CheckpointStore(data_root)
+    policy, stale_fingerprint, _ = _seed_pending_checkpoint(
+        store,
+        account,
+        terms,
+        stale_url,
+    )
+    actionability_checks: list[str] = []
+
+    async def reject_target(self, target):
+        actionability_checks.append(target.fingerprint)
+        raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED")
+
+    monkeypatch.setattr(ThreadsHomeReader, "actionable_now", reject_target)
+
+    async def exercise(page) -> None:
+        result = await _run_page_workflow_for_test(
+            page,
+            account,
+            store,
+            max_posts=20,
+            max_scrolls=max_scrolls,
+            max_total_posts=40,
+            terms=terms,
+            detail=True,
+        )
+        assert result.status == "RELEVANT_POST_NOT_CURRENT"
+        assert result.scroll_attempts == result.scrolls == max_scrolls
+        assert result.unresolved_gaps == 1
+        assert not result.viewport_coverage_complete
+        assert result.detail_reads == 0
+        assert page.url == HOME_URL
+
+    _run_offline_page(feed_html, exercise)
+    output = capsys.readouterr().out
+    scroll_deltas = [
+        float(value)
+        for value in re.findall(
+            r"\[SCROLL\] attempt=\d+ status=ADVANCED observed=1 delta_px=([0-9.]+)",
+            output,
+        )
+    ]
+    assert len(scroll_deltas) == max_scrolls
+    assert all(value == pytest.approx(288, abs=1) for value in scroll_deltas)
+    assert not actionability_checks
+    assert "state=PARTIAL_BODY" in output
+    assert "reason=VISIBLE_TEXT_PROGRESS" in output
+    assert "SEARCH_INCOMPLETE reason=RELEVANT_POST_NOT_CURRENT" in output
+    assert "[DETAIL]" not in output
+    assert "[BACK]" not in output
+    assert "[CHECKPOINT] status=NOT_SAVED reason=RELEVANT_POST_NOT_CURRENT" in output
+    assert all(value not in output for value in (stale_url, actor, long_body, str(profile)))
+    checkpoint = store.load(account.account_id, policy)
+    assert checkpoint.schema_version == 3
+    assert checkpoint.completed_runs == 1
+    assert checkpoint.pending_read_fingerprints == (stale_fingerprint,)
+
+
 def test_carried_candidate_status_is_kept_per_row() -> None:
     actor = "offline.operator"
     feed_html = f"""<!doctype html><html><body>
