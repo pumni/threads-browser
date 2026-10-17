@@ -82,6 +82,10 @@ from .browser_ui.viewport_scan import (
     _ViewportScanRequest,
     _VisibleTargets,
 )
+from .console_output import (
+    ConsoleOutputPolicy,
+    emit_console_diagnostic,
+)
 from .errors import UiReadError
 from .feed.models import (
     BodyReadEvidence,
@@ -163,11 +167,16 @@ class ThreadsHomeReader:
         *,
         readiness_prompt: Callable[[str, int], Awaitable[bool]] | None = None,
         detail_mode: bool = False,
+        console_output_policy: ConsoleOutputPolicy = ConsoleOutputPolicy.INTERACTIVE,
     ) -> None:
         if expected_actor is not None and _USERNAME.fullmatch(expected_actor) is None:
             raise UiReadError("ACTOR_INVALID")
         self._page = page
-        self._loading_observer = LoadingObserver(page)
+        self._console_output_policy = console_output_policy
+        self._loading_observer = LoadingObserver(
+            page,
+            console_output_policy=console_output_policy,
+        )
         self._body_text = BodyTextReader(page)
         self._scroll_engine = NativeWheelScrollEngine(page)
         self._expected_actor = None if expected_actor is None else expected_actor.casefold()
@@ -226,6 +235,7 @@ class ThreadsHomeReader:
         self._detail_navigator = DetailNavigator(
             self,
             timeout_ms=_DETAIL_TIMEOUT_MS,
+            console_output_policy=console_output_policy,
         )
         self._reported_render_rescans: set[tuple[str, float | None]] = set()
         self._skipped_candidate_identities: set[str] = set()
@@ -441,7 +451,7 @@ class ThreadsHomeReader:
         identities.update(error.identities)
         if len(identities) != previous_count:
             cause = "" if error.diagnostic_reason is None else f" cause={error.diagnostic_reason}"
-            print(f"SKIPPED stage={stage} reason={error.reason} count={len(identities)}{cause}")
+            emit_console_diagnostic(self._console_output_policy, f"SKIPPED stage={stage} reason={error.reason} count={len(identities)}{cause}")
 
     def _record_scan_skip(
         self,
@@ -1050,9 +1060,10 @@ class ThreadsHomeReader:
                     error_class=failure.error_class,
                     page_closed=failure.page_closed,
                     context_closed=failure.context_closed,
+                    console_output_policy=self._console_output_policy,
                 )
                 if not self._detail_mode:
-                    print(f"SCROLL attempt={self.scroll_attempts} observed=0")
+                    emit_console_diagnostic(self._console_output_policy, f"SCROLL attempt={self.scroll_attempts} observed=0")
                 code = (
                     "BROWSER_SESSION_UNAVAILABLE"
                     if failure.error_class == "TARGET_CLOSED"
@@ -1062,7 +1073,7 @@ class ThreadsHomeReader:
             observed_delta = gesture.observed_delta
             if observed_delta <= 1:
                 if not self._detail_mode:
-                    print(f"SCROLL attempt={self.scroll_attempts} observed=0")
+                    emit_console_diagnostic(self._console_output_policy, f"SCROLL attempt={self.scroll_attempts} observed=0")
                 raise UiReadError("HOME_SCROLL_UNVERIFIED")
             if observed_delta > viewport_height * 0.5 + 1:
                 raise UiReadError("HOME_SCROLL_ADVANCE_OVERSIZED")
@@ -1126,7 +1137,7 @@ class ThreadsHomeReader:
                 )
             except UiReadError:
                 if not self._detail_mode:
-                    print(f"SCROLL attempt={self.scroll_attempts} observed=0")
+                    emit_console_diagnostic(self._console_output_policy, f"SCROLL attempt={self.scroll_attempts} observed=0")
                 raise
             self.scrolls += 1
             self.last_scroll_delta = observed_delta
@@ -1164,7 +1175,7 @@ class ThreadsHomeReader:
             )
             self.last_scroll_band = delta_band
             if not self._detail_mode:
-                print(f"SCROLL attempt={self.scroll_attempts} observed=1 delta_band={delta_band}")
+                emit_console_diagnostic(self._console_output_policy, f"SCROLL attempt={self.scroll_attempts} observed=1 delta_band={delta_band}")
             return True
         finally:
             await surface.dispose()
@@ -1286,6 +1297,7 @@ class ThreadsHomeReader:
                         error_class=failure.error_class,
                         page_closed=failure.page_closed,
                         context_closed=failure.context_closed,
+                        console_output_policy=self._console_output_policy,
                         stage=self._scan_stage,
                         viewport_index=self._scan_viewport_index,
                         candidate_index=self._scan_candidate_index,
@@ -1325,7 +1337,7 @@ class ThreadsHomeReader:
                         self._viewport_scan.clear_scan_state()
                         self.last_scan_retry_count += 1
                         window += 1
-                        print(f"WAITING stage={stage} retry={window}")
+                        emit_console_diagnostic(self._console_output_policy, f"WAITING stage={stage} retry={window}")
                         continue
                     await self._dispose_active_scan_candidate_handles()
                     self._scan_failure_site = None
@@ -1338,6 +1350,7 @@ class ThreadsHomeReader:
                     error_class=failure.error_class,
                     page_closed=failure.page_closed,
                     context_closed=failure.context_closed,
+                    console_output_policy=self._console_output_policy,
                     error_kind=classify_playwright_error_kind(error),
                 )
                 if failure.error_class == "TARGET_CLOSED":
@@ -1355,7 +1368,7 @@ class ThreadsHomeReader:
                     else:
                         dom_change_retried = True
                     window += 1
-                    print(f"WAITING stage={stage} retry={window}")
+                    emit_console_diagnostic(self._console_output_policy, f"WAITING stage={stage} retry={window}")
                     continue
                 if (
                     failure_operation == "DETAIL"
@@ -1364,7 +1377,7 @@ class ThreadsHomeReader:
                 ):
                     detail_ui_retried = True
                     window += 1
-                    print(f"WAITING stage={stage} retry={window}")
+                    emit_console_diagnostic(self._console_output_policy, f"WAITING stage={stage} retry={window}")
                     continue
                 raise UiReadError("UI_READ_UNVERIFIED") from None
             except UiReadError as error:
@@ -1378,11 +1391,11 @@ class ThreadsHomeReader:
                 final_code = error.code
             else:
                 if window:
-                    print(f"RECOVERED stage={stage} retry={window}")
+                    emit_console_diagnostic(self._console_output_policy, f"RECOVERED stage={stage} retry={window}")
                 return result
 
             window += 1
-            print(f"WAITING stage={stage} retry={window}")
+            emit_console_diagnostic(self._console_output_policy, f"WAITING stage={stage} retry={window}")
             if window < _AUTOMATIC_READINESS_WINDOWS:
                 continue
             if self._readiness_prompt is None:
@@ -1568,7 +1581,7 @@ class ThreadsHomeReader:
         coverage_complete = str(getattr(observation.value, "coverage_complete", False)).lower()
         ready_state = observation.ready_state
         if ready_state == "FEED_VISIBLE_UNVERIFIED":
-            print(
+            emit_console_diagnostic(self._console_output_policy,
                 f"OBSERVED stage={stage} state=FEED_VISIBLE_UNVERIFIED verified=0 "
                 "identity=OBSERVED_UNVERIFIED "
                 f"observed_rows={getattr(observation.value, 'observed_rows', 0)} "
@@ -1576,7 +1589,7 @@ class ThreadsHomeReader:
                 f"viewport_coverage_complete={coverage_complete} render_checks={checks}"
             )
         elif ready_state == "OBSERVATION_UNCERTAIN":
-            print(
+            emit_console_diagnostic(self._console_output_policy,
                 f"OBSERVED stage={stage} state=OBSERVATION_UNCERTAIN "
                 f"verified={self.last_scan_counts.verified} "
                 f"observed_rows={self.last_scan_counts.observed_rows} "
@@ -1584,7 +1597,7 @@ class ThreadsHomeReader:
                 f"viewport_coverage_complete={coverage_complete} render_checks={checks}"
             )
         elif ready_state == "DISPLAY_OBSERVATION":
-            print(
+            emit_console_diagnostic(self._console_output_policy,
                 f"OBSERVED stage={stage} state=DISPLAY_OBSERVATION "
                 f"verified={self.last_scan_counts.verified} "
                 f"observed_rows={self.last_scan_counts.observed_rows} "
@@ -1592,7 +1605,7 @@ class ThreadsHomeReader:
                 f"viewport_coverage_complete={coverage_complete} render_checks={checks}"
             )
         elif ready_state == "BODY_EXTRACTED":
-            print(
+            emit_console_diagnostic(self._console_output_policy,
                 f"READY stage={stage} state=BODY_EXTRACTED "
                 f"verified={self.last_scan_counts.verified} "
                 f"observed_rows={self.last_scan_counts.observed_rows} "
@@ -1600,13 +1613,13 @@ class ThreadsHomeReader:
                 f"viewport_coverage_complete={coverage_complete} render_checks={checks}"
             )
         elif ready_state == "UI_SHELL_SETTLED":
-            print(f"READY stage={stage} state=UI_SHELL_SETTLED render_checks={checks}")
+            emit_console_diagnostic(self._console_output_policy, f"READY stage={stage} state=UI_SHELL_SETTLED render_checks={checks}")
         elif ready_state == "FEED_EVIDENCE":
-            print(f"OBSERVED stage={stage} state=FEED_EVIDENCE render_checks={checks}")
+            emit_console_diagnostic(self._console_output_policy, f"OBSERVED stage={stage} state=FEED_EVIDENCE render_checks={checks}")
         elif ready_state == "DETAIL_VERIFIED":
-            print(f"READY stage={stage} state=DETAIL_VERIFIED render_checks={checks}")
+            emit_console_diagnostic(self._console_output_policy, f"READY stage={stage} state=DETAIL_VERIFIED render_checks={checks}")
         else:
-            print(f"READY stage={stage} render_checks={checks}")
+            emit_console_diagnostic(self._console_output_policy, f"READY stage={stage} render_checks={checks}")
 
     async def _observe_feed_targets(
         self,
@@ -1859,14 +1872,14 @@ class ThreadsHomeReader:
         )
         counts = self.last_scan_counts
         if counts.verified and counts.body_read and scan.coverage_complete:
-            print(
+            emit_console_diagnostic(self._console_output_policy,
                 f"READY stage={stage_name} state=BODY_EXTRACTED "
                 f"verified={counts.verified} observed_rows={counts.observed_rows} "
                 f"body_extracted={counts.body_extracted} "
                 f"viewport_coverage_complete={str(counts.coverage_complete).lower()}"
             )
         elif counts.body_extracted and not counts.verified and scan.coverage_complete:
-            print(
+            emit_console_diagnostic(self._console_output_policy,
                 f"OBSERVED stage={stage_name} "
                 "state=FEED_VISIBLE_UNVERIFIED verified=0 "
                 f"identity=OBSERVED_UNVERIFIED observed_rows={counts.observed_rows} "
@@ -1874,7 +1887,7 @@ class ThreadsHomeReader:
                 f"viewport_coverage_complete={str(counts.coverage_complete).lower()}"
             )
         elif counts.observed_rows:
-            print(
+            emit_console_diagnostic(self._console_output_policy,
                 f"OBSERVED stage={stage_name} state=OBSERVATION_UNCERTAIN "
                 f"verified={counts.verified} observed_rows={counts.observed_rows} "
                 f"uncertain_rows={counts.uncertain_rows} "

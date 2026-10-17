@@ -11,6 +11,7 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page, async_playwright
 
 from .browser_ui.session import classify_playwright_failure, emit_failure_diagnostic
+from .console_output import ConsoleOutputPolicy
 from .nurture.diagnostics import _terminal_safe_post_text
 from .nurture.engine import NurtureResult
 from .nurture.engine import _run_page_workflow_cycle as _execute_page_workflow
@@ -48,6 +49,7 @@ async def _run_page_workflow_locked(
     show_post_text: bool = False,
     show_observed_text: bool = False,
     detail: bool = False,
+    console_output_policy: ConsoleOutputPolicy = ConsoleOutputPolicy.INTERACTIVE,
 ) -> NurtureResult:
     """Run one page cycle; caller must hold the account profile lock."""
     try:
@@ -63,6 +65,7 @@ async def _run_page_workflow_locked(
             show_post_text=show_post_text,
             show_observed_text=show_observed_text,
             detail=detail,
+            console_output_policy=console_output_policy,
             reader_factory=ThreadsHomeReader,
         )
     except UiReadError:
@@ -75,6 +78,7 @@ async def _run_page_workflow_locked(
             error_class=failure.error_class,
             page_closed=failure.page_closed,
             context_closed=failure.context_closed,
+            console_output_policy=console_output_policy,
         )
         code = (
             "BROWSER_SESSION_UNAVAILABLE"
@@ -91,6 +95,7 @@ async def _run_page_workflow_locked(
             error_class="STATE_INVALID",
             page_closed=page.is_closed(),
             context_closed=None,
+            console_output_policy=console_output_policy,
         )
         raise UiReadError("INTERNAL_STATE_ERROR") from None
     except (ValueError, RuntimeError):
@@ -100,6 +105,7 @@ async def _run_page_workflow_locked(
             error_class="STATE_INVALID",
             page_closed=page.is_closed(),
             context_closed=None,
+            console_output_policy=console_output_policy,
         )
         raise UiReadError("INTERNAL_STATE_ERROR") from None
     except Exception:  # noqa: BLE001 - Sanitize unexpected failures at the API boundary.
@@ -109,6 +115,7 @@ async def _run_page_workflow_locked(
             error_class="OTHER",
             page_closed=page.is_closed(),
             context_closed=None,
+            console_output_policy=console_output_policy,
         )
         raise UiReadError("INTERNAL_OPERATION_ERROR") from None
 
@@ -126,7 +133,12 @@ async def run_browser_nurture(
     show_post_text: bool = False,
     show_observed_text: bool = False,
     detail: bool = False,
+    console_output_policy: ConsoleOutputPolicy = ConsoleOutputPolicy.INTERACTIVE,
 ) -> NurtureResult:
+    if console_output_policy is ConsoleOutputPolicy.SCHEDULED and (
+        detail or show_post_text or show_observed_text
+    ):
+        raise UiReadError("SCHEDULED_TEXT_OUTPUT_INVALID")
     if account.expected_actor is None:
         raise BrowserDataError("ACCOUNT_NOT_VERIFIED")
     if detail and not _detail_terminal_ready():
@@ -166,6 +178,7 @@ async def run_browser_nurture(
                     show_post_text=show_post_text,
                     show_observed_text=show_observed_text,
                     detail=detail,
+                    console_output_policy=console_output_policy,
                 )
         except TimeoutError:
             if timeout_scope is None or not timeout_scope.expired():
@@ -177,6 +190,7 @@ async def run_browser_nurture(
                 error_kind="TIMEOUT",
                 page_closed=None,
                 context_closed=None,
+                console_output_policy=console_output_policy,
             )
             raise UiReadError("CYCLE_TIMEOUT") from None
     except (UiReadError, BrowserDataError):
@@ -189,6 +203,7 @@ async def run_browser_nurture(
             error_class=failure.error_class,
             page_closed=failure.page_closed,
             context_closed=failure.context_closed,
+            console_output_policy=console_output_policy,
         )
         code = (
             "BROWSER_SESSION_UNAVAILABLE"
@@ -203,6 +218,7 @@ async def run_browser_nurture(
             error_class="OTHER",
             page_closed=False,
             context_closed=None,
+            console_output_policy=console_output_policy,
         )
         raise UiReadError("INTERNAL_OPERATION_ERROR") from None
     finally:
@@ -216,10 +232,16 @@ async def run_browser_nurture(
                             await context.close()
                     except TimeoutError:
                         cleanup_failed = True
-                        _emit_cleanup_failure(timed_out=True)
+                        _emit_cleanup_failure(
+                            timed_out=True,
+                            console_output_policy=console_output_policy,
+                        )
                     except Exception:  # noqa: BLE001 - sanitize browser cleanup failures.
                         cleanup_failed = True
-                        _emit_cleanup_failure(timed_out=False)
+                        _emit_cleanup_failure(
+                            timed_out=False,
+                            console_output_policy=console_output_policy,
+                        )
                 if manager_start_attempted:
                     assert playwright_manager is not None
                     try:
@@ -227,10 +249,16 @@ async def run_browser_nurture(
                             await playwright_manager.__aexit__(None, None, None)
                     except TimeoutError:
                         cleanup_failed = True
-                        _emit_cleanup_failure(timed_out=True)
+                        _emit_cleanup_failure(
+                            timed_out=True,
+                            console_output_policy=console_output_policy,
+                        )
                     except Exception:  # noqa: BLE001 - sanitize browser cleanup failures.
                         cleanup_failed = True
-                        _emit_cleanup_failure(timed_out=False)
+                        _emit_cleanup_failure(
+                            timed_out=False,
+                            console_output_policy=console_output_policy,
+                        )
             finally:
                 lock.release()
             return cleanup_failed
@@ -257,7 +285,11 @@ async def run_browser_nurture(
             raise UiReadError("BROWSER_CLEANUP_FAILED") from None
 
 
-def _emit_cleanup_failure(*, timed_out: bool) -> None:
+def _emit_cleanup_failure(
+    *,
+    timed_out: bool,
+    console_output_policy: ConsoleOutputPolicy = ConsoleOutputPolicy.INTERACTIVE,
+) -> None:
     emit_failure_diagnostic(
         phase="STOPPED",
         operation="OTHER",
@@ -265,4 +297,5 @@ def _emit_cleanup_failure(*, timed_out: bool) -> None:
         error_kind="TIMEOUT" if timed_out else "OTHER",
         page_closed=None,
         context_closed=None,
+        console_output_policy=console_output_policy,
     )

@@ -10,6 +10,10 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
 
 from ..browser_ui.session import classify_playwright_failure, emit_failure_diagnostic
+from ..console_output import (
+    ConsoleOutputPolicy,
+    emit_console_diagnostic,
+)
 from ..feed.models import BodyReadEvidence, PostTarget
 from ..feed.relevance import canonical_terms, classify_body
 from ..reader import ThreadsHomeReader, UiReadError, _HomeRowObservation
@@ -52,6 +56,7 @@ def _reader_playwright_error(
     *,
     phase: str,
     operation: str,
+    console_output_policy: ConsoleOutputPolicy = ConsoleOutputPolicy.INTERACTIVE,
 ) -> UiReadError:
     failure = classify_playwright_failure(page, error)
     emit_failure_diagnostic(
@@ -60,6 +65,7 @@ def _reader_playwright_error(
         error_class=failure.error_class,
         page_closed=failure.page_closed,
         context_closed=failure.context_closed,
+        console_output_policy=console_output_policy,
     )
     code = (
         "BROWSER_SESSION_UNAVAILABLE"
@@ -184,6 +190,7 @@ async def _run_page_workflow_cycle(
     show_post_text: bool = False,
     show_observed_text: bool = False,
     detail: bool = False,
+    console_output_policy: ConsoleOutputPolicy = ConsoleOutputPolicy.INTERACTIVE,
     reader_factory: Callable[..., ThreadsHomeReader] = ThreadsHomeReader,
 ) -> NurtureResult:
     """Run one internal page cycle under workflow's held profile lock."""
@@ -203,11 +210,15 @@ async def _run_page_workflow_cycle(
         checkpoint.seen_fingerprints, checkpoint.pending_read_fingerprints
     )
     stats = WorkflowStats()
+    reader_options = {}
+    if console_output_policy is not ConsoleOutputPolicy.INTERACTIVE:
+        reader_options["console_output_policy"] = console_output_policy
     reader = reader_factory(
         page,
         account.expected_actor,
         readiness_prompt=readiness_prompt,
         detail_mode=detail,
+        **reader_options,
     )
     reader.set_failure_context("INITIALIZING", "SETTLE")
     try:
@@ -221,15 +232,16 @@ async def _run_page_workflow_cycle(
                 raw_error,
                 phase=state.phase.value,
                 operation="SETTLE",
+                console_output_policy=console_output_policy,
             )
         )
         state.stop(error.code)
         if detail:
-            print(f"[HOME] status=FAILED code={error.code}")
+            emit_console_diagnostic(console_output_policy, f"[HOME] status=FAILED code={error.code}")
         raise error from None
     state.transition(WorkflowPhase.OBSERVING)
     if detail:
-        print("[HOME] status=READY account=VERIFIED source=FOR_YOU")
+        emit_console_diagnostic(console_output_policy, "[HOME] status=READY account=VERIFIED source=FOR_YOU")
     selected = None
     coverage = CoverageLedger()
     previous_unverified_rows: list[tuple[str, float]] = []
@@ -253,7 +265,7 @@ async def _run_page_workflow_cycle(
             },
         }
         if detail:
-            print(f"[SCROLL] attempt={attempt} status=REQUESTED")
+            emit_console_diagnostic(console_output_policy, f"[SCROLL] attempt={attempt} status=REQUESTED")
         state.transition(WorkflowPhase.SCROLLING)
         reader.set_failure_context(state.phase.value, "SCROLL")
         try:
@@ -267,24 +279,25 @@ async def _run_page_workflow_cycle(
                     raw_error,
                     phase=state.phase.value,
                     operation="SCROLL",
+                    console_output_policy=console_output_policy,
                 )
             )
             state.stop(error.code)
             if detail:
-                print(f"[SCROLL] attempt={attempt} status=FAILED code={error.code}")
+                emit_console_diagnostic(console_output_policy, f"[SCROLL] attempt={attempt} status=FAILED code={error.code}")
             raise error from None
         if detail:
             gesture = reader.last_scroll_gesture
             wheel_steps = 0 if gesture is None else len(gesture.wheel_deltas)
             gesture_ms = 0 if gesture is None else gesture.duration_ms
             if advanced:
-                print(
+                emit_console_diagnostic(console_output_policy,
                     f"[SCROLL] attempt={reader.scroll_attempts} status=ADVANCED "
                     f"observed=1 delta_px={reader.last_scroll_delta:g} "
                     f"wheel_steps={wheel_steps} gesture_ms={gesture_ms}"
                 )
             else:
-                print(
+                emit_console_diagnostic(console_output_policy,
                     f"[SCROLL] attempt={attempt} status=STOPPED "
                     f"reason={reader.last_scroll_stop_reason or 'NOT_ADVANCED'}"
                 )
@@ -310,6 +323,7 @@ async def _run_page_workflow_cycle(
                         raw_error,
                         phase=state.phase.value,
                         operation="SCAN_ROW",
+                        console_output_policy=console_output_policy,
                     )
                 )
                 if error.code not in {
@@ -321,10 +335,10 @@ async def _run_page_workflow_cycle(
                     raise error from None
                 actionability_rejected_codes.add(error.code)
                 if detail:
-                    print(f"[ACTIONABILITY] status=REJECTED code={error.code}")
+                    emit_console_diagnostic(console_output_policy, f"[ACTIONABILITY] status=REJECTED code={error.code}")
                 continue
             if detail:
-                print("[ACTIONABILITY] status=CONFIRMED")
+                emit_console_diagnostic(console_output_policy, "[ACTIONABILITY] status=CONFIRMED")
             return current
         return None
 
@@ -563,7 +577,7 @@ async def _run_page_workflow_cycle(
                 def metric_count(value: int | None) -> str:
                     return "UNKNOWN" if value is None else str(value)
 
-                print(
+                emit_console_diagnostic(console_output_policy,
                     f"[ROW row_id={diagnostic.observation_id or 'UNTRACKED'} "
                     f"viewport_row={diagnostic.row_index}] root={diagnostic.root_kind} "
                     f"has_visible_time={str(diagnostic.has_visible_time).lower()} "
@@ -641,7 +655,7 @@ async def _run_page_workflow_cycle(
                     elif target.fingerprint in dedupe.previously_seen:
                         dedupe.checkpoint_overlap.add(target.fingerprint)
                     if detail and target.fingerprint not in dedupe.streamed_home_fingerprints:
-                        print(
+                        emit_console_diagnostic(console_output_policy,
                             f"[POST post={dedupe.post_numbers[target.fingerprint]}] "
                             "status=VERIFIED decision=OVERLAP_DUPLICATE HOME_BODY=OMITTED",
                             flush=True,
@@ -683,7 +697,7 @@ async def _run_page_workflow_cycle(
                             stats.previewed_bodies += 1
                         dedupe.streamed_home_fingerprints.add(target.fingerprint)
                     else:
-                        print(
+                        emit_console_diagnostic(console_output_policy,
                             f"[POST post={dedupe.post_numbers[target.fingerprint]}] "
                             f"status=VERIFIED decision={decision} "
                             f"extent={'TRUNCATED' if target.body_truncated else 'COMPLETE'} "
@@ -724,7 +738,7 @@ async def _run_page_workflow_cycle(
                 stats.observation_unknown += 1
                 viewport_observation_unknown += 1
                 if detail:
-                    print(
+                    emit_console_diagnostic(console_output_policy,
                         f"[POST viewport={viewport_number} row={diagnostic.row_index}] "
                         "status=OBSERVATION_UNCERTAIN decision=UNKNOWN body=UNAVAILABLE",
                         flush=True,
@@ -752,7 +766,7 @@ async def _run_page_workflow_cycle(
                 )
             if overlap_duplicate:
                 if detail:
-                    print(
+                    emit_console_diagnostic(console_output_policy,
                         f"[POST viewport={viewport_number} row={diagnostic.row_index}] "
                         "status=OBSERVED_UNVERIFIED decision=OVERLAP_DUPLICATE "
                         "HOME_BODY=OMITTED",
@@ -809,6 +823,7 @@ async def _run_page_workflow_cycle(
                     raw_error,
                     phase=state.phase.value,
                     operation="SCAN_ROW",
+                    console_output_policy=console_output_policy,
                 )
             )
             state.stop(error.code)
@@ -822,7 +837,7 @@ async def _run_page_workflow_cycle(
                 )
                 or "none"
             )
-            print(
+            emit_console_diagnostic(console_output_policy,
                 f"SCAN_STOP viewport={viewport_number} visible_links={counts.visible_links} "
                 f"inspected={counts.inspected} url_parsed={counts.url_parsed} "
                 f"author_unverified={counts.author_unverified} "
@@ -838,7 +853,7 @@ async def _run_page_workflow_cycle(
                 f"{_format_structure_diagnostics(counts)}"
             )
             if detail:
-                print(
+                emit_console_diagnostic(console_output_policy,
                     f"[TIMING] viewport={viewport_number} "
                     f"discover_ms={reader.last_scan_timings.discover_ms} "
                     f"read_row_ms={reader.last_scan_timings.read_row_ms} "
@@ -847,7 +862,7 @@ async def _run_page_workflow_cycle(
                     flush=True,
                 )
                 _print_url_structure_diagnostics(counts)
-                print(
+                emit_console_diagnostic(console_output_policy,
                     f"[VIEWPORT {viewport_number}] status=PARTIAL code={error.code} "
                     f"coverage={str(counts.coverage_complete).lower()} "
                     f"unrepresented_root_count={counts.unrepresented_root_count} "
@@ -875,7 +890,7 @@ async def _run_page_workflow_cycle(
                     viewport_coverage_complete=False,
                 )
             if detail:
-                print(
+                emit_console_diagnostic(console_output_policy,
                     f"[VIEWPORT] status=FAILED code={error.code} "
                     f"coverage={str(counts.coverage_complete).lower()} "
                     f"unrepresented_root_count={counts.unrepresented_root_count} "
@@ -886,7 +901,7 @@ async def _run_page_workflow_cycle(
         state.transition(WorkflowPhase.OBSERVING)
         scan_counts = reader.last_scan_counts
         if detail:
-            print(
+            emit_console_diagnostic(console_output_policy,
                 f"[VIEWPORT {viewport_number}] observed={scan_counts.observed_rows} "
                 f"verified={scan_counts.verified} body_read={scan_counts.body_read} "
                 f"body_unknown={scan_counts.body_unknown} skipped={scan_counts.skipped} "
@@ -897,7 +912,7 @@ async def _run_page_workflow_cycle(
                 f"lookahead_rows={scan_counts.lookahead_rows}",
                 flush=True,
             )
-            print(
+            emit_console_diagnostic(console_output_policy,
                 f"[TIMING] viewport={viewport_number} "
                 f"discover_ms={reader.last_scan_timings.discover_ms} "
                 f"read_row_ms={reader.last_scan_timings.read_row_ms} "
@@ -970,7 +985,7 @@ async def _run_page_workflow_cycle(
                 def count(value: int | None) -> str:
                     return "UNKNOWN" if value is None else str(value)
 
-                print(
+                emit_console_diagnostic(console_output_policy,
                     f"[SCROLL_ROW_PROGRESS] attempt={reader.scrolls} "
                     f"row_id={diagnostic.observation_id or 'UNTRACKED'} "
                     f"root_intersects={'UNKNOWN' if metrics.root_intersects is None else str(metrics.root_intersects).lower()} "
@@ -1005,7 +1020,7 @@ async def _run_page_workflow_cycle(
                 )
             geometry = reader.last_scroll_geometry or {}
             if geometry:
-                print(
+                emit_console_diagnostic(console_output_policy,
                     f"[SCROLL_GEOMETRY] surface_key={geometry.get('surface_key', 'UNKNOWN')} "
                     f"surface_tag={geometry.get('surface_tag', 'UNKNOWN')} "
                     f"overflow_y={geometry.get('overflow_y', 'UNKNOWN')} "
@@ -1023,7 +1038,7 @@ async def _run_page_workflow_cycle(
                     f"scroll_height_delta={geometry.get('scroll_height_delta', 'UNKNOWN')}",
                     flush=True,
                 )
-            print(
+            emit_console_diagnostic(console_output_policy,
                 f"[SCROLL_PROGRESS] attempt={reader.scrolls} "
                 f"state={'ADVANCED_WITH_CONTENT' if made_progress else 'MOVED_NO_NEW_CONTENT'} "
                 f"new_segments={new_segments} "
@@ -1055,7 +1070,7 @@ async def _run_page_workflow_cycle(
                     exhaustion_reason = "READ_PROGRESS_STALLED"
                     coverage.unrepresented_gaps.add(f"stalled:{reader.scrolls}")
                     stats.viewport_coverage_complete = False
-                print(
+                emit_console_diagnostic(console_output_policy,
                     f"[SCROLL_PROGRESS] status=STOPPED reason={exhaustion_reason} "
                     "coverage=INCOMPLETE "
                     f"unresolved_gaps={coverage.unresolved_gap_count}",
@@ -1071,7 +1086,7 @@ async def _run_page_workflow_cycle(
             if scan_counts.uncertain_rows
             else "NONE"
         )
-        print(
+        emit_console_diagnostic(console_output_policy,
             f"SCANNING viewport={viewport_number} verified={scan_counts.verified} "
             f"relevant={viewport_relevant} skipped={scan_counts.skipped} "
             f"visible_links={scan_counts.visible_links} "
@@ -1108,12 +1123,12 @@ async def _run_page_workflow_cycle(
             + _format_structure_diagnostics(scan_counts)
         )
         if not scan_counts.coverage_complete and not reader.last_viewport_deferred_only:
-            print(
+            emit_console_diagnostic(console_output_policy,
                 f"VIEWPORT_COVERAGE_INCOMPLETE viewport={viewport_number} "
                 f"observed_rows={scan_counts.observed_rows} cap={min(max_posts, remaining)}"
             )
             if detail:
-                print(
+                emit_console_diagnostic(console_output_policy,
                     f"[VIEWPORT] verified_body_extracted={scan_counts.body_read} "
                     f"observed_body_extracted={scan_counts.body_extracted - scan_counts.body_read} "
                     f"scan={'PARTIAL' if reader.last_viewport_can_wheel else 'NOT_COMMITTED'} "
@@ -1176,9 +1191,9 @@ async def _run_page_workflow_cycle(
     detail_retry_pending = False
     if selected is None and not stats.found_relevant:
         if exhaustion_reason in {"FEED_END_REACHED", "FEED_NOT_SCROLLABLE"}:
-            print(f"SEARCH_STOP reason={exhaustion_reason} viewports={viewport_number}")
+            emit_console_diagnostic(console_output_policy, f"SEARCH_STOP reason={exhaustion_reason} viewports={viewport_number}")
         else:
-            print(f"SEARCH_BUDGET_EXHAUSTED reason={exhaustion_reason} viewports={viewport_number}")
+            emit_console_diagnostic(console_output_policy, f"SEARCH_BUDGET_EXHAUSTED reason={exhaustion_reason} viewports={viewport_number}")
     if selected is not None:
         state.transition(WorkflowPhase.SELECTING)
         selected_number = dedupe.post_numbers[selected.fingerprint]
@@ -1188,12 +1203,12 @@ async def _run_page_workflow_cycle(
         )
         if detail:
             if selected_decision == "RELEVANT":
-                print(
+                emit_console_diagnostic(console_output_policy,
                     f"[SELECT] post={selected_number} decision=RELEVANT "
                     f"reason={'RELEVANT_PENDING' if selected.fingerprint in dedupe.previously_seen else 'RELEVANT_NEW'}"
                 )
             else:
-                print(
+                emit_console_diagnostic(console_output_policy,
                     f"[SELECT] post={selected_number} "
                     "decision=VERIFIED_FALLBACK reason=NO_RELEVANT_MATCH"
                 )
@@ -1210,6 +1225,7 @@ async def _run_page_workflow_cycle(
                     raw_error,
                     phase=state.phase.value,
                     operation="DETAIL",
+                    console_output_policy=console_output_policy,
                 )
             )
             if error.code not in _DETAIL_READ_FAILURES or not getattr(
@@ -1219,7 +1235,7 @@ async def _run_page_workflow_cycle(
             ):
                 state.stop(error.code)
                 if detail:
-                    print(
+                    emit_console_diagnostic(console_output_policy,
                         f"[DETAIL] post={selected_number} "
                         f"status=FAILED code={error.code}"
                     )
@@ -1227,7 +1243,7 @@ async def _run_page_workflow_cycle(
                 raise error from None
             detail_retry_pending = True
             if detail:
-                print(
+                emit_console_diagnostic(console_output_policy,
                     f"[DETAIL] post={selected_number} status=UNAVAILABLE "
                     f"code={error.code} retry=PENDING"
                 )
@@ -1241,7 +1257,7 @@ async def _run_page_workflow_cycle(
                 if detail_target.body_truncated
                 else "FULL"
             )
-            print(
+            emit_console_diagnostic(console_output_policy,
                 f"[DETAIL] post={selected_number} status=VERIFIED "
                 f"provenance=VERIFIED extent={extent}"
             )
@@ -1254,9 +1270,9 @@ async def _run_page_workflow_cycle(
                 detail_target.body,
             )
         if not detail_retry_pending:
-            print("DETAIL_VERIFIED status=PROVENANCE_VERIFIED")
+            emit_console_diagnostic(console_output_policy, "DETAIL_VERIFIED status=PROVENANCE_VERIFIED")
         if detail:
-            print(f"[BACK] post={selected_number} status=REQUESTED")
+            emit_console_diagnostic(console_output_policy, f"[BACK] post={selected_number} status=REQUESTED")
         state.transition(WorkflowPhase.BACK)
         reader.set_failure_context(state.phase.value, "BACK")
         try:
@@ -1270,6 +1286,7 @@ async def _run_page_workflow_cycle(
                     raw_error,
                     phase=state.phase.value,
                     operation="BACK",
+                    console_output_policy=console_output_policy,
                 )
             )
             state.stop(error.code)
@@ -1277,13 +1294,13 @@ async def _run_page_workflow_cycle(
                 anchor_status = (
                     "CHANGED" if error.code == "RETURN_CONTEXT_CHANGED" else "UNVERIFIED"
                 )
-                print(
+                emit_console_diagnostic(console_output_policy,
                     f"[BACK] post={selected_number} status=FAILED "
                     f"anchor={anchor_status} code={error.code}"
                 )
             raise error from None
         if detail:
-            print(
+            emit_console_diagnostic(console_output_policy,
                 f"[BACK] post={selected_number} status=RESTORED "
                 "anchor=IDENTITY_VERIFIED"
             )
@@ -1302,7 +1319,7 @@ async def _run_page_workflow_cycle(
         and not stats.found_relevant
         and not coverage.has_skips
     ):
-        print("SEARCH_INCOMPLETE reason=UNVERIFIED_RELEVANCE")
+        emit_console_diagnostic(console_output_policy, "SEARCH_INCOMPLETE reason=UNVERIFIED_RELEVANCE")
         if detail:
             _detail_stop("UNVERIFIED_RELEVANCE_REQUIRES_VERIFICATION")
         return _result_from_observation(
@@ -1315,7 +1332,7 @@ async def _run_page_workflow_cycle(
             checkpoint_runs=checkpoint.completed_runs,
         )
     elif selected is None and actionability_rejected_codes:
-        print("SEARCH_INCOMPLETE reason=NO_ACTIONABLE_TARGET")
+        emit_console_diagnostic(console_output_policy, "SEARCH_INCOMPLETE reason=NO_ACTIONABLE_TARGET")
         if detail:
             _detail_stop("NO_ACTIONABLE_TARGET")
         state.stop("NO_ACTIONABLE_TARGET")
@@ -1330,7 +1347,7 @@ async def _run_page_workflow_cycle(
         )
     elif len(dedupe.seen_this_run) == 0 and not coverage.has_skips:
         if show_post_text and stats.previewed_bodies == 0:
-            print(
+            emit_console_diagnostic(console_output_policy,
                 "POST_TEXT status=NONE "
                 f"verified_posts={len(dedupe.seen_this_run)} extracted={stats.previewed_bodies}"
             )
@@ -1363,7 +1380,7 @@ async def _run_page_workflow_cycle(
             if exhaustion_reason == "FEED_END_REACHED"
             else "RELEVANT_POST_NOT_CURRENT"
         )
-        print(f"SEARCH_INCOMPLETE reason={incomplete_status}")
+        emit_console_diagnostic(console_output_policy, f"SEARCH_INCOMPLETE reason={incomplete_status}")
         if detail:
             _detail_stop(incomplete_status)
         return _result_from_observation(
@@ -1429,10 +1446,10 @@ async def _run_page_workflow_cycle(
             _detail_stop(error.code)
         raise
     if detail:
-        print(f"[CHECKPOINT] status=SAVED completed_runs={updated.completed_runs}")
-        print(f"[CYCLE] status={status}")
+        emit_console_diagnostic(console_output_policy, f"[CHECKPOINT] status=SAVED completed_runs={updated.completed_runs}")
+        emit_console_diagnostic(console_output_policy, f"[CYCLE] status={status}")
     if show_post_text and stats.previewed_bodies == 0:
-        print(
+        emit_console_diagnostic(console_output_policy,
             "POST_TEXT status=NONE "
             f"verified_posts={len(dedupe.seen_this_run)} extracted={stats.previewed_bodies}"
         )

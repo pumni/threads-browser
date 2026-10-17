@@ -18,6 +18,10 @@ from playwright.async_api import (
     TimeoutError as PlaywrightTimeoutError,
 )
 
+from ..console_output import (
+    ConsoleOutputPolicy,
+    emit_console_diagnostic,
+)
 from ..errors import UiReadError
 from ..feed.models import PostTarget
 from ..feed.relevance import normalize_text
@@ -135,9 +139,11 @@ class DetailNavigator:
         host: DetailReaderHost,
         *,
         timeout_ms: int,
+        console_output_policy: ConsoleOutputPolicy = ConsoleOutputPolicy.INTERACTIVE,
     ) -> None:
         self._host = host
         self._timeout_ms = timeout_ms
+        self._console_output_policy = console_output_policy
         self._last_reported_detail_state: tuple[str, _DetailState] | None = None
         self.route_verified = False
 
@@ -184,7 +190,7 @@ class DetailNavigator:
         if self._last_reported_detail_state == (phase, state):
             return
         self._last_reported_detail_state = (phase, state)
-        print(
+        emit_console_diagnostic(self._console_output_policy,
             f"[DETAIL_STATE] phase={phase} "
             f"route_verified={str(state.route_verified).lower()} "
             f"same_origin={str(state.same_origin).lower()} "

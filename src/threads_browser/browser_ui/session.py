@@ -11,6 +11,7 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Locator, Page, expect
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
+from ..console_output import ConsoleOutputPolicy
 from ..errors import UiReadError
 from ..feed.relevance import normalize_text
 from ..feed.urls import _profile_author, _same_home_origin
@@ -134,8 +135,12 @@ def emit_failure_diagnostic(
     body_substep: str | None = None,
     identity_source: str | None = None,
     retry_eligibility: str | None = None,
+    console_output_policy: ConsoleOutputPolicy = ConsoleOutputPolicy.INTERACTIVE,
 ) -> None:
     """Print bounded, privacy-safe failure metadata only."""
+    if console_output_policy is ConsoleOutputPolicy.SCHEDULED:
+        return
+
     phases = {
         "INITIALIZING",
         "OBSERVING",

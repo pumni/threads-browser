@@ -13,6 +13,7 @@ from pathlib import Path
 from time import monotonic
 
 from .account_service import add_local_account, open_account_login
+from .console_output import ConsoleOutputPolicy
 from .login import LoginStatus
 from .storage import (
     AccountStore,
@@ -549,6 +550,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                         show_post_text=args.show_post_text,
                         show_observed_text=args.show_observed_text,
                         detail=args.detail,
+                        **(
+                            {"console_output_policy": ConsoleOutputPolicy.SCHEDULED}
+                            if scheduled
+                            else {}
+                        ),
                         readiness_prompt=(
                             _prompt_readiness_extension
                             if not args.no_readiness_prompt
