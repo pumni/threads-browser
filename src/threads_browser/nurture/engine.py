@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from typing import TYPE_CHECKING
 
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import Page
@@ -10,7 +11,7 @@ from playwright.async_api import Page
 from ..console_output import ConsoleOutputPolicy, emit_console_diagnostic
 from ..feed.relevance import canonical_terms
 from ..reader import ThreadsHomeReader, UiReadError
-from ..storage import BrowserAccount, BrowserDataError, CheckpointStore
+from ..storage import BrowserAccount, BrowserDataError, Checkpoint, CheckpointStore
 from .cycle_context import CycleContext
 from .feed_scroll import FeedScrollController
 from .finish_cycle import finish_cycle
@@ -26,6 +27,9 @@ from .state import (
     WorkflowStats,
     policy_fingerprint,
 )
+
+if TYPE_CHECKING:
+    from .session_state import SessionProgress
 
 
 async def _run_page_workflow_cycle(
@@ -45,7 +49,6 @@ async def _run_page_workflow_cycle(
     reader_factory: Callable[..., ThreadsHomeReader] = ThreadsHomeReader,
 ) -> NurtureResult:
     """Run one internal page cycle under workflow's held profile lock."""
-    state = NurtureRunState()
     normalized_terms = _validate_cycle(account, max_posts, max_scrolls, max_total_posts, terms)
     fingerprint = policy_fingerprint(normalized_terms)
     checkpoint = checkpoint_store.load(account.account_id, fingerprint)
@@ -53,7 +56,6 @@ async def _run_page_workflow_cycle(
         checkpoint.seen_fingerprints,
         checkpoint.pending_read_fingerprints,
     )
-    stats = WorkflowStats()
     reader = _make_reader(
         page,
         account,
@@ -62,8 +64,60 @@ async def _run_page_workflow_cycle(
         console_output_policy=console_output_policy,
         reader_factory=reader_factory,
     )
-    reader.set_failure_context("INITIALIZING", "SETTLE")
-    await _open_home(reader, page, state, console_output_policy, detail)
+    coverage = CoverageLedger()
+    context = await _create_cycle_context(
+        page,
+        account,
+        checkpoint_store,
+        checkpoint=checkpoint,
+        policy_fingerprint=fingerprint,
+        normalized_terms=normalized_terms,
+        reader=reader,
+        dedupe=dedupe,
+        coverage=coverage,
+        max_posts=max_posts,
+        max_scrolls=max_scrolls,
+        max_total_posts=max_total_posts,
+        console_output_policy=console_output_policy,
+        detail=detail,
+        show_post_text=show_post_text,
+        show_observed_text=show_observed_text,
+    )
+    partial_result = await scan_home_feed(context)
+    if partial_result is not None:
+        return partial_result
+    return await finish_cycle(context)
+
+
+async def _create_cycle_context(
+    page: Page,
+    account: BrowserAccount,
+    checkpoint_store: CheckpointStore,
+    *,
+    checkpoint: Checkpoint,
+    policy_fingerprint: str,
+    normalized_terms: tuple[str, ...],
+    reader: ThreadsHomeReader,
+    dedupe: DedupeLedger,
+    coverage: CoverageLedger,
+    max_posts: int,
+    max_scrolls: int,
+    max_total_posts: int,
+    console_output_policy: ConsoleOutputPolicy,
+    detail: bool,
+    show_post_text: bool,
+    show_observed_text: bool,
+    session_progress: SessionProgress | None = None,
+    home_already_verified: bool = False,
+    viewport_number: int = 0,
+    previous_unverified_rows: list[tuple[str, float]] | None = None,
+) -> CycleContext:
+    """Create one bounded scan/Detail cycle over supplied run-local ledgers."""
+    state = NurtureRunState()
+    stats = WorkflowStats()
+    if not home_already_verified:
+        reader.set_failure_context("INITIALIZING", "SETTLE")
+        await _open_home(reader, page, state, console_output_policy, detail)
     state.transition(WorkflowPhase.OBSERVING)
     if detail:
         emit_console_diagnostic(
@@ -71,7 +125,6 @@ async def _run_page_workflow_cycle(
             "[HOME] status=READY account=VERIFIED source=FOR_YOU",
         )
 
-    coverage = CoverageLedger()
     selector, scroll_controller = _make_selection_components(
         page,
         reader,
@@ -82,12 +135,12 @@ async def _run_page_workflow_cycle(
         console_output_policy,
         detail,
     )
-    context = CycleContext(
+    return CycleContext(
         page=page,
         account=account,
         checkpoint_store=checkpoint_store,
         checkpoint=checkpoint,
-        policy_fingerprint=fingerprint,
+        policy_fingerprint=policy_fingerprint,
         normalized_terms=normalized_terms,
         state=state,
         dedupe=dedupe,
@@ -103,11 +156,12 @@ async def _run_page_workflow_cycle(
         detail=detail,
         show_post_text=show_post_text,
         show_observed_text=show_observed_text,
+        session_progress=session_progress,
+        viewport_number=viewport_number,
+        previous_unverified_rows=(
+            [] if previous_unverified_rows is None else previous_unverified_rows
+        ),
     )
-    partial_result = await scan_home_feed(context)
-    if partial_result is not None:
-        return partial_result
-    return await finish_cycle(context)
 
 
 def _validate_cycle(

@@ -123,6 +123,54 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("alias")
     _add_run_options(run, legacy=False)
 
+    session = commands.add_parser(
+        "session",
+        help="continue bounded feed observations and verified Detail reads in one headed session",
+    )
+    session.add_argument("alias")
+    session.add_argument(
+        "--max-posts",
+        type=int,
+        default=20,
+        help="maximum visible post rows per viewport (1-20; default: 20)",
+    )
+    session.add_argument(
+        "--max-scrolls",
+        required=True,
+        type=int,
+        help="maximum measured feed advances for the whole browser session (0-20)",
+    )
+    session.add_argument(
+        "--max-total-posts",
+        required=True,
+        type=int,
+        help="maximum distinct verified posts for the whole session (1-400)",
+    )
+    session.add_argument(
+        "--max-detail-reads",
+        required=True,
+        type=int,
+        help="maximum Detail reads for the whole session (1-40)",
+    )
+    session.add_argument(
+        "--max-runtime-seconds",
+        required=True,
+        type=float,
+        help="maximum total session duration including cleanup (>10 and <=3600)",
+    )
+    session.add_argument(
+        "--no-readiness-prompt",
+        action="store_true",
+        help="stop when readiness checks expire instead of waiting for operator input",
+    )
+    session.add_argument(
+        "-t",
+        "--term",
+        action="append",
+        dest="terms",
+        help="one-time local relevance term; repeat for more terms",
+    )
+
     account = commands.add_parser("account", help="legacy account management commands")
     account_commands = account.add_subparsers(dest="account_command", required=True)
     legacy_add = account_commands.add_parser(
@@ -235,32 +283,35 @@ async def _prompt_readiness_extension(stage: str, retry: int) -> bool:
 
 
 def _run_diagnostics_check(args: argparse.Namespace) -> bool:
-    if not (args.detail or args.show_post_text or args.show_observed_text):
+    detail = getattr(args, "detail", False)
+    show_post_text = getattr(args, "show_post_text", False)
+    show_observed_text = getattr(args, "show_observed_text", False)
+    if not (detail or show_post_text or show_observed_text):
         return True
     if not _has_interactive_terminal():
         error = (
             "DETAIL_TTY_REQUIRED"
-            if args.detail
+            if detail
             else "OBSERVED_TEXT_TTY_REQUIRED"
-            if args.show_observed_text
+            if show_observed_text
             else "POST_TEXT_TTY_REQUIRED"
         )
         print(f"ERROR {error}", file=sys.stderr)
         return False
-    if args.detail:
+    if detail:
         print(
             "WARNING DETAIL_LOCAL_ONLY extracted post text may remain in terminal "
             "scrollback; do not capture or share this output in GitHub, PRs, chats, or CI logs.",
             file=sys.stderr,
         )
         return True
-    if args.show_post_text:
+    if show_post_text:
         print(
             "WARNING POST_TEXT_LOCAL_ONLY terminal scrollback may retain content; "
             "do not paste preview text into PRs or chats.",
             file=sys.stderr,
         )
-    if args.show_observed_text:
+    if show_observed_text:
         print(
             "WARNING OBSERVED_TEXT_LOCAL_ONLY identity is unverified and terminal "
             "scrollback may retain content; do not paste preview text into PRs or chats.",
@@ -391,15 +442,23 @@ def _is_add(args: argparse.Namespace) -> bool:
 def _is_run(args: argparse.Namespace) -> bool:
     return args.command == "run" or (
         args.command == "nurture" and args.nurture_command == "run"
-    )
+    ) or args.command == "session"
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
-    scheduled = _is_run(args) and args.scheduled
-    if scheduled and (args.detail or args.show_post_text or args.show_observed_text):
+    session = args.command == "session"
+    scheduled = _is_run(args) and getattr(args, "scheduled", False)
+    if scheduled and (
+        getattr(args, "detail", False)
+        or getattr(args, "show_post_text", False)
+        or getattr(args, "show_observed_text", False)
+    ):
         print("ERROR SCHEDULED_TEXT_OUTPUT_INVALID", file=sys.stderr)
+        return 1
+    if session and not _has_interactive_terminal():
+        print("ERROR SESSION_ATTENDED_TERMINAL_REQUIRED", file=sys.stderr)
         return 1
     if _is_run(args) and not _run_diagnostics_check(args):
         return 1
@@ -509,7 +568,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print("ERROR RUNTIME_LIMIT_INVALID", file=sys.stderr)
                 _mark_scheduled_failure(scheduled_status, "RUNTIME_LIMIT_INVALID")
                 return 1
-            if args.scheduled and args.max_runtime_seconds is None:
+            if session and not 10 < args.max_runtime_seconds <= 3600:
+                print("ERROR RUNTIME_LIMIT_INVALID", file=sys.stderr)
+                return 1
+            if session and not 1 <= args.max_detail_reads <= 40:
+                print("ERROR DETAIL_READ_LIMIT_INVALID", file=sys.stderr)
+                return 1
+            if scheduled and args.max_runtime_seconds is None:
                 print("ERROR SCHEDULED_RUNTIME_REQUIRED", file=sys.stderr)
                 _mark_scheduled_failure(scheduled_status, "SCHEDULED_RUNTIME_REQUIRED")
                 return 1
@@ -526,7 +591,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 terms = TermsStore(data_root).get(account.alias)
             if not terms:
                 print("ERROR TERMS_NOT_CONFIGURED", file=sys.stderr)
-                if not args.scheduled:
+                if not scheduled:
                     print(
                         f'Configure terms with: tb terms {account.alias} "hiring"',
                         file=sys.stderr,
@@ -535,41 +600,60 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 1
             scheduled_terms = terms
             from .reader import UiReadError
-            from .workflow import run_browser_nurture
+            from .workflow import run_browser_nurture, run_browser_nurture_session
 
             try:
-                result = asyncio.run(
-                    run_browser_nurture(
-                        account,
-                        CheckpointStore(data_root),
-                        max_posts=args.max_posts,
-                        terms=terms,
-                        max_scrolls=args.max_scrolls,
-                        max_total_posts=args.max_total_posts,
-                        max_runtime_seconds=args.max_runtime_seconds,
-                        show_post_text=args.show_post_text,
-                        show_observed_text=args.show_observed_text,
-                        detail=args.detail,
-                        **(
-                            {"console_output_policy": ConsoleOutputPolicy.SCHEDULED}
-                            if scheduled
-                            else {}
-                        ),
-                        readiness_prompt=(
-                            _prompt_readiness_extension
-                            if not args.no_readiness_prompt
-                            and not args.scheduled
-                            and _has_interactive_terminal()
-                            else None
-                        ),
+                if session:
+                    result = asyncio.run(
+                        run_browser_nurture_session(
+                            account,
+                            CheckpointStore(data_root),
+                            max_posts=args.max_posts,
+                            terms=terms,
+                            max_scrolls=args.max_scrolls,
+                            max_total_posts=args.max_total_posts,
+                            max_detail_reads=args.max_detail_reads,
+                            max_runtime_seconds=args.max_runtime_seconds,
+                            readiness_prompt=(
+                                _prompt_readiness_extension
+                                if not args.no_readiness_prompt
+                                else None
+                            ),
+                        )
                     )
-                )
+                else:
+                    result = asyncio.run(
+                        run_browser_nurture(
+                            account,
+                            CheckpointStore(data_root),
+                            max_posts=args.max_posts,
+                            terms=terms,
+                            max_scrolls=args.max_scrolls,
+                            max_total_posts=args.max_total_posts,
+                            max_runtime_seconds=args.max_runtime_seconds,
+                            show_post_text=args.show_post_text,
+                            show_observed_text=args.show_observed_text,
+                            detail=args.detail,
+                            **(
+                                {"console_output_policy": ConsoleOutputPolicy.SCHEDULED}
+                                if scheduled
+                                else {}
+                            ),
+                            readiness_prompt=(
+                                _prompt_readiness_extension
+                                if not args.no_readiness_prompt
+                                and not scheduled
+                                and _has_interactive_terminal()
+                                else None
+                            ),
+                        )
+                    )
             except UiReadError as error:
                 _mark_scheduled_failure(scheduled_status, error.code)
                 _record_known_checkpoint_runs(
                     scheduled_status, data_root, account, terms
                 )
-                if args.detail:
+                if getattr(args, "detail", False):
                     print(
                         f"[CHECKPOINT] status=NOT_SAVED reason={error.code}",
                         file=sys.stderr,
@@ -577,12 +661,30 @@ def main(argv: Sequence[str] | None = None) -> int:
                     print(f"[STOP] code={error.code}", file=sys.stderr)
                 else:
                     print(f"STOP {error.code}", file=sys.stderr)
-                if error.code == "LOGIN_REQUIRED" and not args.scheduled:
+                if error.code == "LOGIN_REQUIRED" and not scheduled:
                     print(f"Run 'tb login {account.alias}' to authenticate.", file=sys.stderr)
                 return 1
             _mark_scheduled_result(scheduled_status, result)
-            print(_format_result(result))
-            if args.scheduled and getattr(result, "checkpoint_saved", False) is not True:
+            formatted_result = _format_result(result)
+            if session:
+                formatted_result += (
+                    " checkpoint_saved="
+                    f"{str(getattr(result, 'checkpoint_saved', False) is True).lower()}"
+                )
+            print(formatted_result)
+            if session and getattr(result, "status", None) not in {
+                "SESSION_COMPLETE",
+                "SESSION_BUDGET_EXHAUSTED",
+            }:
+                reason = _safe_status_code(
+                    getattr(result, "stop_reason", None),
+                    default=_safe_status_code(
+                        getattr(result, "status", None), default="SESSION_STOPPED"
+                    ),
+                )
+                print(f"STOP {reason}", file=sys.stderr)
+                return 1
+            if (scheduled or session) and getattr(result, "checkpoint_saved", False) is not True:
                 reason = _safe_status_code(
                     getattr(result, "stop_reason", None),
                     default=_safe_status_code(

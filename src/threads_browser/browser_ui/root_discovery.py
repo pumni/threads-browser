@@ -104,6 +104,22 @@ class FeedRootDiscoverer:
             )
         )
 
+    async def invalidate_document_candidates(self) -> None:
+        """Drop DOM handles after a verified navigation while keeping ledger evidence."""
+        identities = (
+            *self.state.last_identities,
+            *self.state.pending_identities,
+            *self.state.carried_identities,
+        )
+        unique_handles = {
+            id(identity.dom_handle): identity.dom_handle for identity in identities
+        }
+        self.state.last_roots = ()
+        self.state.last_identities = ()
+        self.state.pending_identities = ()
+        self.state.carried_identities = ()
+        await self._host._viewport_scan.dispose_handles(tuple(unique_handles.values()))
+
     async def _remember_viewport_candidates(
         self,
         roots: tuple[Locator, ...],

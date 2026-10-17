@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from ..reader import ThreadsHomeReader
     from .feed_scroll import FeedScrollController
     from .selection import VerifiedTargetSelector
+    from .session_state import SessionProgress
 
 
 @dataclass(slots=True)
@@ -49,3 +50,6 @@ class CycleContext:
     selected_status: str | None = None
     detail_reads: int = 0
     detail_retry_pending: bool = False
+    session_progress: SessionProgress | None = None
+    session_checkpoint_committed: bool = False
+    detail_attempted: bool = False
