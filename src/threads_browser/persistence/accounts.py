@@ -236,19 +236,21 @@ class ProcessLock:
         stream.seek(0, os.SEEK_END)
         size = stream.tell()
         stream.seek(0)
-        contents = stream.read(size)
         if size == 0 and normalize_legacy:
             self._write_bytes(stream, 0, _PROFILE_LOCK_BYTE + _CLEANUP_GUARD_CLEAN)
             return _CLEANUP_GUARD_CLEAN
-        if size == 1 and contents == _PROFILE_LOCK_BYTE and normalize_legacy:
-            self._write_bytes(stream, 1, _CLEANUP_GUARD_CLEAN)
-            return _CLEANUP_GUARD_CLEAN
-        if (
-            size == 2
-            and contents[:1] == _PROFILE_LOCK_BYTE
-            and contents[1:] in (_CLEANUP_GUARD_CLEAN, _CLEANUP_GUARD_ARMED)
-        ):
-            return contents[1:]
+        if size == 1:
+            if stream.read(1) == _PROFILE_LOCK_BYTE and normalize_legacy:
+                self._write_bytes(stream, 1, _CLEANUP_GUARD_CLEAN)
+                return _CLEANUP_GUARD_CLEAN
+            raise BrowserDataError("BROWSER_CLEANUP_FAILED")
+        if size == 2:
+            contents = stream.read(2)
+            if (
+                contents[:1] == _PROFILE_LOCK_BYTE
+                and contents[1:] in (_CLEANUP_GUARD_CLEAN, _CLEANUP_GUARD_ARMED)
+            ):
+                return contents[1:]
         raise BrowserDataError("BROWSER_CLEANUP_FAILED")
 
     def _write_guard_state(self, stream: BinaryIO, state: bytes) -> None:
