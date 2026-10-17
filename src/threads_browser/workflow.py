@@ -13,7 +13,7 @@ from playwright.async_api import Page, async_playwright
 from .browser_ui.session import classify_playwright_failure, emit_failure_diagnostic
 from .nurture.diagnostics import _terminal_safe_post_text
 from .nurture.engine import NurtureResult
-from .nurture.engine import run_page_workflow as _execute_page_workflow
+from .nurture.engine import _run_page_workflow_cycle as _execute_page_workflow
 from .nurture.state import InvalidWorkflowTransition, policy_fingerprint
 from .reader import ThreadsHomeReader, UiReadError
 from .storage import BrowserAccount, BrowserDataError, CheckpointStore, ensure_safe_browser_profile
@@ -23,7 +23,6 @@ __all__ = [
     "_terminal_safe_post_text",
     "policy_fingerprint",
     "run_browser_nurture",
-    "run_page_workflow",
 ]
 
 _CLEANUP_ALLOWANCE_SECONDS = 5
@@ -36,7 +35,7 @@ def _detail_terminal_ready() -> bool:
         return False
 
 
-async def run_page_workflow(
+async def _run_page_workflow_locked(
     page: Page,
     account: BrowserAccount,
     checkpoint_store: CheckpointStore,
@@ -50,6 +49,7 @@ async def run_page_workflow(
     show_observed_text: bool = False,
     detail: bool = False,
 ) -> NurtureResult:
+    """Run one page cycle; caller must hold the account profile lock."""
     try:
         return await _execute_page_workflow(
             page,
@@ -135,7 +135,6 @@ async def run_browser_nurture(
         not math.isfinite(max_runtime_seconds) or max_runtime_seconds <= 0
     ):
         raise UiReadError("RUNTIME_LIMIT_INVALID")
-    ensure_safe_browser_profile(account.profile_directory)
     lock = checkpoint_store.profile_lock(account)
     lock.acquire()
     playwright_manager = None
@@ -143,6 +142,7 @@ async def run_browser_nurture(
     context = None
     timeout_scope = None
     try:
+        ensure_safe_browser_profile(account.profile_directory)
         timeout_scope = asyncio.timeout(max_runtime_seconds)
         try:
             async with timeout_scope:
@@ -154,7 +154,7 @@ async def run_browser_nurture(
                     headless=False,
                 )
                 page = context.pages[0] if context.pages else await context.new_page()
-                return await run_page_workflow(
+                return await _run_page_workflow_locked(
                     page,
                     account,
                     checkpoint_store,
@@ -206,32 +206,53 @@ async def run_browser_nurture(
         )
         raise UiReadError("INTERNAL_OPERATION_ERROR") from None
     finally:
-        cleanup_failed = False
         operation_failed = sys.exc_info()[0] is not None
+        async def cleanup_resources() -> bool:
+            cleanup_failed = False
+            try:
+                if context is not None:
+                    try:
+                        async with asyncio.timeout(_CLEANUP_ALLOWANCE_SECONDS):
+                            await context.close()
+                    except TimeoutError:
+                        cleanup_failed = True
+                        _emit_cleanup_failure(timed_out=True)
+                    except Exception:  # noqa: BLE001 - sanitize browser cleanup failures.
+                        cleanup_failed = True
+                        _emit_cleanup_failure(timed_out=False)
+                if manager_start_attempted:
+                    assert playwright_manager is not None
+                    try:
+                        async with asyncio.timeout(_CLEANUP_ALLOWANCE_SECONDS):
+                            await playwright_manager.__aexit__(None, None, None)
+                    except TimeoutError:
+                        cleanup_failed = True
+                        _emit_cleanup_failure(timed_out=True)
+                    except Exception:  # noqa: BLE001 - sanitize browser cleanup failures.
+                        cleanup_failed = True
+                        _emit_cleanup_failure(timed_out=False)
+            finally:
+                lock.release()
+            return cleanup_failed
+
         try:
-            if context is not None:
-                try:
-                    async with asyncio.timeout(_CLEANUP_ALLOWANCE_SECONDS):
-                        await context.close()
-                except TimeoutError:
-                    cleanup_failed = True
-                    _emit_cleanup_failure(timed_out=True)
-                except Exception:  # noqa: BLE001 - sanitize cleanup failures; cancellation is not an Exception.
-                    cleanup_failed = True
-                    _emit_cleanup_failure(timed_out=False)
-            if manager_start_attempted:
-                assert playwright_manager is not None
-                try:
-                    async with asyncio.timeout(_CLEANUP_ALLOWANCE_SECONDS):
-                        await playwright_manager.__aexit__(None, None, None)
-                except TimeoutError:
-                    cleanup_failed = True
-                    _emit_cleanup_failure(timed_out=True)
-                except Exception:  # noqa: BLE001 - sanitize cleanup failures; cancellation is not an Exception.
-                    cleanup_failed = True
-                    _emit_cleanup_failure(timed_out=False)
-        finally:
+            cleanup_task = asyncio.create_task(cleanup_resources())
+        except BaseException:
             lock.release()
+            raise
+        cleanup_cancelled = False
+        while True:
+            try:
+                cleanup_failed = await asyncio.shield(cleanup_task)
+                break
+            except asyncio.CancelledError:
+                current_task = asyncio.current_task()
+                if current_task is None or current_task.cancelling() == 0:
+                    raise
+                current_task.uncancel()
+                cleanup_cancelled = True
+        if cleanup_cancelled and not operation_failed:
+            raise asyncio.CancelledError
         if cleanup_failed and not operation_failed:
             raise UiReadError("BROWSER_CLEANUP_FAILED") from None
 

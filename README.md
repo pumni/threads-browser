@@ -90,7 +90,7 @@ asyncio.run(open_account_login("local1"))
 
 `add_local_account(alias)` and async `open_account_login(alias)` do not parse command-line arguments, call `input()`, or require a TTY. `open_account_login` accepts optional `data_root` and `status_callback` arguments. It holds the profile lock while Chromium is open. The account JSON contains account ID, alias, expected actor, and profile path; it never stores a password, cookies, or exported browser state.
 
-Applications can call `threads_browser.workflow.run_browser_nurture(...)` directly when they need to integrate the nurture workflow without a command-line runner.
+Applications can call `threads_browser.workflow.run_browser_nurture(...)` as the supported Python entry point for a persistent-profile nurture cycle. It acquires the shared profile lock before launching Chromium and holds it through checkpoint persistence and browser shutdown attempts. The page-cycle runner is private; applications should not open their own persistent context and pass a `Page` into the workflow.
 
 ## Workflow scope and limits
 
