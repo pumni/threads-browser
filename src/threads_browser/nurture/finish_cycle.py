@@ -14,9 +14,24 @@ from .results import NurtureResult, _result_from_observation
 
 async def finish_cycle(context: CycleContext) -> NurtureResult:
     """Read one selected Detail safely, resolve status and commit a valid boundary."""
+    progress = context.session_progress
     if context.selected is None and not context.stats.found_relevant:
         _report_search_stop(context)
     if context.selected is not None:
+        if progress is not None and not progress.has_safe_boundary(context.stats):
+            progress.record_cycle(
+                context.stats,
+                detail_attempted=False,
+                detail_reads=0,
+                viewport_number=context.viewport_number,
+                previous_unverified_rows=context.previous_unverified_rows,
+            )
+            context.state.stop("SESSION_COVERAGE_INCOMPLETE")
+            return progress.result(
+                context.reader,
+                status="SESSION_COVERAGE_INCOMPLETE",
+                stop_reason="COVERAGE_INCOMPLETE",
+            )
         context.detail_attempted = context.session_progress is not None
         await _read_selected_detail(context)
 
@@ -37,7 +52,6 @@ async def finish_cycle(context: CycleContext) -> NurtureResult:
         actionability_rejected=bool(context.selector.rejected_codes),
         checkpoint_runs=context.checkpoint.completed_runs,
     )
-    progress = context.session_progress
     if progress is not None:
         progress.record_cycle(
             context.stats,
@@ -58,6 +72,13 @@ async def finish_cycle(context: CycleContext) -> NurtureResult:
     status = outcome
 
     if progress is not None:
+        if context.detail_retry_pending:
+            context.state.stop(status)
+            return progress.result(
+                context.reader,
+                status=status,
+                stop_reason="DETAIL_RETRY_PENDING",
+            )
         if not progress.has_safe_boundary(context.stats):
             context.state.stop("SESSION_COVERAGE_INCOMPLETE")
             return progress.result(
