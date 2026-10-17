@@ -121,7 +121,7 @@ Use the status and fixed stop reason to triage:
 | `STOPPED` | Review the fixed cycle status and reason; do not count it as a completed invocation. |
 | `RUNNING` after process exit | Inspect the process and scheduler history; ensure Chromium closed before retrying. |
 
-Before each managed browser launch, the runner durably arms a per-profile guard
+Before each managed nurture launch, the runner durably arms a per-profile guard
 while holding the OS profile lock. It clears the guard, still under that lock,
 only after context close and Playwright manager shutdown both complete
 successfully. An interrupted process or unverified shutdown therefore leaves
