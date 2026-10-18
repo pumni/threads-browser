@@ -37,6 +37,15 @@ uv run tb session local1 --max-runtime-seconds 600 --max-scrolls 8 --max-total-p
 
 The session keeps one headed Chromium context and profile lock, resumes at the verified Home position after Back, and shares deduplication and coverage state across reads. Runtime includes bounded browser cleanup (more than 10 and at most 3600 seconds); scroll advances are capped at 0–20, distinct verified posts at 1–400, and Detail reads at 1–40. `--max-posts` can lower the per-viewport row cap. It requires an interactive terminal and has no scheduled mode. Safe Detail/Back boundaries are checkpointed as the session proceeds; incomplete coverage stops with a nonzero exit code. `tb run` remains the single-cycle command.
 
+For continuous, read-only job-focused exploration, use Auto Nurture:
+
+```powershell
+uv run tb auto local1
+uv run tb auto local1 --max-cycles 3
+```
+
+Auto uses built-in Vietnamese and English hiring and job-seeking phrases, so it does not need saved terms. It opens only verified matching posts, checks the canonical post and author again before Detail, and never likes, follows, replies, comments, posts, or sends messages. Each headed browser operation is bounded to 20 feed advances, 100 distinct observed posts, 5 Detail reads, and 10 minutes; it closes the browser before the next verified Home / For You refresh. No TTY or readiness prompt is required. The default runs in the foreground until Ctrl+C or a blocking error; `--max-cycles` is useful for local checks. Idle refreshes use increasing cooldowns, and challenges, login requirements, rate limits, actor mismatches, and cleanup failures stop the command. This command does not enable scheduled runs.
+
 Attended and legacy runs can opt into `--max-runtime-seconds` and
 `--no-readiness-prompt`. The Windows operations guide covers the safe wrapper,
 bounded runtime defaults, sanitized latest-run status, and the disabled by

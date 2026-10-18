@@ -157,6 +157,17 @@ def _parser() -> argparse.ArgumentParser:
         help="one-time local relevance term; repeat for more terms",
     )
 
+    auto = commands.add_parser(
+        "auto",
+        help="continuously refresh and read verified hiring and job-seeking posts",
+    )
+    auto.add_argument("alias")
+    auto.add_argument(
+        "--max-cycles",
+        type=int,
+        help="stop after this many bounded refresh cycles (default: continue until interrupted)",
+    )
+
     account = commands.add_parser("account", help="legacy account management commands")
     account_commands = account.add_subparsers(dest="account_command", required=True)
     legacy_add = account_commands.add_parser(

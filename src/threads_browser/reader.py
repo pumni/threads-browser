@@ -164,6 +164,7 @@ class ThreadsHomeReader(
         readiness_prompt: Callable[[str, int], Awaitable[bool]] | None = None,
         detail_mode: bool = False,
         console_output_policy: ConsoleOutputPolicy = ConsoleOutputPolicy.INTERACTIVE,
+        auto_nurture: bool = False,
     ) -> None:
         if expected_actor is not None and _USERNAME.fullmatch(expected_actor) is None:
             raise UiReadError("ACTOR_INVALID")
@@ -227,6 +228,7 @@ class ThreadsHomeReader(
             self,
             timeout_ms=_DETAIL_TIMEOUT_MS,
             console_output_policy=console_output_policy,
+            auto_nurture=auto_nurture,
         )
         self._reported_render_rescans: set[tuple[str, float | None]] = set()
         self._skipped_candidate_identities: set[str] = set()

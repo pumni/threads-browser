@@ -5,6 +5,7 @@ from __future__ import annotations
 from hashlib import sha256
 
 from ..console_output import ConsoleOutputPolicy, emit_console_diagnostic
+from ..feed.job_intent import classify_auto_body
 from ..feed.models import BodyReadEvidence, PostTarget, VisibleBodySegment
 from ..feed.relevance import classify_body
 from ..reader import ThreadsHomeReader, _HomeRowObservation
@@ -35,6 +36,7 @@ class HomeRowObserver:
         previous_unverified_rows: list[tuple[str, float]],
         pending_scroll_baseline: dict[str, object] | None,
         detail: bool,
+        auto_mode: bool,
         show_post_text: bool,
         show_observed_text: bool,
     ) -> None:
@@ -48,6 +50,7 @@ class HomeRowObserver:
         self.previous_unverified_rows = previous_unverified_rows
         self.pending_scroll_baseline = pending_scroll_baseline
         self.detail = detail
+        self.auto_mode = auto_mode
         self.show_post_text = show_post_text
         self.show_observed_text = show_observed_text
         self.viewport_relevant_targets: list[PostTarget] = []
@@ -260,6 +263,9 @@ class HomeRowObserver:
                 flush=True,
             )
         decision = self.dedupe.decisions_by_fingerprint.get(fingerprint)
+        if self.auto_mode and fingerprint in self.dedupe.pending_set and decision is None:
+            decision = classify_auto_body(target.body)
+            self.dedupe.decisions_by_fingerprint[fingerprint] = decision
         if decision == "RELEVANT" and fingerprint in self.dedupe.pending_set:
             if target.currently_visible:
                 self.viewport_relevant_targets.append(target)
@@ -281,7 +287,7 @@ class HomeRowObserver:
         is_new = fingerprint not in self.dedupe.checkpoint_seen
         if is_new:
             self.dedupe.new_fingerprints.add(fingerprint)
-        decision = classify_body(target.body, self.normalized_terms)
+        decision = self._classify_body(target.body)
         self.dedupe.decisions_by_fingerprint[fingerprint] = decision
         self.stats.classified += 1
         self._emit_verified_body(target, decision)
@@ -337,6 +343,11 @@ class HomeRowObserver:
             self.viewport_unknown += 1
             if target.currently_visible:
                 self.viewport_fallback_targets.append(target)
+
+    def _classify_body(self, body: str | None) -> str:
+        if self.auto_mode:
+            return classify_auto_body(body)
+        return classify_body(body, self.normalized_terms)
 
     def _record_unverified_observation(self, row: _HomeRowObservation) -> None:
         diagnostic = row.diagnostic

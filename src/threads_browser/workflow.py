@@ -32,6 +32,7 @@ __all__ = [
     "_terminal_safe_post_text",
     "policy_fingerprint",
     "run_browser_nurture",
+    "run_browser_nurture_auto_cycle",
     "run_browser_nurture_session",
 ]
 
@@ -108,6 +109,7 @@ async def _run_page_workflow_session_locked(
     max_detail_reads: int,
     readiness_prompt: Callable[[str, int], Awaitable[bool]] | None,
     console_output_policy: ConsoleOutputPolicy,
+    auto_mode: bool = False,
 ) -> NurtureResult:
     """Run a multi-observation session under the caller-held profile lock."""
     return await _run_locked_page_operation(
@@ -123,6 +125,7 @@ async def _run_page_workflow_session_locked(
             max_detail_reads=max_detail_reads,
             readiness_prompt=readiness_prompt,
             console_output_policy=console_output_policy,
+            auto_mode=auto_mode,
             reader_factory=ThreadsHomeReader,
         ),
         console_output_policy=console_output_policy,
@@ -252,11 +255,19 @@ async def run_browser_nurture_session(
     max_runtime_seconds: float,
     readiness_prompt: Callable[[str, int], Awaitable[bool]] | None = None,
     console_output_policy: ConsoleOutputPolicy = ConsoleOutputPolicy.INTERACTIVE,
+    auto_mode: bool = False,
 ) -> NurtureResult:
     """Run a bounded multi-observation session under one headed Chromium context."""
     if console_output_policy is ConsoleOutputPolicy.SCHEDULED:
         raise UiReadError("SCHEDULED_SESSION_UNSUPPORTED")
-    _validate_cycle(account, max_posts, max_scrolls, max_total_posts, terms)
+    _validate_cycle(
+        account,
+        max_posts,
+        max_scrolls,
+        max_total_posts,
+        terms,
+        allow_empty_terms=auto_mode,
+    )
     if not 1 <= max_detail_reads <= 40:
         raise UiReadError("DETAIL_READ_LIMIT_INVALID")
     if (
@@ -267,6 +278,7 @@ async def run_browser_nurture_session(
     if account.expected_actor is None:
         raise BrowserDataError("ACCOUNT_NOT_VERIFIED")
 
+    session_options = {"auto_mode": True} if auto_mode else {}
     return await _run_managed_browser_operation(
         account,
         checkpoint_store,
@@ -281,11 +293,32 @@ async def run_browser_nurture_session(
             max_detail_reads=max_detail_reads,
             readiness_prompt=readiness_prompt,
             console_output_policy=console_output_policy,
+            **session_options,
         ),
         max_runtime_seconds=max_runtime_seconds,
         timeout_code="SESSION_TIMEOUT",
         reserve_cleanup=True,
         console_output_policy=console_output_policy,
+    )
+
+
+async def run_browser_nurture_auto_cycle(
+    account: BrowserAccount,
+    checkpoint_store: CheckpointStore,
+) -> NurtureResult:
+    """Run one read-only Auto Nurture cycle through the managed browser lifecycle."""
+    return await run_browser_nurture_session(
+        account,
+        checkpoint_store,
+        max_posts=20,
+        terms=(),
+        max_scrolls=20,
+        max_total_posts=100,
+        max_detail_reads=5,
+        max_runtime_seconds=600,
+        readiness_prompt=None,
+        console_output_policy=ConsoleOutputPolicy.AUTO,
+        auto_mode=True,
     )
 
 

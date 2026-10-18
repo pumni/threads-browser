@@ -43,6 +43,7 @@ class CycleContext:
     detail: bool
     show_post_text: bool
     show_observed_text: bool
+    auto_mode: bool = False
     previous_unverified_rows: list[tuple[str, float]] = field(default_factory=list)
     viewport_number: int = 0
     exhaustion_reason: str = "MAX_SCROLLS"

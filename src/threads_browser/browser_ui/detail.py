@@ -23,6 +23,7 @@ from ..console_output import (
     emit_console_diagnostic,
 )
 from ..errors import UiReadError
+from ..feed.job_intent import classify_auto_body
 from ..feed.models import PostTarget
 from ..feed.relevance import normalize_text
 from ..feed.urls import _post_url, _post_url_hint, _profile_author, _same_home_origin
@@ -160,10 +161,12 @@ class DetailNavigator:
         *,
         timeout_ms: int,
         console_output_policy: ConsoleOutputPolicy = ConsoleOutputPolicy.INTERACTIVE,
+        auto_nurture: bool = False,
     ) -> None:
         self._host = host
         self._timeout_ms = timeout_ms
         self._console_output_policy = console_output_policy
+        self._auto_nurture = auto_nurture
         self._last_reported_detail_state: tuple[str, _DetailState] | None = None
         self.return_state = DetailReturnState()
         self.route_verified = False
@@ -769,6 +772,8 @@ class DetailNavigator:
                 timeout_code="DETAIL_NAVIGATION_UNVERIFIED",
             )
             current = await self.actionable_now(target)
+            if self._auto_nurture and classify_auto_body(current.body) != "RELEVANT":
+                raise UiReadError("AUTO_TARGET_NOT_ELIGIBLE")
             click_point = await self._detail_click_point(current.permalink)
             self._host._detail_return_anchor = current.fingerprint
             self._host._detail_return_target = current
@@ -779,7 +784,16 @@ class DetailNavigator:
             # Page.mouse.click sends input at the already-visible anchor point
             # without Playwright's locator auto-scroll behavior.
             try:
-                await self._host._page.mouse.click(*click_point)
+                if self._auto_nurture:
+                    await current.permalink.click(
+                        scroll="none",
+                        timeout=self._host._remaining_readiness_ms(
+                            deadline,
+                            "DETAIL_NAVIGATION_UNVERIFIED",
+                        ),
+                    )
+                else:
+                    await self._host._page.mouse.click(*click_point)
             except PlaywrightError:
                 raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED") from None
             self._host._mark_ui_transition()

@@ -108,6 +108,7 @@ async def _create_cycle_context(
     show_post_text: bool,
     show_observed_text: bool,
     session_progress: SessionProgress | None = None,
+    auto_mode: bool = False,
     home_already_verified: bool = False,
     viewport_number: int = 0,
     previous_unverified_rows: list[tuple[str, float]] | None = None,
@@ -134,6 +135,7 @@ async def _create_cycle_context(
         coverage,
         console_output_policy,
         detail,
+        auto_mode,
     )
     return CycleContext(
         page=page,
@@ -154,6 +156,7 @@ async def _create_cycle_context(
         max_total_posts=max_total_posts,
         console_output_policy=console_output_policy,
         detail=detail,
+        auto_mode=auto_mode,
         show_post_text=show_post_text,
         show_observed_text=show_observed_text,
         session_progress=session_progress,
@@ -170,6 +173,8 @@ def _validate_cycle(
     max_scrolls: int,
     max_total_posts: int,
     terms: tuple[str, ...],
+    *,
+    allow_empty_terms: bool = False,
 ) -> tuple[str, ...]:
     if account.expected_actor is None:
         raise BrowserDataError("ACCOUNT_NOT_VERIFIED")
@@ -179,7 +184,7 @@ def _validate_cycle(
         raise UiReadError("SCROLL_LIMIT_INVALID")
     if not 1 <= max_total_posts <= 400:
         raise UiReadError("TOTAL_SCAN_LIMIT_INVALID")
-    return canonical_terms(terms)
+    return () if allow_empty_terms and not terms else canonical_terms(terms)
 
 
 def _make_reader(
@@ -190,10 +195,13 @@ def _make_reader(
     detail: bool,
     console_output_policy: ConsoleOutputPolicy,
     reader_factory: Callable[..., ThreadsHomeReader],
+    auto_nurture: bool = False,
 ) -> ThreadsHomeReader:
     reader_options = {}
     if console_output_policy is not ConsoleOutputPolicy.INTERACTIVE:
         reader_options["console_output_policy"] = console_output_policy
+    if auto_nurture:
+        reader_options["auto_nurture"] = True
     return reader_factory(
         page,
         account.expected_actor,
@@ -242,6 +250,7 @@ def _make_selection_components(
     coverage: CoverageLedger,
     console_output_policy: ConsoleOutputPolicy,
     detail: bool,
+    auto_mode: bool = False,
 ) -> tuple[VerifiedTargetSelector, FeedScrollController]:
     selector = VerifiedTargetSelector(
         page=page,
@@ -252,6 +261,7 @@ def _make_selection_components(
         coverage=coverage,
         console_output_policy=console_output_policy,
         detail=detail,
+        auto_mode=auto_mode,
         map_playwright_error=_reader_playwright_error,
     )
     scroll_controller = FeedScrollController(

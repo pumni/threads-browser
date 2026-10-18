@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..reader import ThreadsHomeReader
 from .state import CoverageLedger, DedupeLedger, WorkflowStats
@@ -47,6 +47,7 @@ class NurtureResult:
     stranded_body_ranges: int = 0
     lookahead_rows: int = 0
     gap_category: str = "NONE"
+    new_fingerprints: tuple[str, ...] = field(default=(), repr=False, compare=False)
 
 
 def _result_from_observation(
@@ -107,4 +108,5 @@ def _result_from_observation(
             lookahead_rows=stats.lookahead_rows,
         ),
         checkpoint_saved=checkpoint_saved,
+        new_fingerprints=tuple(sorted(dedupe.new_fingerprints)) if report_home_counts else (),
     )
