@@ -1,9 +1,9 @@
 # Bàn giao Threads Browser — Hướng dẫn vận hành và tình trạng hiện tại
 
-**Ngày chốt thông tin:** 19/10/2026  
-**Repository:** https://github.com/pumni/threads-browser  
-**Nhánh bàn giao:** `main` (khách hàng ghi lại mã commit thực tế bằng `git rev-parse HEAD` sau khi nhận bản bàn giao).  
-**Mốc mã nguồn Auto V3 đã merge:** `75820ebc90141dc898614425b36f8711199372da`, từ [PR #53](https://github.com/pumni/threads-browser/pull/53). Tài liệu này được thêm sau mốc đó, nên mã HEAD của `main` sau khi merge tài liệu sẽ khác.  
+- **Ngày chốt thông tin:** 19/10/2026
+- **Repository:** https://github.com/pumni/threads-browser
+- **Nhánh bàn giao:** `main` (khách hàng ghi lại mã commit thực tế bằng `git rev-parse HEAD` sau khi nhận bản bàn giao).
+- **Mốc mã nguồn Auto V3 đã merge:** `75820ebc90141dc898614425b36f8711199372da`, từ [PR #53](https://github.com/pumni/threads-browser/pull/53). Tài liệu này được thêm sau mốc đó, nên mã HEAD của `main` sau khi merge tài liệu sẽ khác.
 **Trạng thái bàn giao:** **ĐÃ BÀN GIAO MÃ NGUỒN / ĐẠT KIỂM THỬ KỸ THUẬT; CHƯA ĐẠT NGHIỆM THU VẬN HÀNH AUTO TRÊN THREADS THẬT.** Không khẳng định hệ thống sẵn sàng chạy không giám sát.
 
 > Tài liệu dành cho kỹ thuật và người vận hành của khách hàng. Mọi thao tác trình duyệt thật phải do người đã được cấp quyền thực hiện trên máy của mình. Không cần và không được gửi tài khoản, mật khẩu, cookie, profile trình duyệt hoặc nội dung Threads thật cho bên phát triển.
@@ -158,7 +158,7 @@ Trước rollback: dừng mọi CLI, chờ Chromium đóng, ghi lại phiên b�
 
 Tài liệu liên quan: [README.md](../README.md) (lệnh CLI), [OPERATIONS_WINDOWS.md](OPERATIONS_WINDOWS.md) (vận hành/khôi phục), [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) (gate phát hành), [issue #23](https://github.com/pumni/threads-browser/issues/23), [issue #47](https://github.com/pumni/threads-browser/issues/47), [issue #50](https://github.com/pumni/threads-browser/issues/50).
 
-**Bảo mật bàn giao:** chỉ giao **mã nguồn + tài liệu + liên kết CI/issue** qua kênh đã phân quyền. Khách hàng tự dùng tài khoản Threads riêng. Không đưa username/handle thực, post URL, bài viết thật, số điện thoại, email, ảnh màn hình, DOM, transcript PowerShell, cookie hay profile vào GitHub, tài liệu hoặc báo cáo chung. Có thể trao đổi **số đếm tổng hợp và mã dừng**. 
+**Bảo mật bàn giao:** chỉ giao **mã nguồn + tài liệu + liên kết CI/issue** qua kênh đã phân quyền. Khách hàng tự dùng tài khoản Threads riêng. Không đưa username/handle thực, post URL, bài viết thật, số điện thoại, email, ảnh màn hình, DOM, transcript PowerShell, cookie hay profile vào GitHub, tài liệu hoặc báo cáo chung. Có thể trao đổi **số đếm tổng hợp và mã dừng**.
 
 **Kết luận bàn giao:** Đã có mã nguồn và kiểm thử kỹ thuật cho **pilot đọc-only có giám sát**; **chưa đủ bằng chứng để nghiệm thu vận hành đầy đủ, bảo đảm chất lượng tìm bài tuyển dụng thật hoặc kích hoạt chạy tự động định kỳ**. Các mục ở checklist cần người phụ trách khách hàng ký xác nhận riêng.
 
