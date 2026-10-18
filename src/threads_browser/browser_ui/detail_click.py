@@ -2,21 +2,35 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Protocol
 
 from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import Locator, Page
 
 from ..console_output import ConsoleOutputPolicy
 from ..errors import UiReadError
 from ..feed.job_intent import classify_auto_body
 from ..feed.models import PostTarget
 
-if TYPE_CHECKING:
-    from .detail import DetailNavigator
+
+class _DetailClickHost(Protocol):
+    _page: Page
+    _detail_return_anchor: str | None
+    _detail_return_target: PostTarget | None
+
+    def _remaining_readiness_ms(self, deadline: float, timeout_code: str) -> int: ...
+    def _mark_ui_transition(self) -> None: ...
+
+
+class _DetailClickNavigator(Protocol):
+    _host: _DetailClickHost
+    _console_output_policy: ConsoleOutputPolicy
+
+    async def _detail_click_point(self, permalink: Locator) -> tuple[float, float]: ...
 
 
 async def click_detail_target(
-    navigator: DetailNavigator,
+    navigator: _DetailClickNavigator,
     target: PostTarget,
     deadline: float,
 ) -> None:
