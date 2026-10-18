@@ -55,6 +55,16 @@ def test_reposts_and_posts_on_behalf_are_not_opened_in_detail(
             "Gửi CV qua inbox để ứng tuyển.",
         ),
         SyntheticPost(
+            "conversational-content-recruitment",
+            "Góc tuyển dụng: team mình cần thêm 2 bạn viết content/podcast, "
+            "có bạn nào muốn về team không?",
+        ),
+        SyntheticPost(
+            "conversational-marketing-recruitment",
+            "Bên mình cần thêm bạn chạy marketing part-time, "
+            "ai quan tâm nhắn mình nhé.",
+        ),
+        SyntheticPost(
             "passive-repost",
             "Mình đăng lại bài này: TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. "
             "Lương: 8 triệu/tháng. Địa điểm: Quận 7.",
@@ -68,6 +78,11 @@ def test_reposts_and_posts_on_behalf_are_not_opened_in_detail(
             "repost-with-incidental-inbox",
             "Repost: TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. Lương 8 triệu/tháng. "
             "Địa điểm: Quận 7. Inbox mình để xin link.",
+        ),
+        SyntheticPost(
+            "repost-with-conversational-hiring-copy",
+            "Repost: team mình cần thêm 2 bạn viết content/podcast. "
+            "Lương: 8–10 triệu/tháng. Địa điểm: Quận 7. Inbox ứng tuyển.",
         ),
     )
     home_html = synthetic_home_html(actor, posts).replace(
@@ -105,10 +120,20 @@ def test_reposts_and_posts_on_behalf_are_not_opened_in_detail(
 
     assert result.status == "SESSION_COMPLETE"
     assert result.checkpoint_saved is True
-    assert result.detail_reads == 2
-    assert set(visited) == {"direct-structured-ad", "partner-recruiter-intake"}
+    assert result.detail_reads == 4
+    assert set(visited) == {
+        "direct-structured-ad",
+        "partner-recruiter-intake",
+        "conversational-content-recruitment",
+        "conversational-marketing-recruitment",
+    }
     assert set(visited).isdisjoint(
-        {"passive-repost", "posted-on-behalf", "repost-with-incidental-inbox"}
+        {
+            "passive-repost",
+            "posted-on-behalf",
+            "repost-with-incidental-inbox",
+            "repost-with-conversational-hiring-copy",
+        }
     )
 
 

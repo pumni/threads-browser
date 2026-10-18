@@ -35,7 +35,8 @@ _HIRING_ROLE = (
     r"qa(?:\s+(?:engineer|tester))?|testers?|engineers?|developers?|"
     r"designers?|managers?|analysts?|recruiters?|accountants?|interns?|"
     r"sales(?:people)?|marketers?|backend(?:\s+developers?)?|"
-    r"frontend(?:\s+developers?)?|product\s+managers?|data\s+scientists?)"
+    r"frontend(?:\s+developers?)?|product\s+managers?|data\s+scientists?|"
+    r"content(?:\s+(?:creators?|writers?))?|podcasts?|marketing)"
 )
 _HIRING_POSITIVE = re.compile(
     rf"\b{_HIRING_SUBJECT}\b(?:\s+[\w-]+){{0,3}}\s+"
@@ -111,6 +112,14 @@ _APPLICANT_INTAKE = re.compile(
     r"\b(?:gui\s+(?:cv|ho\s+so)|nop\s+(?:cv|ho\s+so)|"
     r"ung\s+tuyen|nhan\s+(?:cv|ho\s+so|don\s+ung\s+tuyen))\b"
 )
+_CONVERSATIONAL_HIRING = re.compile(
+    rf"\b{_HIRING_SUBJECT}\b\s+"
+    r"(?:(?:hien\s+(?:tai|nay)\s+)?(?:dang\s+)?)"
+    r"(?:can(?:\s+them)?|tim(?:\s+them)?)\s+"
+    r"(?:\d+\s+)?(?:ban|nguoi|dong\s+doi|nhan\s+su)\s+"
+    r"(?:lam|viet|chay|phu\s+trach|quan\s+ly)\s+"
+    rf"(?P<role>{_HIRING_ROLE})\b"
+)
 _PASSIVE_REPOST_CONTEXT = re.compile(
     r"\b(?:dang\s+(?:lai|ho|dum|giup)|re[\s-]?post|"
     r"chia\s+se\s+lai|share\s+lai)\b"
@@ -119,7 +128,8 @@ _INDEPENDENT_AUTHOR_HIRING_OR_INTAKE = re.compile(
     rf"(?:\b(?:rieng|nhung|tuy\s+nhien|con)\s+"
     rf"(?:{_HIRING_SUBJECT}|minh|em|toi|anh|chi)\b"
     rf"(?:\s+[\w-]+){{0,3}}\s+{_HIRING_STATUS}\s+tuyen(?:\s+dung)?\b|"
-    rf"{_SELF_RECRUITER_INTAKE.pattern})"
+    rf"{_SELF_RECRUITER_INTAKE.pattern}|"
+    rf"\b(?:rieng|nhung|tuy\s+nhien|con)\s+{_CONVERSATIONAL_HIRING.pattern})"
 )
 _SALARY_DETAIL = re.compile(
     r"\b(?:luong|thu\s+nhap|muc\s+luong|salary|wage)\b"
@@ -402,6 +412,9 @@ def _sentence_events(sentence: str) -> list[tuple[int, str, str | None]]:
                 hiring_matches.extend(_HIRING_POSITIVE_WITH_INHERITED_SUBJECT.finditer(clause))
             for match in hiring_matches:
                 events.append((offset + match.start(), "HIRING", match.group("role")))
+            for match in _CONVERSATIONAL_HIRING.finditer(clause):
+                if match.group("role") != "nhan vien":
+                    events.append((offset + match.start(), "HIRING", match.group("role")))
             seeking_matches = list(_SEEKING_POSITIVE.finditer(clause))
             seeking_matches.extend(_SEEKING_NEEDS_WORK_POSITIVE.finditer(clause))
             if seeking_subject_seen and not has_seeking_subject:

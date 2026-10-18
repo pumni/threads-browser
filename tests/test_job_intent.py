@@ -11,6 +11,28 @@ from threads_browser.feed.job_intent import classify_auto_body, classify_job_int
         ("Bên mình đang tuyển nhân viên kinh doanh tại Hà Nội.", "HIRING"),
         ("Công ty đang cần tuyển 2 lập trình viên Backend.", "HIRING"),
         ("Chúng tôi đang tuyển QA Engineer cho nhóm sản phẩm.", "HIRING"),
+        (
+            (
+                "Góc tuyển dụng: team mình cần thêm 2 bạn viết content/podcast, "
+                "có bạn nào muốn về team không?"
+            ),
+            "HIRING",
+        ),
+        (
+            (
+                "Bên mình cần thêm bạn chạy marketing part-time, "
+                "ai quan tâm nhắn mình nhé."
+            ),
+            "HIRING",
+        ),
+        ("Team mình đang tìm đồng đội làm podcast.", "HIRING"),
+        (
+            (
+                "Mình đăng lại bài tuyển phục vụ. "
+                "Riêng team mình đang tìm đồng đội làm podcast."
+            ),
+            "HIRING",
+        ),
         ("Mình đang tìm việc làm ở Đà Nẵng.", "SEEKING_JOB"),
         ("Em đang tìm công việc QA Tester tại TP.HCM.", "SEEKING_JOB"),
         ("Tôi đang tìm việc lập trình Backend.", "SEEKING_JOB"),
@@ -152,6 +174,10 @@ from threads_browser.feed.job_intent import classify_auto_body, classify_job_int
         "vi_hiring_employee",
         "vi_hiring_backend",
         "vi_hiring_english_title",
+        "conversational_team_needs_content_and_podcast",
+        "conversational_team_needs_part_time_marketing",
+        "conversational_team_seeking_colleague_for_work",
+        "own_conversational_opening_after_repost",
         "vi_seeking_da_nang",
         "vi_seeking_qa_title",
         "vi_seeking_backend",
@@ -292,6 +318,10 @@ def test_vietnamese_current_job_intent_is_eligible(body: str, expected: str) -> 
             "Địa điểm: Quận 7. Inbox mình để xin link."
         ),
         (
+            "Repost: team mình cần thêm 2 bạn viết content/podcast. "
+            "Lương: 8–10 triệu/tháng. Địa điểm: Quận 7. Inbox ứng tuyển."
+        ),
+        (
             "Minh dang lai bai nay: TUYEN GAP 3 NHAN VIEN PHUC VU. "
             "Luong: 8 trieu/thang. Dia diem: Quan 7."
         ),
@@ -373,6 +403,7 @@ def test_vietnamese_current_job_intent_is_eligible(body: str, expected: str) -> 
         "passive_repost_of_structured_direct_ad",
         "posted_on_behalf_of_friend_with_job_details",
         "repost_with_incidental_inbox_request",
+        "repost_with_conversational_hiring_copy",
         "unaccented_passive_repost_of_structured_ad",
         "direct_ad_with_explicitly_closed_applications",
         "unaccented_question_about_someone_hiring",
