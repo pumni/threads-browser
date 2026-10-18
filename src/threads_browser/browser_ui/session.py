@@ -138,7 +138,7 @@ def emit_failure_diagnostic(
     console_output_policy: ConsoleOutputPolicy = ConsoleOutputPolicy.INTERACTIVE,
 ) -> None:
     """Print bounded, privacy-safe failure metadata only."""
-    if console_output_policy is ConsoleOutputPolicy.SCHEDULED:
+    if console_output_policy in {ConsoleOutputPolicy.SCHEDULED, ConsoleOutputPolicy.AUTO}:
         return
 
     phases = {

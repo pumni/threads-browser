@@ -8,6 +8,7 @@ from enum import Enum
 class ConsoleOutputPolicy(Enum):
     INTERACTIVE = "interactive"
     SCHEDULED = "scheduled"
+    AUTO = "auto"
 
 
 def emit_console_diagnostic(

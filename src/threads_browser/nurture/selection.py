@@ -9,6 +9,7 @@ from playwright.async_api import Page
 
 from ..console_output import ConsoleOutputPolicy, emit_console_diagnostic
 from ..errors import UiReadError
+from ..feed.job_intent import classify_auto_body
 from ..feed.models import PostTarget
 from ..reader import ThreadsHomeReader
 from .state import CoverageLedger, DedupeLedger, NurtureRunState, WorkflowStats
@@ -28,6 +29,7 @@ class VerifiedTargetSelector:
         coverage: CoverageLedger,
         console_output_policy: ConsoleOutputPolicy,
         detail: bool,
+        auto_mode: bool,
         map_playwright_error: Callable[..., UiReadError],
     ) -> None:
         self._page = page
@@ -38,6 +40,7 @@ class VerifiedTargetSelector:
         self._coverage = coverage
         self._console_output_policy = console_output_policy
         self._detail = detail
+        self._auto_mode = auto_mode
         self._map_playwright_error = map_playwright_error
         self.rejected_codes: set[str] = set()
 
@@ -78,6 +81,8 @@ class VerifiedTargetSelector:
                     self._console_output_policy,
                     "[ACTIONABILITY] status=CONFIRMED",
                 )
+            if self._auto_mode and classify_auto_body(current.body) != "RELEVANT":
+                continue
             return current
         return None
 

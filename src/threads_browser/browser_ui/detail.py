@@ -27,6 +27,7 @@ from ..feed.models import PostTarget
 from ..feed.relevance import normalize_text
 from ..feed.urls import _post_url, _post_url_hint, _profile_author, _same_home_origin
 from .body_text import _VisibleBodyRead
+from .detail_click import click_detail_target
 from .feed_rows import _BODY_EXCLUSION_SELECTOR
 from .loading import CardNotReady as _CardNotReady
 from .loading import RenderObservation as _RenderObservation
@@ -769,20 +770,7 @@ class DetailNavigator:
                 timeout_code="DETAIL_NAVIGATION_UNVERIFIED",
             )
             current = await self.actionable_now(target)
-            click_point = await self._detail_click_point(current.permalink)
-            self._host._detail_return_anchor = current.fingerprint
-            self._host._detail_return_target = current
-            self._host._remaining_readiness_ms(
-                deadline,
-                "DETAIL_NAVIGATION_UNVERIFIED",
-            )
-            # Page.mouse.click sends input at the already-visible anchor point
-            # without Playwright's locator auto-scroll behavior.
-            try:
-                await self._host._page.mouse.click(*click_point)
-            except PlaywrightError:
-                raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED") from None
-            self._host._mark_ui_transition()
+            await click_detail_target(self, current, deadline)
         except PlaywrightTimeoutError:
             raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED") from None
         try:

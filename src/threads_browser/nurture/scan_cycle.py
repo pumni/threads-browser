@@ -7,6 +7,7 @@ from playwright.async_api import Error as PlaywrightError
 from ..browser_ui.feed_rows import _FeedScanCounts
 from ..console_output import emit_console_diagnostic
 from ..errors import UiReadError
+from ..feed.job_intent import classify_auto_body
 from ..feed.models import PostTarget
 from ..feed.relevance import classify_body
 from .cycle_context import CycleContext
@@ -40,7 +41,18 @@ async def scan_home_feed(context: CycleContext) -> NurtureResult | None:
             return partial_result
         if _record_viewport_observation(context, observer, scan_limit=scan_limit):
             break
-        if await _select_or_advance(context, observer):
+        try:
+            stop = await _select_or_advance(context, observer)
+        except UiReadError as error:
+            if context.uat_diagnostics is not None:
+                context.uat_diagnostics.report(
+                    "FEED",
+                    "FAILED",
+                    viewport=context.viewport_number,
+                    code=error.code,
+                )
+            raise
+        if stop:
             break
     return None
 
@@ -59,6 +71,7 @@ def _new_row_observer(context: CycleContext) -> HomeRowObserver:
         detail=context.detail,
         show_post_text=context.show_post_text,
         show_observed_text=context.show_observed_text,
+        auto_mode=context.auto_mode,
     )
 
 
@@ -70,6 +83,12 @@ async def _scan_viewport(
 ) -> NurtureResult | None:
     context.state.transition(WorkflowPhase.WAITING_FOR_CONTENT)
     context.state.transition(WorkflowPhase.VERIFYING)
+    if context.uat_diagnostics is not None:
+        context.uat_diagnostics.report(
+            "FEED",
+            "STARTED",
+            viewport=context.viewport_number,
+        )
     context.reader.set_scan_viewport_index(context.viewport_number)
     context.reader.set_failure_context(context.state.phase.value, "SCAN_ROW")
     try:
@@ -81,6 +100,20 @@ async def _scan_viewport(
         context.reader.last_scan_counts.new_verified_rows = len(
             observer.completed_viewport_fingerprints
         )
+        counts = context.reader.last_scan_counts
+        if context.uat_diagnostics is not None:
+            context.uat_diagnostics.report(
+                "FEED",
+                "OBSERVED" if counts.coverage_complete else "PARTIAL",
+                viewport=context.viewport_number,
+                counts={
+                    "observed_rows": counts.observed_rows,
+                    "verified_rows": counts.verified,
+                    "body_read": counts.body_read,
+                    "body_unknown": counts.body_unknown,
+                    "skipped_rows": counts.skipped,
+                },
+            )
     except (UiReadError, PlaywrightError) as raw_error:
         return _handle_scan_failure(context, observer, raw_error)
     context.state.transition(WorkflowPhase.OBSERVING)
@@ -107,6 +140,20 @@ def _handle_scan_failure(
     counts = context.reader.last_scan_counts
     counts.coverage_complete = False
     context.reader.refresh_viewport_body_coverage_counts()
+    if context.uat_diagnostics is not None:
+        context.uat_diagnostics.report(
+            "FEED",
+            "FAILED",
+            viewport=context.viewport_number,
+            code=error.code,
+            counts={
+                "observed_rows": counts.observed_rows,
+                "verified_rows": counts.verified,
+                "body_read": counts.body_read,
+                "body_unknown": counts.body_unknown,
+                "skipped_rows": counts.skipped,
+            },
+        )
     rejection_reasons = _rejection_reasons(counts)
     emit_console_diagnostic(
         context.console_output_policy,
@@ -303,6 +350,31 @@ async def _select_or_advance(
     context: CycleContext,
     observer: HomeRowObserver,
 ) -> bool:
+    if context.auto_mode:
+        if observer.viewport_relevant_targets:
+            observer.viewport_relevant_targets.sort(
+                key=lambda target: target.fingerprint in context.dedupe.checkpoint_seen
+            )
+            context.selected = await context.selector.first_actionable(
+                observer.viewport_relevant_targets
+            )
+            if context.selected is not None:
+                return True
+
+        seen_count = len(context.dedupe.home_observed_this_session)
+        if seen_count >= context.max_total_posts:
+            context.exhaustion_reason = "MAX_TOTAL_POSTS"
+            return True
+        if context.reader.scroll_attempts >= context.max_scrolls:
+            context.exhaustion_reason = "MAX_SCROLLS"
+            return True
+        if not await context.scroll_controller.advance():
+            context.exhaustion_reason = (
+                context.reader.last_scroll_stop_reason or "FEED_NOT_ADVANCED"
+            )
+            return True
+        return False
+
     if observer.viewport_relevant_targets:
         observer.viewport_relevant_targets.sort(
             key=lambda target: target.fingerprint in context.dedupe.checkpoint_seen
@@ -368,7 +440,11 @@ async def _select_still_visible(context: CycleContext) -> PostTarget | None:
         for target in context.reader.last_scroll_targets
         if target.fingerprint in context.dedupe.pending_set
         and context.dedupe.decisions_by_fingerprint.get(target.fingerprint) == "RELEVANT"
-        and classify_body(target.body, context.normalized_terms) == "RELEVANT"
+        and (
+            classify_auto_body(target.body) == "RELEVANT"
+            if context.auto_mode
+            else classify_body(target.body, context.normalized_terms) == "RELEVANT"
+        )
     ]
     still_visible.sort(key=lambda target: target.fingerprint in context.dedupe.checkpoint_seen)
     return await context.selector.first_actionable(still_visible)

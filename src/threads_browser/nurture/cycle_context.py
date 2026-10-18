@@ -11,6 +11,7 @@ from ..console_output import ConsoleOutputPolicy
 from ..feed.models import PostTarget
 from ..storage import BrowserAccount, Checkpoint, CheckpointStore
 from .state import CoverageLedger, DedupeLedger, NurtureRunState, WorkflowStats
+from .uat_diagnostics import AutoUatDiagnostics
 
 if TYPE_CHECKING:
     from ..reader import ThreadsHomeReader
@@ -43,6 +44,7 @@ class CycleContext:
     detail: bool
     show_post_text: bool
     show_observed_text: bool
+    auto_mode: bool = False
     previous_unverified_rows: list[tuple[str, float]] = field(default_factory=list)
     viewport_number: int = 0
     exhaustion_reason: str = "MAX_SCROLLS"
@@ -53,3 +55,4 @@ class CycleContext:
     session_progress: SessionProgress | None = None
     session_checkpoint_committed: bool = False
     detail_attempted: bool = False
+    uat_diagnostics: AutoUatDiagnostics | None = None

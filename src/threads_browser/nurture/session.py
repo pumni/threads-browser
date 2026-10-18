@@ -15,7 +15,8 @@ from .finish_cycle import finish_cycle
 from .results import NurtureResult
 from .scan_cycle import scan_home_feed
 from .session_state import SessionProgress
-from .state import DedupeLedger, policy_fingerprint
+from .state import DedupeLedger, auto_policy_fingerprint, policy_fingerprint
+from .uat_diagnostics import AutoUatDiagnostics
 
 
 async def run_page_workflow_session(
@@ -30,14 +31,13 @@ async def run_page_workflow_session(
     max_detail_reads: int,
     readiness_prompt: Callable[[str, int], Awaitable[bool]] | None = None,
     console_output_policy: ConsoleOutputPolicy = ConsoleOutputPolicy.INTERACTIVE,
+    auto_mode: bool = False, uat_diagnostics: AutoUatDiagnostics | None = None,
     reader_factory: Callable[..., ThreadsHomeReader] = ThreadsHomeReader,
 ) -> NurtureResult:
     """Continue verified Detail/Back observations without resetting session evidence."""
-    normalized_terms = _validate_cycle(account, max_posts, max_scrolls, max_total_posts, terms)
-    if not 1 <= max_detail_reads <= 40:
-        raise UiReadError("DETAIL_READ_LIMIT_INVALID")
-
-    fingerprint = policy_fingerprint(normalized_terms)
+    normalized_terms, fingerprint = _prepare_session_policy(
+        account, max_posts, terms, max_scrolls, max_total_posts, max_detail_reads, auto_mode
+    )
     checkpoint = checkpoint_store.load(account.account_id, fingerprint)
     progress = SessionProgress(
         checkpoint=checkpoint,
@@ -58,7 +58,6 @@ async def run_page_workflow_session(
         reader_factory=reader_factory,
     )
     last_context: CycleContext | None = None
-
     while True:
         if progress.detail_attempts >= max_detail_reads:
             return _finalize_session(
@@ -95,9 +94,11 @@ async def run_page_workflow_session(
             show_post_text=False,
             show_observed_text=False,
             session_progress=progress,
+            auto_mode=auto_mode,
             home_already_verified=progress.detail_reads > 0,
             viewport_number=progress.viewport_number,
             previous_unverified_rows=progress.previous_unverified_rows,
+            uat_diagnostics=uat_diagnostics,
         )
         last_context = context
         partial_result = await scan_home_feed(context)
@@ -208,3 +209,28 @@ def _finalize_session(
             ),
         )
     return progress.result(reader, status=status, stop_reason=stop_reason)
+
+
+def _prepare_session_policy(
+    account: BrowserAccount,
+    max_posts: int,
+    terms: tuple[str, ...],
+    max_scrolls: int,
+    max_total_posts: int,
+    max_detail_reads: int,
+    auto_mode: bool,
+) -> tuple[tuple[str, ...], str]:
+    normalized_terms = _validate_cycle(
+        account,
+        max_posts,
+        max_scrolls,
+        max_total_posts,
+        terms,
+        allow_empty_terms=auto_mode,
+    )
+    if not 1 <= max_detail_reads <= 40:
+        raise UiReadError("DETAIL_READ_LIMIT_INVALID")
+    fingerprint = (
+        auto_policy_fingerprint() if auto_mode else policy_fingerprint(normalized_terms)
+    )
+    return normalized_terms, fingerprint

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from hashlib import sha256
 
+from ..feed.job_intent import AUTO_POLICY_VERSION
 from .observation import (
     BodyRangeCoverageFacts,
     BodyRangeCoverageState,
@@ -95,6 +96,11 @@ _ALLOWED_TRANSITIONS: dict[WorkflowPhase, frozenset[WorkflowPhase]] = {
 def policy_fingerprint(terms: tuple[str, ...]) -> str:
     payload = json.dumps(tuple(sorted(terms)), ensure_ascii=False, separators=(",", ":"))
     return sha256(payload.encode("utf-8")).hexdigest()
+
+
+def auto_policy_fingerprint() -> str:
+    """Keep built-in Auto Nurture history separate from user-term checkpoints."""
+    return sha256(AUTO_POLICY_VERSION.encode("ascii")).hexdigest()
 
 
 @dataclass(slots=True)

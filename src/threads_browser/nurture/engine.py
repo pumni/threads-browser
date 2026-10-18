@@ -27,6 +27,7 @@ from .state import (
     WorkflowStats,
     policy_fingerprint,
 )
+from .uat_diagnostics import AutoUatDiagnostics
 
 if TYPE_CHECKING:
     from .session_state import SessionProgress
@@ -108,16 +109,31 @@ async def _create_cycle_context(
     show_post_text: bool,
     show_observed_text: bool,
     session_progress: SessionProgress | None = None,
+    auto_mode: bool = False,
     home_already_verified: bool = False,
     viewport_number: int = 0,
     previous_unverified_rows: list[tuple[str, float]] | None = None,
+    uat_diagnostics: AutoUatDiagnostics | None = None,
 ) -> CycleContext:
     """Create one bounded scan/Detail cycle over supplied run-local ledgers."""
     state = NurtureRunState()
     stats = WorkflowStats()
     if not home_already_verified:
         reader.set_failure_context("INITIALIZING", "SETTLE")
-        await _open_home(reader, page, state, console_output_policy, detail)
+        if uat_diagnostics is not None:
+            uat_diagnostics.report("HOME", "STARTED")
+        await _open_home(
+            reader,
+            page,
+            state,
+            console_output_policy,
+            detail,
+            uat_diagnostics,
+        )
+        if uat_diagnostics is not None:
+            uat_diagnostics.report("HOME", "READY")
+    elif uat_diagnostics is not None:
+        uat_diagnostics.report("HOME", "RESUMED")
     state.transition(WorkflowPhase.OBSERVING)
     if detail:
         emit_console_diagnostic(
@@ -134,6 +150,7 @@ async def _create_cycle_context(
         coverage,
         console_output_policy,
         detail,
+        auto_mode,
     )
     return CycleContext(
         page=page,
@@ -154,6 +171,7 @@ async def _create_cycle_context(
         max_total_posts=max_total_posts,
         console_output_policy=console_output_policy,
         detail=detail,
+        auto_mode=auto_mode,
         show_post_text=show_post_text,
         show_observed_text=show_observed_text,
         session_progress=session_progress,
@@ -161,6 +179,7 @@ async def _create_cycle_context(
         previous_unverified_rows=(
             [] if previous_unverified_rows is None else previous_unverified_rows
         ),
+        uat_diagnostics=uat_diagnostics,
     )
 
 
@@ -170,6 +189,8 @@ def _validate_cycle(
     max_scrolls: int,
     max_total_posts: int,
     terms: tuple[str, ...],
+    *,
+    allow_empty_terms: bool = False,
 ) -> tuple[str, ...]:
     if account.expected_actor is None:
         raise BrowserDataError("ACCOUNT_NOT_VERIFIED")
@@ -179,7 +200,7 @@ def _validate_cycle(
         raise UiReadError("SCROLL_LIMIT_INVALID")
     if not 1 <= max_total_posts <= 400:
         raise UiReadError("TOTAL_SCAN_LIMIT_INVALID")
-    return canonical_terms(terms)
+    return () if allow_empty_terms and not terms else canonical_terms(terms)
 
 
 def _make_reader(
@@ -209,6 +230,7 @@ async def _open_home(
     state: NurtureRunState,
     console_output_policy: ConsoleOutputPolicy,
     detail: bool,
+    uat_diagnostics: AutoUatDiagnostics | None = None,
 ) -> None:
     try:
         await reader.open_home()
@@ -225,6 +247,8 @@ async def _open_home(
             )
         )
         state.stop(error.code)
+        if uat_diagnostics is not None:
+            uat_diagnostics.report("HOME", "FAILED", code=error.code)
         if detail:
             emit_console_diagnostic(
                 console_output_policy,
@@ -242,6 +266,7 @@ def _make_selection_components(
     coverage: CoverageLedger,
     console_output_policy: ConsoleOutputPolicy,
     detail: bool,
+    auto_mode: bool = False,
 ) -> tuple[VerifiedTargetSelector, FeedScrollController]:
     selector = VerifiedTargetSelector(
         page=page,
@@ -252,6 +277,7 @@ def _make_selection_components(
         coverage=coverage,
         console_output_policy=console_output_policy,
         detail=detail,
+        auto_mode=auto_mode,
         map_playwright_error=_reader_playwright_error,
     )
     scroll_controller = FeedScrollController(
