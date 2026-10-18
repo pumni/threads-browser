@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from datetime import date
 
-AUTO_POLICY_VERSION = "threads-browser:auto-nurture:job-intent-v2-vi"
+AUTO_POLICY_VERSION = "threads-browser:auto-nurture:job-intent-v3-vi"
 
 # Normalize Vietnamese accents before matching. Eligibility comes from the
 # Vietnamese sentence structure below, never from the presence of diacritics.
@@ -21,12 +22,21 @@ _HIRING_STATUS = (
     r"(?:dang(?:\s+can)?|hien(?:\s+(?:tai|nay))?(?:\s+dang)?(?:\s+can)?|can)"
 )
 _HIRING_ROLE = (
-    r"(?:nhan\s+vien(?:\s+kinh\s+doanh)?|nhan\s+su|lap\s+trinh\s+vien|"
-    r"ky\s+su|kiem\s+thu\s+vien|ke\s+toan|tai\s+xe|"
+    r"(?:nhan\s+vien(?:\s+(?:kinh\s+doanh|phuc\s+vu|thu\s+ngan|pha\s+che|"
+    r"ban\s+hang|kho(?:\s+van)?|van\s+phong|giao\s+hang|le\s+tan|"
+    r"tu\s+van|bao\s+ve|tai\s+xe|lai\s+xe|cong\s+nhan|phu\s+bep|"
+    r"dau\s+bep|tap\s+vu|tho\s+dien|tho\s+han|ky\s+thuat\s+vien|"
+    r"hanh\s+chinh(?:\s+nhan\s+su)?|cham\s+soc\s+khach\s+hang))?|"
+    r"nhan\s+su|lap\s+trinh\s+vien|phuc\s+vu|thu\s+ngan|pha\s+che|"
+    r"bao\s+ve|kho(?:\s+van)?|lai\s+xe|tai\s+xe|giao\s+hang|ban\s+hang|"
+    r"tap\s+vu|le\s+tan|cong\s+nhan|phu\s+bep|dau\s+bep|tho\s+dien|"
+    r"tho\s+han|ky\s+thuat\s+vien|hanh\s+chinh\s+nhan\s+su|"
+    r"kiem\s+thu\s+vien|ke\s+toan|"
     r"qa(?:\s+(?:engineer|tester))?|testers?|engineers?|developers?|"
     r"designers?|managers?|analysts?|recruiters?|accountants?|interns?|"
     r"sales(?:people)?|marketers?|backend(?:\s+developers?)?|"
-    r"frontend(?:\s+developers?)?|product\s+managers?|data\s+scientists?)"
+    r"frontend(?:\s+developers?)?|product\s+managers?|data\s+scientists?|"
+    r"content(?:\s+(?:creators?|writers?))?|podcasts?|marketing)"
 )
 _HIRING_POSITIVE = re.compile(
     rf"\b{_HIRING_SUBJECT}\b(?:\s+[\w-]+){{0,3}}\s+"
@@ -40,8 +50,12 @@ _HIRING_POSITIVE_WITH_INHERITED_SUBJECT = re.compile(
 _HIRING_ROLE_PATTERN = re.compile(rf"\b(?P<role>{_HIRING_ROLE})\b")
 _SEEKING_POSITIVE = re.compile(
     rf"\b(?:hien(?:\s+(?:tai|nay))?\s+)?{_SEEKING_SUBJECT}\s+"
-    rf"(?:hien(?:\s+(?:tai|nay))\s+)?(?:dang|can)\s+"
+    rf"(?:hien(?:\s+(?:tai|nay))\s+)?(?:dang|can|muon)\s+"
     r"tim(?:\s+kiem)?\s+(?:viec(?:\s+lam)?|cong\s+viec)\b"
+)
+_SEEKING_NEEDS_WORK_POSITIVE = re.compile(
+    r"\bem\s+(?:hien(?:\s+(?:tai|nay))\s+)?(?:dang\s+)?"
+    r"can\s+(?:tim\s+)?viec(?:\s+lam)?\b"
 )
 _SEEKING_POSITIVE_WITH_INHERITED_SUBJECT = re.compile(
     r"\b(?:hien(?:\s+(?:tai|nay))?\s+)?(?:dang|can)\s+"
@@ -50,6 +64,13 @@ _SEEKING_POSITIVE_WITH_INHERITED_SUBJECT = re.compile(
 _HIRING_NEGATION = re.compile(
     r"\b(?:khong|chua|chang)(?:\s+con)?(?:\s+dang)?\s+tuyen(?:\s+dung)?\b|"
     r"\b(?:ngung|dung)\s+tuyen(?:\s+dung)?\b|"
+    r"\b(?:ngung|dung)\s+nhan\s+(?:cv|ho\s+so|don\s+ung\s+tuyen)"
+    r"(?:\s+(?:nua|them))?\b|"
+    r"\bhet\s+han\s+(?:nhan\s+(?:cv|ho\s+so)|nop\s+ho\s+so|"
+    r"ung\s+tuyen|tuyen\s+dung)\b|"
+    r"\bhan\s+(?:nop\s+ho\s+so|ung\s+tuyen|tuyen\s+dung)\s+da\s+(?:qua|het)\b|"
+    r"\bda\s+(?:qua|het)\s+han(?:\s+(?:nop\s+ho\s+so|ung\s+tuyen|tuyen\s+dung))?\b|"
+    r"\b(?:khong|chua)\s+nhan\s+cv(?:\s+(?:nua|them))?\b|"
     r"\bda\s+(?:tuyen\s+(?:du|xong|duoc\s+du)|dong\s+tuyen\s+dung)\b|"
     r"\bkhong\s+(?:tiep\s+)?nhan\s+(?:ho\s+so|don\s+ung\s+tuyen|ung\s+vien)"
     r"(?:\s+(?:nua|them))?\b|"
@@ -63,14 +84,75 @@ _SEEKING_NEGATION = re.compile(
     r"\btim\s+duoc\s+viec\s+(?:roi|r\s+oi)\b"
 )
 _NON_JOB_CONTEXT = re.compile(
-    r"\b(?:khoa\s+hoc|lop\s+hoc|tuyen\s+sinh|dang\s+ky(?:\s+khoa\s+hoc)?|"
+    r"\b(?:khoa\s+hoc|lop\s+hoc|tuyen\s+sinh|"
+    r"dang\s+ky\s+(?:khoa\s+hoc|lop\s+hoc|workshop|dao\s+tao)|"
     r"workshop|dao\s+tao|course|courses|class\s+enrollment|training|"
     r"career\s+advice|career\s+tips|interview\s+tips|cv\s+tips|"
     r"chia\s+se|kinh\s+nghiem|meo|loi\s+khuyen|huong\s+dan|"
-    r"phan\s+tich|thi\s+truong\s+lao\s+dong|nguoi\s+khac|minh\s+anh|"
-    r"mot\s+cong\s+ty|nhieu\s+cong\s+ty|cac\s+cong\s+ty|"
+    r"phan\s+tich|thi\s+truong\s+lao\s+dong|"
+    r"tong\s+hop|danh\s+sach|tin\s+tuyen\s+dung)\b"
+)
+_THIRD_PARTY_CONTEXT = re.compile(
+    r"\b(?:nguoi\s+khac|minh\s+anh|mot\s+cong\s+ty|nhieu\s+cong\s+ty|"
+    r"cac\s+cong\s+ty|"
     r"cong\s+ty\s+(?:khac|cua\s+ban|nay|do|kia)|"
     r"doanh\s+nghiep\s+(?:nay|do|kia))\b"
+)
+_SELF_RECRUITER_INTAKE = re.compile(
+    r"\b(?:ben\s+(?:minh|toi)|chung\s+(?:toi|minh)|toi|em|anh|chi)\s+"
+    r"(?:(?:hien(?:\s+(?:tai|nay))?\s+)?(?:dang\s+)?)"
+    r"nhan\s+(?:cv|ho\s+so|don\s+ung\s+tuyen)\b"
+)
+_DIRECT_HIRING_INTENT = re.compile(
+    r"\b(?:(?:hien(?:\s+(?:tai|nay))?\s+)?(?:dang\s+)?(?:can\s+)?)"
+    r"tuyen(?:\s+(?:gap|dung|lai|ngay))?\b|"
+    r"\b(?:dang\s+)?nhan\s+(?:ho\s+so|cv|don\s+ung\s+tuyen)\b"
+)
+_APPLICANT_INTAKE = re.compile(
+    r"\b(?:gui\s+(?:cv|ho\s+so)|nop\s+(?:cv|ho\s+so)|"
+    r"ung\s+tuyen|nhan\s+(?:cv|ho\s+so|don\s+ung\s+tuyen))\b"
+)
+_CONVERSATIONAL_HIRING = re.compile(
+    rf"\b{_HIRING_SUBJECT}\b\s+"
+    r"(?:(?:hien\s+(?:tai|nay)\s+)?(?:dang\s+)?)"
+    r"(?:can(?:\s+them)?|tim(?:\s+them)?)\s+"
+    r"(?:\d+\s+)?(?:ban|nguoi|dong\s+doi|nhan\s+su)\s+"
+    r"(?:lam|viet|chay|phu\s+trach|quan\s+ly)\s+"
+    rf"(?P<role>{_HIRING_ROLE})\b"
+)
+_PASSIVE_REPOST_CONTEXT = re.compile(
+    r"\b(?:dang\s+(?:lai|ho|dum|giup)|re[\s-]?post|"
+    r"chia\s+se\s+lai|share\s+lai)\b"
+)
+_INDEPENDENT_AUTHOR_HIRING_OR_INTAKE = re.compile(
+    rf"(?:\b(?:rieng|nhung|tuy\s+nhien|con)\s+"
+    rf"(?:{_HIRING_SUBJECT}|minh|em|toi|anh|chi)\b"
+    rf"(?:\s+[\w-]+){{0,3}}\s+{_HIRING_STATUS}\s+tuyen(?:\s+dung)?\b|"
+    rf"{_SELF_RECRUITER_INTAKE.pattern}|"
+    rf"\b(?:rieng|nhung|tuy\s+nhien|con)\s+{_CONVERSATIONAL_HIRING.pattern})"
+)
+_SALARY_DETAIL = re.compile(
+    r"\b(?:luong|thu\s+nhap|muc\s+luong|salary|wage)\b"
+    r"\s*(?:[:\-]\s*)?(?:tu\s+)?\d"
+)
+_WORK_LOCATION_DETAIL = re.compile(
+    r"\b(?:dia\s+diem|dia\s+chi(?:\s+lam\s+viec)?|noi\s+lam\s+viec|"
+    r"lam\s+viec\s+tai|lam\s+tai|khu\s+vuc)\b"
+)
+_WORK_SCHEDULE_DETAIL = re.compile(
+    r"\b(?:ca\s+(?:sang|chieu|toi|dem|ngay|xoay|hanh\s+chinh)|"
+    r"xoay\s+ca|thoi\s+gian\s+lam\s+viec|full[\s-]?time|"
+    r"part[\s-]?time|ban\s+thoi\s+gian|toan\s+thoi\s+gian)\b"
+)
+_CONTACT_DETAIL = re.compile(
+    r"\b(?:lien\s+he|inbox|ib|zalo|email|sdt|so\s+dien\s+thoai|"
+    r"goi|nhan\s+tin)\b|\b(?:0\d{9,10}|\+?84\d{8,10})\b"
+)
+_EXPLICIT_DEADLINE = re.compile(
+    r"\b(?:han\s+(?:nop\s+ho\s+so|ung\s+tuyen|tuyen\s+dung)|deadline)\s*"
+    r"(?:la\s+|den\s+|toi\s+|[:\-]\s*)?"
+    r"(?:(?P<iso_year>\d{4})-(?P<iso_month>\d{1,2})-(?P<iso_day>\d{1,2})|"
+    r"(?P<day>\d{1,2})[/-](?P<month>\d{1,2})[/-](?P<year>\d{4}))\b"
 )
 _UNCERTAIN_CONTEXT = re.compile(
     r"\b(?:neu|gia\s+su|co\s+the|co\s+le|du\s+kien|suy\s+doan|"
@@ -81,7 +163,8 @@ _PAST_CONTEXT = re.compile(
     r"luc\s+truoc|hoi\s+do|nam\s+truoc|da\s+tung|tung)\b"
 )
 _CURRENT_CONTEXT = re.compile(
-    r"\b(?:hien\s+tai|hien\s+nay|bay\s+gio|hom\s+nay|luc\s+nay)\b"
+    r"\b(?:hien\s+tai|hien\s+nay|hien\s+(?:dang|can)|bay\s+gio|"
+    r"hom\s+nay|luc\s+nay|tuyen\s+lai)\b"
 )
 _SEEKING_NAME_CONTEXT = re.compile(
     r"\b(?:nguyen|tran|le|pham|hoang|vu|vo|dang|bui|do|ngo|duong|ly|phan|"
@@ -89,7 +172,7 @@ _SEEKING_NAME_CONTEXT = re.compile(
 )
 _THIRD_PARTY_SEEKING_CONTEXT = re.compile(
     r"\b(?:ban|anh|chi|ong|ba|co|chu)\s+[a-z]{1,16}\s+"
-    r"(?:hien(?:\s+(?:tai|nay))?\s+)?(?:dang|can)\s+"
+    r"(?:hien(?:\s+(?:tai|nay))?\s+)?(?:dang|can|muon)\s+"
     r"tim(?:\s+kiem)?\s+(?:viec(?:\s+lam)?|cong\s+viec)\b"
 )
 _ENGLISH_CONTEXT = re.compile(
@@ -104,11 +187,185 @@ _CLAUSE_BREAK = re.compile(
 )
 
 
+def _is_passively_reposted_hiring_event(text: str, position: int) -> bool:
+    """Exclude copied hiring evidence while preserving a separate author opening."""
+    paragraph_start = 0
+    paragraph_end = len(text)
+    for separator in re.finditer(r"\n[ \t]*\n", text):
+        if separator.end() <= position:
+            paragraph_start = separator.end()
+        else:
+            paragraph_end = separator.start()
+            break
+    passive_markers = list(
+        _PASSIVE_REPOST_CONTEXT.finditer(text, paragraph_start, position)
+    )
+    if not passive_markers:
+        return False
+
+    latest_marker = passive_markers[-1]
+    for author_opening in _INDEPENDENT_AUTHOR_HIRING_OR_INTAKE.finditer(
+        text, latest_marker.end(), paragraph_end
+    ):
+        sentence_start = max(
+            text.rfind(mark, latest_marker.end(), author_opening.start())
+            for mark in ".!?"
+        ) + 1
+        sentence_end_candidates = [
+            text.find(mark, author_opening.start(), paragraph_end)
+            for mark in ".!?"
+        ]
+        sentence_end_candidates = [value for value in sentence_end_candidates if value >= 0]
+        sentence_end = min(sentence_end_candidates, default=paragraph_end)
+        if sentence_start <= author_opening.start() <= position < sentence_end:
+            return False
+    return True
+
+
 def _plain_text(value: str) -> str:
     text = unicodedata.normalize("NFKD", value).casefold()
     text = "".join(character for character in text if not unicodedata.combining(character))
     text = text.replace("đ", "d").replace("’", "'").replace("‘", "'")
-    return re.sub(r"\s+", " ", text).strip()
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[^\S\n]+", " ", text)
+    return re.sub(r" *\n *", "\n", text).strip()
+
+
+def _direct_hiring_events(text: str) -> list[tuple[int, str, str | None]]:
+    """Find direct ads with a role and application or structured vacancy evidence."""
+    events: list[tuple[int, str, str | None]] = []
+    block_start = 0
+    for separator in (*re.finditer(r"\n[ \t]*\n", text), None):
+        block_end = len(text) if separator is None else separator.start()
+        block = text[block_start:block_end]
+        flattened = block.replace("\n", " ")
+        if block:
+            for intent in _DIRECT_HIRING_INTENT.finditer(flattened):
+                preceding_words = flattened[max(0, intent.start() - 32) : intent.start()]
+                if re.search(r"\b(?:ung|han)\s+$", preceding_words):
+                    continue
+                if re.search(
+                    r"\b(?:da|khong|chua|chang)(?:\s+con)?(?:\s+dang)?\s+$|"
+                    r"\b(?:ngung|dung)\s+$",
+                    preceding_words,
+                ):
+                    continue
+                sentence_start = max(
+                    flattened.rfind(mark, 0, intent.start()) for mark in ".!?"
+                ) + 1
+                sentence_end_candidates = [
+                    (position, mark)
+                    for mark in ".!?"
+                    if (position := flattened.find(mark, intent.end())) >= 0
+                ]
+                sentence_end, sentence_ending = min(
+                    sentence_end_candidates,
+                    default=(len(flattened), ""),
+                )
+                sentence = flattened[sentence_start:sentence_end]
+                if sentence_ending == "?":
+                    continue
+                if (
+                    _THIRD_PARTY_CONTEXT.search(sentence)
+                    and _SELF_RECRUITER_INTAKE.search(sentence) is None
+                ):
+                    continue
+                window_start = max(0, intent.start() - 100)
+                window_end = min(len(flattened), intent.end() + 360)
+                window = flattened[window_start:window_end]
+                if _NON_JOB_CONTEXT.search(window):
+                    continue
+                role_matches = list(_HIRING_ROLE_PATTERN.finditer(window))
+                role_match = min(
+                    role_matches,
+                    key=lambda match: abs(
+                        window_start + match.start() - intent.start()
+                    ),
+                    default=None,
+                )
+                intent_in_window = intent.start() - window_start
+                headcount_detail = (
+                    role_match is not None
+                    and intent_in_window < role_match.start()
+                    and re.fullmatch(
+                        r"\s+\d+\s+",
+                        window[intent_in_window + (intent.end() - intent.start()) : role_match.start()],
+                    )
+                    is not None
+                )
+                vacancy_details = (
+                    _SALARY_DETAIL.search(window) is not None,
+                    _WORK_LOCATION_DETAIL.search(window) is not None,
+                    _WORK_SCHEDULE_DETAIL.search(window) is not None,
+                    headcount_detail,
+                    _CONTACT_DETAIL.search(window) is not None,
+                    _EXPLICIT_DEADLINE.search(window) is not None,
+                )
+                if (
+                    role_match is None
+                    or role_match.group("role") == "nhan vien"
+                    or (
+                        _APPLICANT_INTAKE.search(window) is None
+                        and sum(vacancy_details) < 2
+                    )
+                ):
+                    continue
+
+                prefix = flattened[sentence_start:intent.start()]
+                if _UNCERTAIN_CONTEXT.search(sentence):
+                    continue
+                past_markers = list(_PAST_CONTEXT.finditer(prefix))
+                current_markers = list(_CURRENT_CONTEXT.finditer(prefix))
+                if past_markers and (
+                    not current_markers or past_markers[-1].start() > current_markers[-1].start()
+                ):
+                    continue
+
+                events.append(
+                    (
+                        block_start + intent.start(),
+                        "HIRING",
+                        role_match.group("role"),
+                    )
+                )
+        if separator is None:
+            break
+        block_start = separator.end()
+    return events
+
+
+def _expired_deadline_events(text: str) -> list[tuple[int, str, str | None]]:
+    events: list[tuple[int, str, str | None]] = []
+    for match in _EXPLICIT_DEADLINE.finditer(text):
+        if match.group("iso_year") is not None:
+            year, month, day = (
+                int(match.group("iso_year")),
+                int(match.group("iso_month")),
+                int(match.group("iso_day")),
+            )
+        else:
+            year, month, day = (
+                int(match.group("year")),
+                int(match.group("month")),
+                int(match.group("day")),
+            )
+        try:
+            deadline = date(year, month, day)
+        except ValueError:
+            continue
+        if deadline >= date.today():
+            continue
+        nearby_start = max(0, match.start() - 240)
+        nearby = text[nearby_start : match.end() + 240]
+        role_matches = list(_HIRING_ROLE_PATTERN.finditer(nearby))
+        role_match = min(
+            role_matches,
+            key=lambda item: abs(item.start() - (match.start() - nearby_start)),
+            default=None,
+        )
+        if role_match is not None:
+            events.append((match.end(), "NOT_HIRING", role_match.group("role")))
+    return events
 
 
 def _sentence_events(sentence: str) -> list[tuple[int, str, str | None]]:
@@ -142,13 +399,24 @@ def _sentence_events(sentence: str) -> list[tuple[int, str, str | None]]:
         has_hiring_subject = re.search(rf"\b{_HIRING_SUBJECT}\b", clause) is not None
         has_seeking_subject = re.search(rf"\b{_SEEKING_SUBJECT}\b", clause) is not None
         mixed_english_context = _ENGLISH_CONTEXT.search(clause) is not None
+        third_party_context = _THIRD_PARTY_CONTEXT.search(clause) is not None
+        if (
+            third_party_context
+            and _SELF_RECRUITER_INTAKE.search(clause) is None
+        ):
+            offset += len(clause) + 1
+            continue
         if not mixed_english_context:
             hiring_matches = list(_HIRING_POSITIVE.finditer(clause))
             if hiring_subject_seen and not has_hiring_subject:
                 hiring_matches.extend(_HIRING_POSITIVE_WITH_INHERITED_SUBJECT.finditer(clause))
             for match in hiring_matches:
                 events.append((offset + match.start(), "HIRING", match.group("role")))
+            for match in _CONVERSATIONAL_HIRING.finditer(clause):
+                if match.group("role") != "nhan vien":
+                    events.append((offset + match.start(), "HIRING", match.group("role")))
             seeking_matches = list(_SEEKING_POSITIVE.finditer(clause))
+            seeking_matches.extend(_SEEKING_NEEDS_WORK_POSITIVE.finditer(clause))
             if seeking_subject_seen and not has_seeking_subject:
                 seeking_matches.extend(_SEEKING_POSITIVE_WITH_INHERITED_SUBJECT.finditer(clause))
             for match in seeking_matches:
@@ -184,25 +452,68 @@ def classify_job_intent(body: str | None) -> str:
         return "UNKNOWN"
 
     text = _plain_text(_QUOTED_TEXT.sub(" ", body))
+    events: list[tuple[int, str, str | None]] = []
+    for sentence_match in _SENTENCES.finditer(text):
+        raw_sentence = sentence_match.group(0)
+        sentence = raw_sentence.strip()
+        leading_space = len(raw_sentence) - len(raw_sentence.lstrip())
+        events.extend(
+            (
+                sentence_match.start() + leading_space + offset,
+                event,
+                role,
+            )
+            for offset, event, role in _sentence_events(sentence)
+        )
+    direct_events = _direct_hiring_events(text)
+    for direct_event in direct_events:
+        position, _, role = direct_event
+        if any(
+            event == "HIRING"
+            and existing_role is not None
+            and role is not None
+            and _same_hiring_role(existing_role, role)
+            and abs(existing_position - position) <= 160
+            and not any(
+                close_position > min(existing_position, position)
+                and close_position < max(existing_position, position)
+                and close_event in {"NOT_HIRING", "NOT_HIRING_OTHER"}
+                and (
+                    close_role is None
+                    or _same_hiring_role(close_role, role)
+                )
+                for close_position, close_event, close_role in events
+            )
+            for existing_position, event, existing_role in events
+        ):
+            continue
+        events.append(direct_event)
+    events.extend(_expired_deadline_events(text))
+    events = [
+        (position, event, role)
+        for position, event, role in events
+        if event not in {"HIRING", "NOT_HIRING", "NOT_HIRING_OTHER"}
+        or not _is_passively_reposted_hiring_event(text, position)
+    ]
+    events.sort(key=lambda event: event[0])
+
     active_hiring_roles: list[str] = []
     seeking_job_is_current = False
-    for match in _SENTENCES.finditer(text):
-        events = _sentence_events(match.group(0).strip())
-        for _, event, role in events:
-            if event == "HIRING" and role is not None:
-                active_hiring_roles.append(role)
-            elif event in {"NOT_HIRING", "NOT_HIRING_OTHER"}:
-                if role is not None:
-                    for index in range(len(active_hiring_roles) - 1, -1, -1):
-                        if _same_hiring_role(active_hiring_roles[index], role):
-                            del active_hiring_roles[index]
-                            break
-                elif event == "NOT_HIRING" and active_hiring_roles:
-                    active_hiring_roles.pop()
-            elif event == "SEEKING_JOB":
-                seeking_job_is_current = True
-            elif event == "NOT_SEEKING_JOB":
-                seeking_job_is_current = False
+    for _, event, role in events:
+        if event == "HIRING" and role is not None:
+            active_hiring_roles.append(role)
+        elif event in {"NOT_HIRING", "NOT_HIRING_OTHER"}:
+            if role is not None:
+                for index in range(len(active_hiring_roles) - 1, -1, -1):
+                    if _same_hiring_role(active_hiring_roles[index], role):
+                        del active_hiring_roles[index]
+                        break
+            elif event == "NOT_HIRING" and active_hiring_roles:
+                active_hiring_roles.pop()
+        elif event == "SEEKING_JOB":
+            seeking_job_is_current = True
+        elif event == "NOT_SEEKING_JOB":
+            seeking_job_is_current = False
 
     positive_intents: set[str] = set()
     if active_hiring_roles:

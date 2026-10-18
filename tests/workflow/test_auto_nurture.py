@@ -36,6 +36,107 @@ def _detail_html(post: SyntheticPost) -> str:
     )
 
 
+def test_reposts_and_posts_on_behalf_are_not_opened_in_detail(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    actor = "offline.repostcheck"
+    account = create_local_account(tmp_path / "data", actor=actor)
+    store = CheckpointStore(tmp_path / "data")
+    posts = (
+        SyntheticPost(
+            "direct-structured-ad",
+            "TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. Lương 8 triệu/tháng. "
+            "Địa điểm: Quận 7. Liên hệ: 0900000000.",
+        ),
+        SyntheticPost(
+            "partner-recruiter-intake",
+            "Mình đang nhận CV cho đối tác ở vị trí QA Engineer. "
+            "Gửi CV qua inbox để ứng tuyển.",
+        ),
+        SyntheticPost(
+            "conversational-content-recruitment",
+            "Góc tuyển dụng: team mình cần thêm 2 bạn viết content/podcast, "
+            "có bạn nào muốn về team không?",
+        ),
+        SyntheticPost(
+            "conversational-marketing-recruitment",
+            "Bên mình cần thêm bạn chạy marketing part-time, "
+            "ai quan tâm nhắn mình nhé.",
+        ),
+        SyntheticPost(
+            "passive-repost",
+            "Mình đăng lại bài này: TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. "
+            "Lương: 8 triệu/tháng. Địa điểm: Quận 7.",
+        ),
+        SyntheticPost(
+            "posted-on-behalf",
+            "Đăng hộ bạn mình: CẦN TUYỂN 2 THU NGÂN. "
+            "Lương 9 triệu/tháng. Địa điểm: Hà Nội.",
+        ),
+        SyntheticPost(
+            "repost-with-incidental-inbox",
+            "Repost: TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. Lương 8 triệu/tháng. "
+            "Địa điểm: Quận 7. Inbox mình để xin link.",
+        ),
+        SyntheticPost(
+            "repost-with-conversational-hiring-copy",
+            "Repost: team mình cần thêm 2 bạn viết content/podcast. "
+            "Lương: 8–10 triệu/tháng. Địa điểm: Quận 7. Inbox ứng tuyển.",
+        ),
+    )
+    home_html = synthetic_home_html(actor, posts).replace(
+        "<html><body>",
+        '<html><head><meta charset="utf-8"></head><body>',
+        1,
+    )
+    details = {
+        f"https://www.threads.com/@candidate/post/{post.slug}": _detail_html(post)
+        for post in posts
+    }
+    visited: list[str] = []
+
+    async def respond(route: Route) -> None:
+        url = route.request.url
+        if url == HOME_URL:
+            body = home_html
+        elif url in details:
+            visited.append(url.rsplit("/", 1)[-1])
+            body = details[url]
+        elif url == f"https://www.threads.com/@{actor}":
+            body = "<!doctype html><html><body><h1>Local profile</h1></body></html>"
+        else:
+            await route.abort()
+            return
+        await route.fulfill(status=200, content_type="text/html", body=body)
+
+    monkeypatch.setattr(
+        workflow,
+        "async_playwright",
+        lambda: _offline_playwright_manager(respond, headless=False),
+    )
+
+    result = asyncio.run(workflow.run_browser_nurture_auto_cycle(account, store))
+
+    assert result.status == "SESSION_COMPLETE"
+    assert result.checkpoint_saved is True
+    assert result.detail_reads == 4
+    assert set(visited) == {
+        "direct-structured-ad",
+        "partner-recruiter-intake",
+        "conversational-content-recruitment",
+        "conversational-marketing-recruitment",
+    }
+    assert set(visited).isdisjoint(
+        {
+            "passive-repost",
+            "posted-on-behalf",
+            "repost-with-incidental-inbox",
+            "repost-with-conversational-hiring-copy",
+        }
+    )
+
+
 def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match(
     tmp_path: Path,
     monkeypatch,
@@ -46,34 +147,60 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
     account = create_local_account(data_root, actor=actor)
     store = CheckpointStore(data_root)
     posts = (
-        SyntheticPost("hire-post", "Bên mình đang tuyển nhân viên kinh doanh tại Hà Nội."),
         SyntheticPost(
-            "career-post",
-            "Năm ngoái mình đang tìm việc làm ở Đà Nẵng. "
-            "Hồi trước bên mình đang tuyển nhân viên kinh doanh.",
+            "structured-direct-ad",
+            "TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. Lương: 8–10 triệu/tháng. "
+            "Địa điểm: Quận 7. Liên hệ: 0900000000.",
         ),
-        SyntheticPost("third-party-company", "Công ty khác đang tuyển QA Engineer."),
         SyntheticPost(
-            "independent-course-clause",
-            "Bên mình đang tuyển nhân viên kinh doanh, nhưng khóa học kỹ năng phỏng vấn cũng đang mở. "
-            "Đã tuyển đủ người cho vị trí khác.",
+            "mixed-share-and-own-hiring",
+            "Mình đăng lại bài này: TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. "
+            "Lương: 8 triệu/tháng. Địa điểm: Quận 7. "
+            "Riêng bên mình đang tuyển Backend Developer.",
+        ),
+        SyntheticPost(
+            "partner-recruiter",
+            "Mình đang nhận CV cho đối tác ở vị trí QA Engineer. "
+            "Gửi CV qua inbox để ứng tuyển.",
+        ),
+        SyntheticPost(
+            "question-about-hiring",
+            "Có ai đang tuyển QA Engineer không? Liên hệ mình. "
+            "Lương 8 triệu/tháng. Địa điểm: Quận 7.",
+        ),
+        SyntheticPost(
+            "third-party-link-request",
+            "Công ty khác đang tuyển QA Engineer. Lương 8 triệu/tháng. "
+            "Địa điểm: Quận 7. Inbox mình để xin link.",
+        ),
+        SyntheticPost(
+            "expired-direct-ad",
+            "TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. Lương 8 triệu. "
+            "Inbox ứng tuyển. HẾT HẠN NHẬN HỒ SƠ.",
+        ),
+        SyntheticPost(
+            "course-enrollment",
+            "Tuyển sinh khóa học QA Engineer. Học phí: 8 triệu. "
+            "Địa điểm: Quận 7. Liên hệ đăng ký.",
+        ),
+        SyntheticPost(
+            "salary-phone-no-hiring-intent",
+            "Lương 8–10 triệu/tháng, gọi số 0900000000, địa chỉ Quận 7.",
         ),
         SyntheticPost(
             "closed-post",
             "Bên mình đang tuyển QA Engineer. Đã tuyển đủ người cho vị trí này.",
         ),
-        SyntheticPost(
-            "closed-applications",
-            "Bên mình đang tuyển nhân viên kinh doanh. Nhưng không nhận hồ sơ nữa.",
-        ),
-        SyntheticPost("third-party-seeking", "Bạn Minh đang tìm việc làm."),
         SyntheticPost("seeking-post", "Em đang tìm công việc QA Tester tại TP.HCM."),
     )
-    hire_url = "https://www.threads.com/@candidate/post/hire-post"
+    hire_url = "https://www.threads.com/@candidate/post/structured-direct-ad"
     legacy_auto_policy = sha256(
         b"threads-browser:auto-nurture:job-intent-v1"
     ).hexdigest()
-    assert AUTO_POLICY_VERSION == "threads-browser:auto-nurture:job-intent-v2-vi"
+    legacy_v2_policy = sha256(
+        b"threads-browser:auto-nurture:job-intent-v2-vi"
+    ).hexdigest()
+    assert AUTO_POLICY_VERSION == "threads-browser:auto-nurture:job-intent-v3-vi"
     legacy_auto_checkpoint = Checkpoint(
         account.account_id,
         legacy_auto_policy,
@@ -91,6 +218,23 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
         / f"{account.account_id}-{legacy_auto_policy}.json"
     )
     legacy_auto_bytes = legacy_auto_path.read_bytes()
+    legacy_v2_checkpoint = Checkpoint(
+        account.account_id,
+        legacy_v2_policy,
+        completed_runs=2,
+        home_sampled=1,
+        home_new=1,
+        home_relevant=1,
+        seen_fingerprints=(_post_fingerprint(hire_url),),
+    )
+    store.save(legacy_v2_checkpoint)
+    legacy_v2_path = (
+        data_root
+        / "nurture"
+        / "checkpoints"
+        / f"{account.account_id}-{legacy_v2_policy}.json"
+    )
+    legacy_v2_bytes = legacy_v2_path.read_bytes()
     current_auto_policy = auto_policy_fingerprint()
     assert current_auto_policy != legacy_auto_policy
     current_auto_checkpoint = Checkpoint(
@@ -188,15 +332,29 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
     uat_diagnostics.report_result(result)
     assert result.status == "SESSION_COMPLETE"
     assert result.checkpoint_saved is True
-    assert result.detail_reads == 3
+    assert result.detail_reads == 4
     assert result.new_fingerprints
 
-    assert set(visited) == {"seeking-post", "hire-post", "independent-course-clause"}
-    assert len(visited) == 3
+    assert set(visited) == {
+        "seeking-post",
+        "structured-direct-ad",
+        "mixed-share-and-own-hiring",
+        "partner-recruiter",
+    }
+    assert set(visited).isdisjoint(
+        {
+            "question-about-hiring",
+            "third-party-link-request",
+            "expired-direct-ad",
+            "course-enrollment",
+            "salary-phone-no-hiring-intent",
+        }
+    )
+    assert len(visited) == 4
     assert wheel_counts_at_detail[0] == 0
     uat_output = "\n".join(uat_lines)
     assert "phase=HOME status=READY" in uat_output
-    assert "phase=FEED status=OBSERVED viewport=1" in uat_output
+    assert "phase=FEED status=OBSERVED" in uat_output
     assert "phase=DETAIL status=VERIFIED detail_reads=1" in uat_output
     assert "phase=BACK status=RETURNED" in uat_output
     assert "phase=COVERAGE status=COMPLETE" in uat_output
@@ -205,28 +363,42 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
     assert all(url not in uat_output for url in details)
     assert all(post.body not in uat_output for post in posts)
     checkpoint = store.load(account.account_id, auto_policy_fingerprint())
-    assert checkpoint.detail_reads == 3
+    assert checkpoint.detail_reads == 4
     assert checkpoint.completed_runs == 2
     assert checkpoint.pending_read_fingerprints == ()
     assert _post_fingerprint(hire_url) in checkpoint.seen_fingerprints
     assert store.load(account.account_id, legacy_auto_policy) == legacy_auto_checkpoint
     assert legacy_auto_path.read_bytes() == legacy_auto_bytes
+    assert store.load(account.account_id, legacy_v2_policy) == legacy_v2_checkpoint
+    assert legacy_v2_path.read_bytes() == legacy_v2_bytes
     assert store.load(account.account_id, user_terms_policy) == user_terms_checkpoint
     assert user_terms_path.read_bytes() == user_terms_bytes
 
     resumed_result = asyncio.run(
         workflow.run_browser_nurture_auto_cycle(account, store)
     )
-    assert resumed_result.checkpoint_saved is True
+    assert resumed_result.checkpoint_saved is True, (
+        resumed_result.status,
+        resumed_result.unresolved_gaps,
+        resumed_result.read_in_progress,
+        resumed_result.viewport_coverage_complete,
+    )
     assert resumed_result.detail_reads == 0
     assert resumed_result.home_new == 0
-    assert set(visited) == {"seeking-post", "hire-post", "independent-course-clause"}
-    assert len(visited) == 3
+    assert set(visited) == {
+        "seeking-post",
+        "structured-direct-ad",
+        "mixed-share-and-own-hiring",
+        "partner-recruiter",
+    }
+    assert len(visited) == 4
     resumed_checkpoint = store.load(account.account_id, auto_policy_fingerprint())
     assert resumed_checkpoint.completed_runs == 3
-    assert resumed_checkpoint.detail_reads == 3
+    assert resumed_checkpoint.detail_reads == 4
     assert store.load(account.account_id, legacy_auto_policy) == legacy_auto_checkpoint
     assert legacy_auto_path.read_bytes() == legacy_auto_bytes
+    assert store.load(account.account_id, legacy_v2_policy) == legacy_v2_checkpoint
+    assert legacy_v2_path.read_bytes() == legacy_v2_bytes
     assert store.load(account.account_id, user_terms_policy) == user_terms_checkpoint
     assert user_terms_path.read_bytes() == user_terms_bytes
     raw_checkpoint = (
