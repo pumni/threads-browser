@@ -14,6 +14,7 @@ from ..feed.models import PostTarget
 from ..reader import ThreadsHomeReader
 from .diagnostics import _detail_stop, _print_detail_body
 from .state import DedupeLedger, NurtureRunState, WorkflowPhase
+from .uat_diagnostics import AutoUatDiagnostics
 
 _DETAIL_READ_FAILURES = frozenset(
     {
@@ -34,6 +35,17 @@ class DetailCycleOutcome:
     retry_pending: bool
 
 
+def _report_uat_phase(
+    diagnostics: AutoUatDiagnostics | None,
+    phase: str,
+    status: str,
+    code: str | None = None,
+    counts: dict[str, int] | None = None,
+) -> None:
+    if diagnostics is not None:
+        diagnostics.report(phase, status, code=code, counts=counts)
+
+
 class DetailBackCoordinator:
     """Own the fail-closed Detail → Back transition for the single-cycle API."""
 
@@ -47,6 +59,7 @@ class DetailBackCoordinator:
         console_output_policy: ConsoleOutputPolicy,
         detail: bool,
         map_playwright_error: Callable[..., UiReadError],
+        uat_diagnostics: AutoUatDiagnostics | None = None,
     ) -> None:
         self._page = page
         self._reader = reader
@@ -55,6 +68,7 @@ class DetailBackCoordinator:
         self._console_output_policy = console_output_policy
         self._detail = detail
         self._map_playwright_error = map_playwright_error
+        self._uat_diagnostics = uat_diagnostics
 
     async def read_and_return(
         self,
@@ -65,6 +79,12 @@ class DetailBackCoordinator:
     ) -> DetailCycleOutcome:
         if selected.fingerprint in self._dedupe.detail_attempted_this_session:
             self._state.stop("DETAIL_IDENTITY_ALREADY_ATTEMPTED")
+            _report_uat_phase(
+                self._uat_diagnostics,
+                "DETAIL",
+                "FAILED",
+                "DETAIL_IDENTITY_ALREADY_ATTEMPTED",
+            )
             emit_console_diagnostic(
                 self._console_output_policy,
                 "[DETAIL] status=STOPPED code=DETAIL_IDENTITY_ALREADY_ATTEMPTED",
@@ -108,6 +128,7 @@ class DetailBackCoordinator:
                     console_output_policy=self._console_output_policy,
                 )
             )
+            _report_uat_phase(self._uat_diagnostics, "DETAIL", "FAILED", error.code)
             if error.code not in _DETAIL_READ_FAILURES or not getattr(
                 self._reader,
                 "detail_route_verified",
@@ -122,6 +143,7 @@ class DetailBackCoordinator:
                     _detail_stop(error.code)
                 raise error from None
             retry_pending = True
+            _report_uat_phase(self._uat_diagnostics, "DETAIL", "RETRY_PENDING", error.code)
             if self._detail:
                 emit_console_diagnostic(
                     self._console_output_policy,
@@ -129,33 +151,24 @@ class DetailBackCoordinator:
                     f"code={error.code} retry=PENDING",
                 )
 
-        if not retry_pending and self._detail:
-            home_body = " ".join((selected.body or "").split())
-            expanded_body = " ".join((detail_target.body or "").split())
-            extent = (
-                "EXPANDED"
-                if len(expanded_body) > len(home_body)
-                else "TRUNCATED"
-                if detail_target.body_truncated
-                else "FULL"
-            )
-            emit_console_diagnostic(
-                self._console_output_policy,
-                f"[DETAIL] post={selected_number} status=VERIFIED "
-                f"provenance=VERIFIED extent={extent}",
-            )
-            _print_detail_body(
-                "DETAIL",
-                f"post={selected_number}",
-                "VERIFIED",
+        if not retry_pending:
+            self._report_detail_body(
+                selected,
+                selected_number,
                 selected_decision,
-                extent,
-                detail_target.body,
+                detail_target,
             )
         if not retry_pending:
             emit_console_diagnostic(
                 self._console_output_policy,
                 "DETAIL_VERIFIED status=PROVENANCE_VERIFIED",
+            )
+        if not retry_pending:
+            _report_uat_phase(
+                self._uat_diagnostics,
+                "DETAIL",
+                "VERIFIED",
+                counts={"detail_reads": 1},
             )
 
         if self._detail:
@@ -180,6 +193,7 @@ class DetailBackCoordinator:
                 )
             )
             self._state.stop(error.code)
+            _report_uat_phase(self._uat_diagnostics, "BACK", "FAILED", error.code)
             if self._detail:
                 anchor_status = (
                     "CHANGED" if error.code == "RETURN_CONTEXT_CHANGED" else "UNVERIFIED"
@@ -196,9 +210,42 @@ class DetailBackCoordinator:
                 f"[BACK] post={selected_number} status=RESTORED "
                 "anchor=IDENTITY_VERIFIED",
             )
+        _report_uat_phase(self._uat_diagnostics, "BACK", "RETURNED")
 
         if retry_pending:
             return DetailCycleOutcome("DETAIL_RETRY_PENDING", 0, True)
         self._dedupe.pending.remove(selected.fingerprint)
         self._dedupe.pending_set.remove(selected.fingerprint)
         return DetailCycleOutcome("COMPLETE", 1, False)
+
+    def _report_detail_body(
+        self,
+        selected: PostTarget,
+        selected_number: int,
+        selected_decision: str,
+        detail_target: PostTarget,
+    ) -> None:
+        if not self._detail:
+            return
+        home_body = " ".join((selected.body or "").split())
+        expanded_body = " ".join((detail_target.body or "").split())
+        extent = (
+            "EXPANDED"
+            if len(expanded_body) > len(home_body)
+            else "TRUNCATED"
+            if detail_target.body_truncated
+            else "FULL"
+        )
+        emit_console_diagnostic(
+            self._console_output_policy,
+            f"[DETAIL] post={selected_number} status=VERIFIED "
+            f"provenance=VERIFIED extent={extent}",
+        )
+        _print_detail_body(
+            "DETAIL",
+            f"post={selected_number}",
+            "VERIFIED",
+            selected_decision,
+            extent,
+            detail_target.body,
+        )

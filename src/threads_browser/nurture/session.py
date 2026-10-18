@@ -16,6 +16,7 @@ from .results import NurtureResult
 from .scan_cycle import scan_home_feed
 from .session_state import SessionProgress
 from .state import DedupeLedger, auto_policy_fingerprint, policy_fingerprint
+from .uat_diagnostics import AutoUatDiagnostics
 
 
 async def run_page_workflow_session(
@@ -30,7 +31,7 @@ async def run_page_workflow_session(
     max_detail_reads: int,
     readiness_prompt: Callable[[str, int], Awaitable[bool]] | None = None,
     console_output_policy: ConsoleOutputPolicy = ConsoleOutputPolicy.INTERACTIVE,
-    auto_mode: bool = False,
+    auto_mode: bool = False, uat_diagnostics: AutoUatDiagnostics | None = None,
     reader_factory: Callable[..., ThreadsHomeReader] = ThreadsHomeReader,
 ) -> NurtureResult:
     """Continue verified Detail/Back observations without resetting session evidence."""
@@ -57,7 +58,6 @@ async def run_page_workflow_session(
         reader_factory=reader_factory,
     )
     last_context: CycleContext | None = None
-
     while True:
         if progress.detail_attempts >= max_detail_reads:
             return _finalize_session(
@@ -98,6 +98,7 @@ async def run_page_workflow_session(
             home_already_verified=progress.detail_reads > 0,
             viewport_number=progress.viewport_number,
             previous_unverified_rows=progress.previous_unverified_rows,
+            uat_diagnostics=uat_diagnostics,
         )
         last_context = context
         partial_result = await scan_home_feed(context)

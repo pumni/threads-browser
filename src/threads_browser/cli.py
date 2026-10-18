@@ -445,8 +445,18 @@ def _handle_auto_command(
     if args.max_cycles is not None and args.max_cycles < 1:
         print("ERROR CYCLE_LIMIT_INVALID", file=sys.stderr)
         return 1
+    if args.uat_diagnostics and args.max_cycles is None:
+        print("ERROR UAT_DIAGNOSTICS_REQUIRES_CYCLE_LIMIT", file=sys.stderr)
+        return 1
+    diagnostics = None
+    if args.uat_diagnostics:
+        from .nurture.uat_diagnostics import AutoUatDiagnostics
+
+        diagnostics = AutoUatDiagnostics()
     account = accounts.get(args.alias)
     if account.expected_actor is None:
+        if diagnostics is not None:
+            diagnostics.report_terminal("ACCOUNT_NOT_VERIFIED")
         print("ERROR ACCOUNT_NOT_VERIFIED", file=sys.stderr)
         return 1
 
@@ -457,16 +467,30 @@ def _handle_auto_command(
     checkpoint_store = CheckpointStore(data_root)
 
     async def run_cycle():
-        return await run_browser_nurture_auto_cycle(account, checkpoint_store)
+        if diagnostics is None:
+            return await run_browser_nurture_auto_cycle(account, checkpoint_store)
+        return await run_browser_nurture_auto_cycle(
+            account,
+            checkpoint_store,
+            uat_diagnostics=diagnostics,
+        )
 
     try:
-        asyncio.run(run_auto_nurture(run_cycle, max_cycles=args.max_cycles))
+        asyncio.run(
+            run_auto_nurture(
+                run_cycle,
+                max_cycles=args.max_cycles,
+                uat_diagnostics=diagnostics,
+            )
+        )
     except UiReadError as error:
         print(f"STOP {error.code}", file=sys.stderr)
         if error.code == "LOGIN_REQUIRED":
             print(f"Run 'tb login {account.alias}' to authenticate.", file=sys.stderr)
         return 1
     except BrowserDataError as error:
+        if diagnostics is not None:
+            diagnostics.report_terminal(error.code)
         print(f"ERROR {error.code}", file=sys.stderr)
         return 1
     return 0

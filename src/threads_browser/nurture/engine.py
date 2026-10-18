@@ -27,6 +27,7 @@ from .state import (
     WorkflowStats,
     policy_fingerprint,
 )
+from .uat_diagnostics import AutoUatDiagnostics
 
 if TYPE_CHECKING:
     from .session_state import SessionProgress
@@ -112,13 +113,27 @@ async def _create_cycle_context(
     home_already_verified: bool = False,
     viewport_number: int = 0,
     previous_unverified_rows: list[tuple[str, float]] | None = None,
+    uat_diagnostics: AutoUatDiagnostics | None = None,
 ) -> CycleContext:
     """Create one bounded scan/Detail cycle over supplied run-local ledgers."""
     state = NurtureRunState()
     stats = WorkflowStats()
     if not home_already_verified:
         reader.set_failure_context("INITIALIZING", "SETTLE")
-        await _open_home(reader, page, state, console_output_policy, detail)
+        if uat_diagnostics is not None:
+            uat_diagnostics.report("HOME", "STARTED")
+        await _open_home(
+            reader,
+            page,
+            state,
+            console_output_policy,
+            detail,
+            uat_diagnostics,
+        )
+        if uat_diagnostics is not None:
+            uat_diagnostics.report("HOME", "READY")
+    elif uat_diagnostics is not None:
+        uat_diagnostics.report("HOME", "RESUMED")
     state.transition(WorkflowPhase.OBSERVING)
     if detail:
         emit_console_diagnostic(
@@ -164,6 +179,7 @@ async def _create_cycle_context(
         previous_unverified_rows=(
             [] if previous_unverified_rows is None else previous_unverified_rows
         ),
+        uat_diagnostics=uat_diagnostics,
     )
 
 
@@ -214,6 +230,7 @@ async def _open_home(
     state: NurtureRunState,
     console_output_policy: ConsoleOutputPolicy,
     detail: bool,
+    uat_diagnostics: AutoUatDiagnostics | None = None,
 ) -> None:
     try:
         await reader.open_home()
@@ -230,6 +247,8 @@ async def _open_home(
             )
         )
         state.stop(error.code)
+        if uat_diagnostics is not None:
+            uat_diagnostics.report("HOME", "FAILED", code=error.code)
         if detail:
             emit_console_diagnostic(
                 console_output_policy,

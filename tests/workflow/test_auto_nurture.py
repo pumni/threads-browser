@@ -18,6 +18,7 @@ from threads_browser.console_output import ConsoleOutputPolicy
 from threads_browser.feed.urls import HOME_URL
 from threads_browser.nurture.session import run_page_workflow_session
 from threads_browser.nurture.state import auto_policy_fingerprint
+from threads_browser.nurture.uat_diagnostics import AutoUatDiagnostics
 from threads_browser.storage import CheckpointStore
 
 
@@ -98,7 +99,17 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
         inspect_completed_cycle,
     )
 
-    result = asyncio.run(workflow.run_browser_nurture_auto_cycle(account, store))
+    uat_lines: list[str] = []
+    uat_diagnostics = AutoUatDiagnostics(emit=uat_lines.append)
+    uat_diagnostics.begin_attempt()
+    result = asyncio.run(
+        workflow.run_browser_nurture_auto_cycle(
+            account,
+            store,
+            uat_diagnostics=uat_diagnostics,
+        )
+    )
+    uat_diagnostics.report_result(result)
     assert result.status == "SESSION_COMPLETE"
     assert result.checkpoint_saved is True
     assert result.detail_reads == 2
@@ -109,6 +120,16 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
         "https://www.threads.com/@candidate/post/seeking-post",
     ]
     assert wheel_counts_at_detail[0] == 0
+    uat_output = "\n".join(uat_lines)
+    assert "phase=HOME status=READY" in uat_output
+    assert "phase=FEED status=OBSERVED viewport=1" in uat_output
+    assert "phase=DETAIL status=VERIFIED detail_reads=1" in uat_output
+    assert "phase=BACK status=RETURNED" in uat_output
+    assert "phase=COVERAGE status=COMPLETE" in uat_output
+    assert "phase=CHECKPOINT status=SAVED" in uat_output
+    assert actor not in uat_output
+    assert all(url not in uat_output for url in details)
+    assert all(post.body not in uat_output for post in posts)
     checkpoint = store.load(account.account_id, auto_policy_fingerprint())
     assert checkpoint.detail_reads == 2
     raw_checkpoint = (

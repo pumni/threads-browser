@@ -167,6 +167,11 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         help="stop after this many bounded refresh cycles (default: continue until interrupted)",
     )
+    auto.add_argument(
+        "--uat-diagnostics",
+        action="store_true",
+        help="emit privacy-safe phase codes and counters; requires --max-cycles",
+    )
 
     account = commands.add_parser("account", help="legacy account management commands")
     account_commands = account.add_subparsers(dest="account_command", required=True)

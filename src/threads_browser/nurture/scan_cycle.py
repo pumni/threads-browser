@@ -41,7 +41,18 @@ async def scan_home_feed(context: CycleContext) -> NurtureResult | None:
             return partial_result
         if _record_viewport_observation(context, observer, scan_limit=scan_limit):
             break
-        if await _select_or_advance(context, observer):
+        try:
+            stop = await _select_or_advance(context, observer)
+        except UiReadError as error:
+            if context.uat_diagnostics is not None:
+                context.uat_diagnostics.report(
+                    "FEED",
+                    "FAILED",
+                    viewport=context.viewport_number,
+                    code=error.code,
+                )
+            raise
+        if stop:
             break
     return None
 
@@ -72,6 +83,12 @@ async def _scan_viewport(
 ) -> NurtureResult | None:
     context.state.transition(WorkflowPhase.WAITING_FOR_CONTENT)
     context.state.transition(WorkflowPhase.VERIFYING)
+    if context.uat_diagnostics is not None:
+        context.uat_diagnostics.report(
+            "FEED",
+            "STARTED",
+            viewport=context.viewport_number,
+        )
     context.reader.set_scan_viewport_index(context.viewport_number)
     context.reader.set_failure_context(context.state.phase.value, "SCAN_ROW")
     try:
@@ -83,6 +100,20 @@ async def _scan_viewport(
         context.reader.last_scan_counts.new_verified_rows = len(
             observer.completed_viewport_fingerprints
         )
+        counts = context.reader.last_scan_counts
+        if context.uat_diagnostics is not None:
+            context.uat_diagnostics.report(
+                "FEED",
+                "OBSERVED" if counts.coverage_complete else "PARTIAL",
+                viewport=context.viewport_number,
+                counts={
+                    "observed_rows": counts.observed_rows,
+                    "verified_rows": counts.verified,
+                    "body_read": counts.body_read,
+                    "body_unknown": counts.body_unknown,
+                    "skipped_rows": counts.skipped,
+                },
+            )
     except (UiReadError, PlaywrightError) as raw_error:
         return _handle_scan_failure(context, observer, raw_error)
     context.state.transition(WorkflowPhase.OBSERVING)
@@ -109,6 +140,20 @@ def _handle_scan_failure(
     counts = context.reader.last_scan_counts
     counts.coverage_complete = False
     context.reader.refresh_viewport_body_coverage_counts()
+    if context.uat_diagnostics is not None:
+        context.uat_diagnostics.report(
+            "FEED",
+            "FAILED",
+            viewport=context.viewport_number,
+            code=error.code,
+            counts={
+                "observed_rows": counts.observed_rows,
+                "verified_rows": counts.verified,
+                "body_read": counts.body_read,
+                "body_unknown": counts.body_unknown,
+                "skipped_rows": counts.skipped,
+            },
+        )
     rejection_reasons = _rejection_reasons(counts)
     emit_console_diagnostic(
         context.console_output_policy,

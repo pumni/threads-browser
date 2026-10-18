@@ -11,6 +11,7 @@ from ..console_output import ConsoleOutputPolicy
 from ..feed.models import PostTarget
 from ..storage import BrowserAccount, Checkpoint, CheckpointStore
 from .state import CoverageLedger, DedupeLedger, NurtureRunState, WorkflowStats
+from .uat_diagnostics import AutoUatDiagnostics
 
 if TYPE_CHECKING:
     from ..reader import ThreadsHomeReader
@@ -54,3 +55,4 @@ class CycleContext:
     session_progress: SessionProgress | None = None
     session_checkpoint_committed: bool = False
     detail_attempted: bool = False
+    uat_diagnostics: AutoUatDiagnostics | None = None

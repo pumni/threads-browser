@@ -186,6 +186,7 @@ async def _read_selected_detail(context: CycleContext) -> None:
         console_output_policy=context.console_output_policy,
         detail=context.detail,
         map_playwright_error=_reader_playwright_error,
+        uat_diagnostics=context.uat_diagnostics,
     ).read_and_return(
         target,
         selected_number=context.dedupe.post_numbers[target.fingerprint],
