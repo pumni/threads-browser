@@ -52,6 +52,11 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
             "TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. Lương 8–10 triệu. "
             "Làm ở Q7. Inbox ứng tuyển.",
         ),
+        SyntheticPost(
+            "partner-recruiter",
+            "Mình đang nhận CV cho đối tác ở vị trí QA Engineer. "
+            "Gửi CV qua inbox để ứng tuyển.",
+        ),
         SyntheticPost("third-party-company", "Công ty khác đang tuyển QA Engineer."),
         SyntheticPost(
             "question-about-hiring",
@@ -69,11 +74,6 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
         SyntheticPost(
             "course-enrollment",
             "Tuyển sinh lớp nghề – học phí 8 triệu – địa chỉ – liên hệ.",
-        ),
-        SyntheticPost(
-            "independent-course-clause",
-            "Bên mình đang tuyển nhân viên kinh doanh, nhưng khóa học kỹ năng phỏng vấn cũng đang mở. "
-            "Đã tuyển đủ người cho vị trí khác.",
         ),
         SyntheticPost(
             "closed-post",
@@ -226,8 +226,8 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
     assert set(visited) == {
         "seeking-post",
         "hire-post",
-        "independent-course-clause",
         "direct-recruitment-ad",
+        "partner-recruiter",
     }
     assert set(visited).isdisjoint(
         {"question-about-hiring", "third-party-link-request", "expired-direct-ad"}
@@ -270,8 +270,8 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
     assert set(visited) == {
         "seeking-post",
         "hire-post",
-        "independent-course-clause",
         "direct-recruitment-ad",
+        "partner-recruiter",
     }
     assert len(visited) == 4
     resumed_checkpoint = store.load(account.account_id, auto_policy_fingerprint())

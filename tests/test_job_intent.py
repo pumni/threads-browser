@@ -111,6 +111,13 @@ from threads_browser.feed.job_intent import classify_auto_body, classify_job_int
             "Năm ngoái mình từng tìm việc, nhưng hiện tại mình đang tìm việc làm.",
             "SEEKING_JOB",
         ),
+        (
+            (
+                "Tuyển gấp nhân viên phục vụ, inbox ứng tuyển. Hết hạn nhận hồ sơ. "
+                "Hiện đang tuyển lại nhân viên phục vụ ca tối, inbox nhận CV."
+            ),
+            "HIRING",
+        ),
     ),
     ids=(
         "vi_hiring_employee",
@@ -143,6 +150,7 @@ from threads_browser.feed.job_intent import classify_auto_body, classify_job_int
         "job_intent_with_independent_course_clause",
         "independent_author_clause_after_third_party_company",
         "current_seeking_after_past_clause",
+        "direct_vacancy_reopened_after_expired_applications",
     ),
 )
 def test_vietnamese_current_job_intent_is_eligible(body: str, expected: str) -> None:

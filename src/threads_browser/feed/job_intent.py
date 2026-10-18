@@ -65,6 +65,8 @@ _HIRING_NEGATION = re.compile(
     r"\b(?:ngung|dung)\s+tuyen(?:\s+dung)?\b|"
     r"\b(?:ngung|dung)\s+nhan\s+(?:cv|ho\s+so|don\s+ung\s+tuyen)"
     r"(?:\s+(?:nua|them))?\b|"
+    r"\bhet\s+han\s+(?:nhan\s+(?:cv|ho\s+so)|nop\s+ho\s+so|"
+    r"ung\s+tuyen|tuyen\s+dung)\b|"
     r"\bhan\s+(?:nop\s+ho\s+so|ung\s+tuyen|tuyen\s+dung)\s+da\s+(?:qua|het)\b|"
     r"\bda\s+(?:qua|het)\s+han(?:\s+(?:nop\s+ho\s+so|ung\s+tuyen|tuyen\s+dung))?\b|"
     r"\b(?:khong|chua)\s+nhan\s+cv(?:\s+(?:nua|them))?\b|"
@@ -95,15 +97,19 @@ _THIRD_PARTY_CONTEXT = re.compile(
     r"cong\s+ty\s+(?:khac|cua\s+ban|nay|do|kia)|"
     r"doanh\s+nghiep\s+(?:nay|do|kia))\b"
 )
+_SELF_RECRUITER_INTAKE = re.compile(
+    r"\b(?:ben\s+(?:minh|toi)|chung\s+(?:toi|minh)|toi|em|anh|chi)\s+"
+    r"(?:(?:hien(?:\s+(?:tai|nay))?\s+)?(?:dang\s+)?)"
+    r"nhan\s+(?:cv|ho\s+so|don\s+ung\s+tuyen)\b"
+)
 _DIRECT_HIRING_INTENT = re.compile(
     r"\b(?:(?:hien(?:\s+(?:tai|nay))?\s+)?(?:dang\s+)?(?:can\s+)?)"
     r"tuyen(?:\s+(?:gap|dung|lai|ngay))?\b|"
     r"\b(?:dang\s+)?nhan\s+(?:ho\s+so|cv|don\s+ung\s+tuyen)\b"
 )
 _APPLICANT_INTAKE = re.compile(
-    r"\b(?:inbox|ib|lien\s+he|gui\s+(?:cv|ho\s+so)|nop\s+(?:cv|ho\s+so)|"
-    r"ung\s+tuyen|nhan\s+(?:cv|ho\s+so|don\s+ung\s+tuyen)|"
-    r"qua\s+(?:zalo|email)|zalo|email)\b"
+    r"\b(?:gui\s+(?:cv|ho\s+so)|nop\s+(?:cv|ho\s+so)|"
+    r"ung\s+tuyen|nhan\s+(?:cv|ho\s+so|don\s+ung\s+tuyen))\b"
 )
 _EXPLICIT_DEADLINE = re.compile(
     r"\b(?:han\s+(?:nop\s+ho\s+so|ung\s+tuyen|tuyen\s+dung)|deadline)\s*"
@@ -172,12 +178,39 @@ def _direct_hiring_events(text: str) -> list[tuple[int, str, str | None]]:
                     preceding_words,
                 ):
                     continue
+                sentence_start = max(
+                    flattened.rfind(mark, 0, intent.start()) for mark in ".!?"
+                ) + 1
+                sentence_end_candidates = [
+                    (position, mark)
+                    for mark in ".!?"
+                    if (position := flattened.find(mark, intent.end())) >= 0
+                ]
+                sentence_end, sentence_ending = min(
+                    sentence_end_candidates,
+                    default=(len(flattened), ""),
+                )
+                sentence = flattened[sentence_start:sentence_end]
+                if sentence_ending == "?":
+                    continue
+                if (
+                    _THIRD_PARTY_CONTEXT.search(sentence)
+                    and _SELF_RECRUITER_INTAKE.search(sentence) is None
+                ):
+                    continue
                 window_start = max(0, intent.start() - 100)
                 window_end = min(len(flattened), intent.end() + 360)
                 window = flattened[window_start:window_end]
                 if _NON_JOB_CONTEXT.search(window):
                     continue
-                role_match = _HIRING_ROLE_PATTERN.search(window)
+                role_matches = list(_HIRING_ROLE_PATTERN.finditer(window))
+                role_match = min(
+                    role_matches,
+                    key=lambda match: abs(
+                        window_start + match.start() - intent.start()
+                    ),
+                    default=None,
+                )
                 if (
                     role_match is None
                     or role_match.group("role") == "nhan vien"
@@ -185,16 +218,6 @@ def _direct_hiring_events(text: str) -> list[tuple[int, str, str | None]]:
                 ):
                     continue
 
-                sentence_start = max(
-                    flattened.rfind(mark, 0, intent.start()) for mark in ".!?"
-                ) + 1
-                sentence_end_candidates = [
-                    position
-                    for mark in ".!?"
-                    if (position := flattened.find(mark, intent.end())) >= 0
-                ]
-                sentence_end = min(sentence_end_candidates, default=len(flattened))
-                sentence = flattened[sentence_start:sentence_end]
                 prefix = flattened[sentence_start:intent.start()]
                 if _UNCERTAIN_CONTEXT.search(sentence):
                     continue
@@ -284,8 +307,10 @@ def _sentence_events(sentence: str) -> list[tuple[int, str, str | None]]:
         has_seeking_subject = re.search(rf"\b{_SEEKING_SUBJECT}\b", clause) is not None
         mixed_english_context = _ENGLISH_CONTEXT.search(clause) is not None
         third_party_context = _THIRD_PARTY_CONTEXT.search(clause) is not None
-        has_applicant_intake = _APPLICANT_INTAKE.search(clause) is not None
-        if third_party_context and not has_applicant_intake:
+        if (
+            third_party_context
+            and _SELF_RECRUITER_INTAKE.search(clause) is None
+        ):
             offset += len(clause) + 1
             continue
         if not mixed_english_context:
