@@ -31,12 +31,13 @@ _HIRING_ROLE = (
 _HIRING_POSITIVE = re.compile(
     rf"\b{_HIRING_SUBJECT}\b(?:\s+[\w-]+){{0,3}}\s+"
     rf"{_HIRING_STATUS}\s+tuyen(?:\s+dung)?\b"
-    rf"[\w\s/-]{{0,64}}?\b(?:[0-9]+\s+)?{_HIRING_ROLE}\b"
+    rf"[\w\s/-]{{0,64}}?\b(?:[0-9]+\s+)?(?P<role>{_HIRING_ROLE})\b"
 )
 _HIRING_POSITIVE_WITH_INHERITED_SUBJECT = re.compile(
     rf"\b{_HIRING_STATUS}\s+tuyen(?:\s+dung)?\b"
-    rf"[\w\s/-]{{0,64}}?\b(?:[0-9]+\s+)?{_HIRING_ROLE}\b"
+    rf"[\w\s/-]{{0,64}}?\b(?:[0-9]+\s+)?(?P<role>{_HIRING_ROLE})\b"
 )
+_HIRING_ROLE_PATTERN = re.compile(rf"\b(?P<role>{_HIRING_ROLE})\b")
 _SEEKING_POSITIVE = re.compile(
     rf"\b(?:hien(?:\s+(?:tai|nay))?\s+)?{_SEEKING_SUBJECT}\s+"
     rf"(?:hien(?:\s+(?:tai|nay))\s+)?(?:dang|can)\s+"
@@ -54,6 +55,7 @@ _HIRING_NEGATION = re.compile(
     r"(?:\s+(?:nua|them))?\b|"
     r"\b(?:position\s+(?:is\s+)?filled|applications?\s+(?:are\s+)?closed)\b"
 )
+_DIFFERENT_POSITION = re.compile(r"\bvi tri khac\b")
 _SEEKING_NEGATION = re.compile(
     r"\b(?:khong|chua|chang)(?:\s+con)?(?:\s+dang)?\s+"
     r"tim(?:\s+kiem)?\s+(?:viec(?:\s+lam)?|cong\s+viec)\b|"
@@ -103,9 +105,9 @@ def _plain_text(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _sentence_events(sentence: str) -> list[tuple[int, str]]:
+def _sentence_events(sentence: str) -> list[tuple[int, str, str | None]]:
     """Return ordered, sentence-local hiring/seeking status evidence."""
-    events: list[tuple[int, str]] = []
+    events: list[tuple[int, str, str | None]] = []
     offset = 0
     hiring_subject_seen = False
     seeking_subject_seen = False
@@ -138,21 +140,35 @@ def _sentence_events(sentence: str) -> list[tuple[int, str]]:
             if hiring_subject_seen and not has_hiring_subject:
                 hiring_matches.extend(_HIRING_POSITIVE_WITH_INHERITED_SUBJECT.finditer(clause))
             for match in hiring_matches:
-                events.append((offset + match.start(), "HIRING"))
+                events.append((offset + match.start(), "HIRING", match.group("role")))
             seeking_matches = list(_SEEKING_POSITIVE.finditer(clause))
             if seeking_subject_seen and not has_seeking_subject:
                 seeking_matches.extend(_SEEKING_POSITIVE_WITH_INHERITED_SUBJECT.finditer(clause))
             for match in seeking_matches:
-                events.append((offset + match.start(), "SEEKING_JOB"))
+                events.append((offset + match.start(), "SEEKING_JOB", None))
         for match in hiring_closures:
-            events.append((offset + match.start(), "NOT_HIRING"))
+            closed_role = _HIRING_ROLE_PATTERN.search(clause)
+            event = "NOT_HIRING_OTHER" if _DIFFERENT_POSITION.search(clause) else "NOT_HIRING"
+            events.append(
+                (
+                    offset + match.start(),
+                    event,
+                    closed_role.group("role") if closed_role is not None else None,
+                )
+            )
         for match in seeking_closures:
-            events.append((offset + match.start(), "NOT_SEEKING_JOB"))
+            events.append((offset + match.start(), "NOT_SEEKING_JOB", None))
         if not mixed_english_context:
             hiring_subject_seen = hiring_subject_seen or has_hiring_subject
             seeking_subject_seen = seeking_subject_seen or has_seeking_subject
         offset += len(clause) + 1
-    return sorted(events)
+    return sorted(events, key=lambda event: event[0])
+
+
+def _same_hiring_role(active_role: str, closed_role: str) -> bool:
+    active_words = set(active_role.split())
+    closed_words = set(closed_role.split())
+    return active_words <= closed_words or closed_words <= active_words
 
 
 def classify_job_intent(body: str | None) -> str:
@@ -161,20 +177,31 @@ def classify_job_intent(body: str | None) -> str:
         return "UNKNOWN"
 
     text = _plain_text(_QUOTED_TEXT.sub(" ", body))
-    positive_intents: set[str] = set()
+    active_hiring_roles: list[str] = []
+    seeking_job_is_current = False
     for match in _SENTENCES.finditer(text):
         events = _sentence_events(match.group(0).strip())
-        if not events:
-            continue
-        latest_by_group: dict[str, str] = {}
-        for _, event in events:
-            group = "HIRING" if event.endswith("HIRING") else "SEEKING_JOB"
-            latest_by_group[group] = event
-        positive_intents.update(
-            group
-            for group, event in latest_by_group.items()
-            if event == group
-        )
+        for _, event, role in events:
+            if event == "HIRING" and role is not None:
+                active_hiring_roles.append(role)
+            elif event in {"NOT_HIRING", "NOT_HIRING_OTHER"}:
+                if role is not None:
+                    for index in range(len(active_hiring_roles) - 1, -1, -1):
+                        if _same_hiring_role(active_hiring_roles[index], role):
+                            del active_hiring_roles[index]
+                            break
+                elif event == "NOT_HIRING" and active_hiring_roles:
+                    active_hiring_roles.pop()
+            elif event == "SEEKING_JOB":
+                seeking_job_is_current = True
+            elif event == "NOT_SEEKING_JOB":
+                seeking_job_is_current = False
+
+    positive_intents: set[str] = set()
+    if active_hiring_roles:
+        positive_intents.add("HIRING")
+    if seeking_job_is_current:
+        positive_intents.add("SEEKING_JOB")
 
     if len(positive_intents) != 1:
         return "OTHER"

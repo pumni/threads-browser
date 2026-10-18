@@ -25,6 +25,20 @@ from threads_browser.feed.job_intent import classify_auto_body, classify_job_int
             "HIRING",
         ),
         (
+            (
+                "Bên mình đang tuyển QA Engineer. Đã tuyển đủ người cho vị trí này. "
+                "Hiện tại bên mình đang tuyển Backend Developer."
+            ),
+            "HIRING",
+        ),
+        (
+            (
+                "Bên mình đang tuyển QA Engineer. Bên mình đang tuyển Backend Developer. "
+                "Đã tuyển đủ Backend Developer cho vị trí này."
+            ),
+            "HIRING",
+        ),
+        (
             "Bên mình đã tuyển đủ người cho vị trí này, nhưng bên mình đang tuyển QA Engineer.",
             "HIRING",
         ),
@@ -59,6 +73,8 @@ from threads_browser.feed.job_intent import classify_auto_body, classify_job_int
         "unaccented_seeking_structure",
         "positive_sentence_after_closing_sentence",
         "positive_sentence_before_other_closure",
+        "independent_current_opening_after_closure",
+        "specific_closure_keeps_other_open_role",
         "positive_clause_after_closing_clause",
         "positive_clause_after_negation",
         "inherited_subject_after_negation",
@@ -98,6 +114,9 @@ def test_vietnamese_current_job_intent_is_eligible(body: str, expected: str) -> 
         "Bên mình đang tuyển QA Engineer, nhưng đã tuyển đủ người cho vị trí này.",
         "Bên mình đang tuyển QA Engineer; nhưng đã tuyển đủ người.",
         "Bên mình đang tuyển nhân viên, không nhận hồ sơ nữa.",
+        "Bên mình đang tuyển QA Engineer. Đã tuyển đủ người cho vị trí này.",
+        "Bên mình đang tuyển nhân viên kinh doanh. Nhưng không nhận hồ sơ nữa.",
+        "Bên mình đang tuyển QA Engineer. Đã tuyển đủ QA Engineer cho vị trí này.",
         "Năm ngoái mình đang tìm việc làm ở Đà Nẵng.",
         "Hồi trước bên mình đang tuyển nhân viên kinh doanh.",
         "Năm ngoái công ty đang cần tuyển QA Engineer.",
@@ -137,6 +156,9 @@ def test_vietnamese_current_job_intent_is_eligible(body: str, expected: str) -> 
         "same_sentence_closure_after_positive",
         "semicolon_closure_after_positive",
         "application_closure_after_positive",
+        "same_vacancy_closed_in_next_sentence",
+        "applications_closed_in_next_sentence",
+        "specific_vacancy_closed_in_next_sentence",
         "past_seeking_job",
         "past_hiring_from_company",
         "past_hiring_qa",

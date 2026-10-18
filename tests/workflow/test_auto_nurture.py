@@ -54,10 +54,17 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
         ),
         SyntheticPost(
             "independent-course-clause",
-            "Bên mình đang tuyển nhân viên kinh doanh, nhưng khóa học kỹ năng phỏng vấn cũng đang mở.",
+            "Bên mình đang tuyển nhân viên kinh doanh, nhưng khóa học kỹ năng phỏng vấn cũng đang mở. "
+            "Đã tuyển đủ người cho vị trí khác.",
         ),
-        SyntheticPost("closed-post", "Bên mình đang tuyển QA Engineer; nhưng đã tuyển đủ người."),
-        SyntheticPost("closed-applications", "Bên mình đang tuyển nhân viên, không nhận hồ sơ nữa."),
+        SyntheticPost(
+            "closed-post",
+            "Bên mình đang tuyển QA Engineer. Đã tuyển đủ người cho vị trí này.",
+        ),
+        SyntheticPost(
+            "closed-applications",
+            "Bên mình đang tuyển nhân viên kinh doanh. Nhưng không nhận hồ sơ nữa.",
+        ),
         SyntheticPost("english-seeking", "Looking for a job in Vietnam."),
         SyntheticPost("seeking-post", "Em đang tìm công việc QA Tester tại TP.HCM."),
     )
