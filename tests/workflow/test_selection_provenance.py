@@ -15,7 +15,7 @@ from tests.fixtures.browser import (
 )
 from threads_browser import reader as reader_module
 from threads_browser import workflow
-from threads_browser.browser_ui.detail import DetailNavigator
+from threads_browser.browser_ui.detail_click import click_detail_target
 from threads_browser.console_output import ConsoleOutputPolicy
 from threads_browser.feed.models import PostTarget
 from threads_browser.reader import (
@@ -31,7 +31,7 @@ from threads_browser.storage import (
 from threads_browser.workflow import policy_fingerprint
 
 
-def test_auto_actionability_rejects_partial_revalidated_body() -> None:
+def test_auto_click_rejects_partial_revalidated_body() -> None:
     target = PostTarget(
         url="https://www.threads.com/@candidate/post/partial",
         author="candidate",
@@ -44,16 +44,28 @@ def test_auto_actionability_rejects_partial_revalidated_body() -> None:
     )
 
     class Host:
-        async def _revalidate_action_target(self, _target):
+        _detail_return_anchor = None
+        _detail_return_target = None
+
+        def _remaining_readiness_ms(self, _deadline, _timeout_code):
+            pytest.fail("partial target must be rejected before click readiness")
+
+        def _mark_ui_transition(self):
+            pytest.fail("partial target must not enter Detail")
+
+    class Navigator:
+        _host = Host()
+        _console_output_policy = ConsoleOutputPolicy.AUTO
+
+        async def actionable_now(self, _target):
             return replace(_target, body_complete=False)
 
-    navigator = DetailNavigator(
-        Host(),
-        timeout_ms=1_000,
-        console_output_policy=ConsoleOutputPolicy.AUTO,
-    )
+        async def _detail_click_point(self, _permalink):
+            pytest.fail("partial target must not be clicked")
+
+    navigator = Navigator()
     with pytest.raises(UiReadError, match="DETAIL_PROVENANCE_UNVERIFIED"):
-        asyncio.run(navigator.actionable_now(target))
+        asyncio.run(click_detail_target(navigator, target, time.monotonic() + 1))
 
 
 def test_relevance_search_finds_visible_post_after_two_observed_advances(
