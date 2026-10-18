@@ -27,7 +27,7 @@ from ..feed.models import PostTarget
 from ..feed.relevance import normalize_text
 from ..feed.urls import _post_url, _post_url_hint, _profile_author, _same_home_origin
 from .body_text import _VisibleBodyRead
-from .detail_click import click_detail_target
+from .detail_click import _auto_revalidation_body_matches, click_detail_target
 from .feed_rows import _BODY_EXCLUSION_SELECTOR
 from .loading import CardNotReady as _CardNotReady
 from .loading import RenderObservation as _RenderObservation
@@ -244,6 +244,11 @@ class DetailNavigator:
         if not target.currently_visible:
             raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED")
         current = await self._host._revalidate_action_target(target)
+        if (
+            self._console_output_policy is ConsoleOutputPolicy.AUTO
+            and not _auto_revalidation_body_matches(target, current)
+        ):
+            raise UiReadError("DETAIL_PROVENANCE_UNVERIFIED")
         await self._detail_click_point(current.permalink)
         return current
 
@@ -769,8 +774,7 @@ class DetailNavigator:
                 deadline,
                 timeout_code="DETAIL_NAVIGATION_UNVERIFIED",
             )
-            current = await self.actionable_now(target)
-            await click_detail_target(self, current, deadline)
+            await click_detail_target(self, target, deadline)
         except PlaywrightTimeoutError:
             raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED") from None
         try:

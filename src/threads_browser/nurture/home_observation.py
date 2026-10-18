@@ -399,7 +399,7 @@ class HomeRowObserver:
             return
         self.current_unverified_rows.append((body_digest, observation.viewport_y))
         self.stats.body_extracted += 1
-        decision = classify_body(observation.body, self.normalized_terms)
+        decision = self._classify_body(observation.body)
         self.stats.classified += 1
         self.viewport_classified += 1
         if decision == "RELEVANT":

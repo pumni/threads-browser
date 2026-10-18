@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -13,9 +15,13 @@ from tests.fixtures.browser import (
 )
 from threads_browser import reader as reader_module
 from threads_browser import workflow
+from threads_browser.browser_ui.detail import DetailNavigator
+from threads_browser.console_output import ConsoleOutputPolicy
+from threads_browser.feed.models import PostTarget
 from threads_browser.reader import (
     HOME_URL,
     ThreadsHomeReader,
+    UiReadError,
     canonical_terms,
 )
 from threads_browser.storage import (
@@ -23,6 +29,31 @@ from threads_browser.storage import (
     CheckpointStore,
 )
 from threads_browser.workflow import policy_fingerprint
+
+
+def test_auto_actionability_rejects_partial_revalidated_body() -> None:
+    target = PostTarget(
+        url="https://www.threads.com/@candidate/post/partial",
+        author="candidate",
+        body="Chúng tôi đang tuyển QA Engineer cho nhóm sản phẩm.",
+        fingerprint="a" * 64,
+        permalink=None,  # type: ignore[arg-type]
+        currently_visible=True,
+        body_complete=True,
+        body_consistent=True,
+    )
+
+    class Host:
+        async def _revalidate_action_target(self, _target):
+            return replace(_target, body_complete=False)
+
+    navigator = DetailNavigator(
+        Host(),
+        timeout_ms=1_000,
+        console_output_policy=ConsoleOutputPolicy.AUTO,
+    )
+    with pytest.raises(UiReadError, match="DETAIL_PROVENANCE_UNVERIFIED"):
+        asyncio.run(navigator.actionable_now(target))
 
 
 def test_relevance_search_finds_visible_post_after_two_observed_advances(

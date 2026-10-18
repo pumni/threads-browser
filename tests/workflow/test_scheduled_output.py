@@ -146,6 +146,9 @@ main {{ display: block; }}
         value not in status_json
         for value in (str(profile), actor, long_body, "https://www.threads.com/")
     )
+    with store.profile_lock(account):
+        pass
+    assert store.load(account.account_id, policy) == checkpoint_before
 
     interactive_code = main(
         [
@@ -163,8 +166,14 @@ main {{ display: block; }}
             "hiring",
         ]
     )
-    interactive_output = capsys.readouterr().out
-    assert interactive_code == 0
+    interactive_capture = capsys.readouterr()
+    interactive_output = interactive_capture.out
+    safe_diagnostics = [
+        line
+        for line in (interactive_capture.out + interactive_capture.err).splitlines()
+        if line.startswith(("NURTURE ", "STOP ", "ERROR ", "WARNING ", "[FAILURE_DIAGNOSTIC]"))
+    ]
+    assert interactive_code == 0, " ".join(safe_diagnostics)
     assert "[SCROLL_ROW_PROGRESS]" in interactive_output
     assert "row_id=" in interactive_output
     assert "[SCROLL_GEOMETRY]" in interactive_output

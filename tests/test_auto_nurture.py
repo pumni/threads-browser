@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from hashlib import sha256
 from types import SimpleNamespace
 
 import pytest
 
 from threads_browser.errors import UiReadError
+from threads_browser.feed.job_intent import AUTO_POLICY_VERSION
 from threads_browser.nurture.auto import run_auto_nurture
 from threads_browser.nurture.state import auto_policy_fingerprint, policy_fingerprint
 from threads_browser.storage import BrowserDataError
@@ -237,4 +239,6 @@ def test_auto_supervisor_stops_after_incomplete_retry_cap() -> None:
 def test_auto_policy_checkpoint_is_versioned_separately_from_terms() -> None:
     auto = auto_policy_fingerprint()
     assert len(auto) == 64
+    assert AUTO_POLICY_VERSION == "threads-browser:auto-nurture:job-intent-v2-vi"
+    assert auto != sha256(b"threads-browser:auto-nurture:job-intent-v1").hexdigest()
     assert auto != policy_fingerprint(("auto-nurture-v1",))

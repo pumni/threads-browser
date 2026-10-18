@@ -11,6 +11,7 @@ from ..console_output import ConsoleOutputPolicy
 from ..errors import UiReadError
 from ..feed.job_intent import classify_auto_body
 from ..feed.models import PostTarget
+from ..feed.relevance import normalize_text
 
 
 class _DetailClickHost(Protocol):
@@ -26,7 +27,26 @@ class _DetailClickNavigator(Protocol):
     _host: _DetailClickHost
     _console_output_policy: ConsoleOutputPolicy
 
+    async def actionable_now(self, target: PostTarget) -> PostTarget: ...
     async def _detail_click_point(self, permalink: Locator) -> tuple[float, float]: ...
+
+
+def _auto_revalidation_body_matches(target: PostTarget, current: PostTarget) -> bool:
+    """Require Auto targets to retain the same complete, consistent body."""
+    if (
+        not target.body_complete
+        or not target.body_consistent
+        or target.body_truncated
+        or target.body is None
+        or not target.body.strip()
+        or not current.body_complete
+        or not current.body_consistent
+        or current.body_truncated
+        or current.body is None
+        or not current.body.strip()
+    ):
+        return False
+    return normalize_text(target.body).strip() == normalize_text(current.body).strip()
 
 
 async def click_detail_target(
@@ -37,6 +57,7 @@ async def click_detail_target(
     """Recheck Auto eligibility, then open the visible target without scrolling."""
     host = navigator._host
     auto_nurture = navigator._console_output_policy is ConsoleOutputPolicy.AUTO
+    target = await navigator.actionable_now(target)
     if auto_nurture and classify_auto_body(target.body) != "RELEVANT":
         raise UiReadError("AUTO_TARGET_NOT_ELIGIBLE")
 

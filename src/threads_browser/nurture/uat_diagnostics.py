@@ -38,7 +38,6 @@ _COUNTERS = frozenset(
         "sampled",
         "relevant",
         "unknown",
-        "viewports",
         "scroll_attempts",
         "scrolls",
         "observed_rows",
@@ -212,7 +211,6 @@ class AutoUatDiagnostics:
             "FEED",
             "OBSERVED",
             counts={
-                "viewports": getattr(result, "viewport_observations", 0),
                 "scroll_attempts": getattr(result, "scroll_attempts", 0),
                 "scrolls": getattr(result, "scrolls", 0),
                 "observed_rows": getattr(result, "observed_rows", 0),
