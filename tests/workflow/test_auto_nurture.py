@@ -52,6 +52,7 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
             "Năm ngoái mình đang tìm việc làm ở Đà Nẵng. "
             "Hồi trước bên mình đang tuyển nhân viên kinh doanh.",
         ),
+        SyntheticPost("third-party-company", "Công ty khác đang tuyển QA Engineer."),
         SyntheticPost(
             "independent-course-clause",
             "Bên mình đang tuyển nhân viên kinh doanh, nhưng khóa học kỹ năng phỏng vấn cũng đang mở. "
@@ -65,7 +66,7 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
             "closed-applications",
             "Bên mình đang tuyển nhân viên kinh doanh. Nhưng không nhận hồ sơ nữa.",
         ),
-        SyntheticPost("english-seeking", "Looking for a job in Vietnam."),
+        SyntheticPost("third-party-seeking", "Bạn Minh đang tìm việc làm."),
         SyntheticPost("seeking-post", "Em đang tìm công việc QA Tester tại TP.HCM."),
     )
     hire_url = "https://www.threads.com/@candidate/post/hire-post"

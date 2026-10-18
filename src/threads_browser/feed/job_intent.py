@@ -69,7 +69,8 @@ _NON_JOB_CONTEXT = re.compile(
     r"chia\s+se|kinh\s+nghiem|meo|loi\s+khuyen|huong\s+dan|"
     r"phan\s+tich|thi\s+truong\s+lao\s+dong|nguoi\s+khac|minh\s+anh|"
     r"mot\s+cong\s+ty|nhieu\s+cong\s+ty|cac\s+cong\s+ty|"
-    r"cong\s+ty\s+(?:nay|do|kia)|doanh\s+nghiep\s+(?:nay|do|kia))\b"
+    r"cong\s+ty\s+(?:khac|cua\s+ban|nay|do|kia)|"
+    r"doanh\s+nghiep\s+(?:nay|do|kia))\b"
 )
 _UNCERTAIN_CONTEXT = re.compile(
     r"\b(?:neu|gia\s+su|co\s+the|co\s+le|du\s+kien|suy\s+doan|"
@@ -85,6 +86,11 @@ _CURRENT_CONTEXT = re.compile(
 _SEEKING_NAME_CONTEXT = re.compile(
     r"\b(?:nguyen|tran|le|pham|hoang|vu|vo|dang|bui|do|ngo|duong|ly|phan|"
     r"truong|dinh|luu)(?:\s+[a-z]{1,16}){0,2}\s+(?:minh|anh|chi)\b"
+)
+_THIRD_PARTY_SEEKING_CONTEXT = re.compile(
+    r"\b(?:ban|anh|chi|ong|ba|co|chu)\s+[a-z]{1,16}\s+"
+    r"(?:hien(?:\s+(?:tai|nay))?\s+)?(?:dang|can)\s+"
+    r"tim(?:\s+kiem)?\s+(?:viec(?:\s+lam)?|cong\s+viec)\b"
 )
 _ENGLISH_CONTEXT = re.compile(
     r"\b(?:we(?:'re|\s+are)?|our\s+team|now\s+hiring|"
@@ -126,6 +132,7 @@ def _sentence_events(sentence: str) -> list[tuple[int, str, str | None]]:
             or _NON_JOB_CONTEXT.search(clause)
             or _UNCERTAIN_CONTEXT.search(clause)
             or _SEEKING_NAME_CONTEXT.search(clause)
+            or _THIRD_PARTY_SEEKING_CONTEXT.search(clause)
         ):
             offset += len(clause) + 1
             continue
