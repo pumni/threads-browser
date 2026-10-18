@@ -219,6 +219,14 @@ def test_vietnamese_current_job_intent_is_eligible(body: str, expected: str) -> 
         "Hạn ứng tuyển: 31/12/2099. Vị trí: QA Engineer.",
         "Hạn ứng tuyển: 31/12. Vị trí: QA Engineer.",
         "Cần tuyển nhân viên, lương 8 triệu, inbox ứng tuyển.",
+        "Có ai đang tuyển QA Engineer không? Inbox mình biết với.",
+        "Công ty khác đang tuyển QA Engineer. Inbox mình để xin link.",
+        (
+            "TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. Lương 8 triệu. "
+            "Inbox ứng tuyển. HẾT HẠN NHẬN HỒ SƠ."
+        ),
+        "Co ai dang tuyen QA Engineer khong? Inbox minh biet voi.",
+        "Cong ty khac dang tuyen QA Engineer. Inbox minh de xin link.",
     ),
     ids=(
         "hiring_closed",
@@ -281,6 +289,11 @@ def test_vietnamese_current_job_intent_is_eligible(body: str, expected: str) -> 
         "deadline_and_role_without_hiring_intent",
         "deadline_without_year_and_hiring_intent",
         "generic_employee_title_without_identifiable_role",
+        "question_about_someone_hiring_with_information_request",
+        "third_party_listing_with_link_request",
+        "direct_ad_with_explicitly_closed_applications",
+        "unaccented_question_about_someone_hiring",
+        "unaccented_third_party_listing_with_link_request",
     ),
 )
 def test_uncertain_or_non_current_context_is_ineligible(body: str) -> None:

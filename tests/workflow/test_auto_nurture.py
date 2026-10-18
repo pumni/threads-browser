@@ -52,12 +52,20 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
             "TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. Lương 8–10 triệu. "
             "Làm ở Q7. Inbox ứng tuyển.",
         ),
-        SyntheticPost(
-            "career-post",
-            "Năm ngoái mình đang tìm việc làm ở Đà Nẵng. "
-            "Hồi trước bên mình đang tuyển nhân viên kinh doanh.",
-        ),
         SyntheticPost("third-party-company", "Công ty khác đang tuyển QA Engineer."),
+        SyntheticPost(
+            "question-about-hiring",
+            "Có ai đang tuyển QA Engineer không? Inbox mình biết với.",
+        ),
+        SyntheticPost(
+            "third-party-link-request",
+            "Công ty khác đang tuyển QA Engineer. Inbox mình để xin link.",
+        ),
+        SyntheticPost(
+            "expired-direct-ad",
+            "TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. Lương 8 triệu. "
+            "Inbox ứng tuyển. HẾT HẠN NHẬN HỒ SƠ.",
+        ),
         SyntheticPost(
             "course-enrollment",
             "Tuyển sinh lớp nghề – học phí 8 triệu – địa chỉ – liên hệ.",
@@ -71,11 +79,6 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
             "closed-post",
             "Bên mình đang tuyển QA Engineer. Đã tuyển đủ người cho vị trí này.",
         ),
-        SyntheticPost(
-            "closed-applications",
-            "Bên mình đang tuyển nhân viên kinh doanh. Nhưng không nhận hồ sơ nữa.",
-        ),
-        SyntheticPost("third-party-seeking", "Bạn Minh đang tìm việc làm."),
         SyntheticPost("seeking-post", "Em đang tìm công việc QA Tester tại TP.HCM."),
     )
     hire_url = "https://www.threads.com/@candidate/post/hire-post"
@@ -226,6 +229,9 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
         "independent-course-clause",
         "direct-recruitment-ad",
     }
+    assert set(visited).isdisjoint(
+        {"question-about-hiring", "third-party-link-request", "expired-direct-ad"}
+    )
     assert len(visited) == 4
     assert wheel_counts_at_detail[0] == 0
     uat_output = "\n".join(uat_lines)
