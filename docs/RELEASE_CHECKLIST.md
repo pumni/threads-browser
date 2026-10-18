@@ -19,13 +19,33 @@ as part of this checklist without the owner's separate approval.
   nonzero exit code. A killed process may leave `RUNNING` for inspection.
 - [ ] Checkpoint v3, profile lock collision handling, atomic writes, privacy,
   and browser cleanup regressions pass.
-- [ ] No unresolved P0 regression remains. Issue #23's final-scroll boundary
-  is resolved or the owner has explicitly accepted its known limit.
+- [ ] No unresolved P0 regression remains.
+- [ ] Known limits are tracked separately: [issue #23](https://github.com/pumni/threads-browser/issues/23)
+  tracks `READ_IN_PROGRESS` at the last-scroll boundary, and [issue #47](https://github.com/pumni/threads-browser/issues/47)
+  tracks `ROOT_AMBIGUOUS` on a second Detail. This documentation, PR #51, and
+  green CI do not resolve either issue; the release owner records any separate
+  resolution or explicit acceptance.
 
-## Windows operator acceptance
+Engineering merge, bounded live UAT, and continuous foreground/scheduler
+acceptance are three separate levels. Green CI does not establish live Threads
+compatibility, and scheduler activation still needs separate owner approval.
+
+## Bounded owner-supervised live UAT
 
 - [ ] The owner installs or upgrades using `uv sync --locked` and installs the
   pinned Playwright Chromium browser.
+- [ ] The owner confirms the intended alias is verified and uses its dedicated
+  authenticated profile in a visible, headed Chromium session.
+- [ ] The owner runs one bounded Auto cycle with
+  `tb auto <verified-alias> --max-cycles 1 --uat-diagnostics`. The cycle limit
+  counts completed, checkpointed cycles; bounded supervisor retries may start
+  more than one browser attempt.
+- [ ] The owner confirms current Vietnamese job intent is required. An English
+  role title may appear in a Vietnamese sentence; English-only, third-party,
+  historical, negated, advice, course, or ambiguous intent is not eligible.
+- [ ] The owner verifies selected post permalink, author, and complete body;
+  Detail verification; Back verification; truthful coverage; safe checkpoint
+  progress; and clean browser/context shutdown and profile-lock release.
 - [ ] The owner supervises one `tb run` that commits a safe checkpoint and one
   expected incomplete/stop result.
 - [ ] For an approved `tb session` pilot, the owner checks multiple verified
@@ -34,12 +54,23 @@ as part of this checklist without the owner's separate approval.
 - [ ] The owner verifies sanitized stdout and status locally without copying
   private logs, account details, post content, profile paths, or URLs to a
   shared location.
+- [ ] The owner treats missing or ambiguous evidence as incomplete UAT and
+  does not publish private logs. `--uat-diagnostics` is for local fixed codes
+  and aggregate counters only.
 - [ ] The owner rehearses rollback to the last known approved code version
   without deleting or editing the private data root.
 - [ ] Live Threads UI assumptions are recorded as owner-supervised UAT. Local
   fixture tests do not count as live compatibility evidence.
 
-## Task Scheduler decision
+## Continuous foreground and scheduler acceptance
+
+- [ ] Before relying on repeated Auto cycles, the owner separately supervises
+  restart/deduplication, bounded retries and cooldowns, incomplete coverage,
+  Detail/Back provenance, checkpoint continuity, Ctrl+C, and browser cleanup.
+- [ ] A bounded one-cycle UAT or engineering merge is not recorded as
+  continuous foreground acceptance.
+
+### Task Scheduler decision
 
 Recurring scheduling stays disabled until the Windows operator separately
 approves:

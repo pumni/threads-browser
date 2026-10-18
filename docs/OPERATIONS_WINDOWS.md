@@ -143,7 +143,65 @@ removes the interactive desktop. Keep Task Scheduler history and any local
 operator output private. Do not enable tracing, screenshots, transcript
 capture, or shared log upload.
 
-## Task Scheduler activation (owner-controlled)
+## Owner-supervised Auto live UAT
+
+Auto's built-in eligibility policy is Vietnamese-only: a post must clearly
+express current hiring or job-seeking intent using Vietnamese sentence
+structure. English role titles may appear within a Vietnamese sentence;
+English-only posts are not eligible. `--max-cycles 1` caps one completed,
+checkpointed cycle, not one browser attempt. Bounded retries can start another
+headed browser operation before the cycle completes or Auto stops.
+
+Only the account owner runs live UAT, in the logged-in desktop session and on
+their verified account/profile. First use `uv run tb ls` to check the intended
+alias is verified. Keep the run in the foreground and confirm the visible,
+headed Chromium session uses that account/profile; stop if it does not.
+Replace `<verified-alias>` below with that alias:
+
+```powershell
+uv run tb auto <verified-alias> --max-cycles 1 --uat-diagnostics
+```
+
+During this bounded run, the owner checks that:
+
+- only a clearly current Vietnamese hiring or job-seeking intent expressed by
+  the post's own author is selected; an English title inside Vietnamese
+  text is allowed, while English-only and third-party intent are not;
+- the Home target's canonical permalink and author remain verified through
+  final pre-click revalidation; Detail's canonical route, author, and complete
+  body are verified before it is counted as read;
+- Detail content is verified, Back returns to the expected Home / For You
+  context and selected-post identity, and no other account action occurs;
+- coverage status is truthful, incomplete coverage is not treated as complete,
+  and only safe completed progress is checkpointed;
+- the headed browser/context closes and the profile lock is released. If
+  cleanup reports `BROWSER_CLEANUP_FAILED`, do not retry the profile; follow
+  the attended recovery instructions above.
+
+Read `--uat-diagnostics` output locally. It contains fixed phase/status codes
+and allowlisted aggregate counters; it is not permission to share private
+terminal output. Do not paste full logs, account aliases, actor names, profile
+paths, post text, URLs, screenshots, or DOM data into GitHub or other shared
+locations. If the expected target or a verification step is absent or
+ambiguous, record UAT as incomplete rather than inferring success.
+
+Engineering merge and green synthetic CI are the engineering gate only. They
+do not establish current live UI compatibility. This bounded owner UAT is a
+separate gate; it does not accept continuous foreground operation or enable
+Task Scheduler. Scheduler activation still needs separate owner approval. Known
+issue [#23](https://github.com/pumni/threads-browser/issues/23)
+(`READ_IN_PROGRESS` at the last-scroll boundary) and [#47](https://github.com/pumni/threads-browser/issues/47)
+(`ROOT_AMBIGUOUS` on a second Detail) remain separate, unresolved limits.
+
+## Continuous foreground and scheduler acceptance
+
+A successful one-cycle UAT does not accept continuous use. Before relying on a
+multi-cycle foreground run, the owner separately supervises bounded cycles,
+restart/deduplication behavior, retry and cooldown stops, incomplete coverage,
+Detail/Back provenance, Ctrl+C handling, checkpoint continuity, and browser
+cleanup. Do not infer this acceptance from CI, merge, or one successful cycle.
+
+### Task Scheduler activation (owner-controlled)
 
 Do not create or enable a recurring task until the owner has explicitly
 approved all of the following in a separate decision:
@@ -154,7 +212,7 @@ approved all of the following in a separate decision:
   timeouts, sleep, and logoff;
 - the logged-in desktop, awake-machine, and timeout assumptions.
 
-After that approval and successful supervised Windows UAT, the Windows
+After that approval and separate successful supervised Windows UAT, the Windows
 operator can create a task with the PowerShell wrapper above. Set it to run
 only while the user is logged on, disallow overlapping instances, disable
 automatic restart, and set its stop time beyond the configured runtime plus
