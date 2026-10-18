@@ -47,10 +47,17 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
     store = CheckpointStore(data_root)
     posts = (
         SyntheticPost("hire-post", "Bên mình đang tuyển nhân viên kinh doanh tại Hà Nội."),
-        SyntheticPost("career-post", "Chia sẻ kinh nghiệm tìm việc và sửa CV."),
-        SyntheticPost("course-post", "Khóa học tuyển dụng đang mở đăng ký."),
-        SyntheticPost("closed-post", "Chúng tôi đang tuyển engineers, but the position is filled."),
-        SyntheticPost("english-hire", "We're hiring an engineer for a local team."),
+        SyntheticPost(
+            "career-post",
+            "Năm ngoái mình đang tìm việc làm ở Đà Nẵng. "
+            "Hồi trước bên mình đang tuyển nhân viên kinh doanh.",
+        ),
+        SyntheticPost(
+            "independent-course-clause",
+            "Bên mình đang tuyển nhân viên kinh doanh, nhưng khóa học kỹ năng phỏng vấn cũng đang mở.",
+        ),
+        SyntheticPost("closed-post", "Bên mình đang tuyển QA Engineer; nhưng đã tuyển đủ người."),
+        SyntheticPost("closed-applications", "Bên mình đang tuyển nhân viên, không nhận hồ sơ nữa."),
         SyntheticPost("english-seeking", "Looking for a job in Vietnam."),
         SyntheticPost("seeking-post", "Em đang tìm công việc QA Tester tại TP.HCM."),
     )
@@ -173,13 +180,11 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
     uat_diagnostics.report_result(result)
     assert result.status == "SESSION_COMPLETE"
     assert result.checkpoint_saved is True
-    assert result.detail_reads == 2
+    assert result.detail_reads == 3
     assert result.new_fingerprints
 
-    assert visited == [
-        "seeking-post",
-        "hire-post",
-    ]
+    assert set(visited) == {"seeking-post", "hire-post", "independent-course-clause"}
+    assert len(visited) == 3
     assert wheel_counts_at_detail[0] == 0
     uat_output = "\n".join(uat_lines)
     assert "phase=HOME status=READY" in uat_output
@@ -192,7 +197,7 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
     assert all(url not in uat_output for url in details)
     assert all(post.body not in uat_output for post in posts)
     checkpoint = store.load(account.account_id, auto_policy_fingerprint())
-    assert checkpoint.detail_reads == 2
+    assert checkpoint.detail_reads == 3
     assert checkpoint.completed_runs == 2
     assert checkpoint.pending_read_fingerprints == ()
     assert _post_fingerprint(hire_url) in checkpoint.seen_fingerprints
@@ -207,13 +212,11 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
     assert resumed_result.checkpoint_saved is True
     assert resumed_result.detail_reads == 0
     assert resumed_result.home_new == 0
-    assert visited == [
-        "seeking-post",
-        "hire-post",
-    ]
+    assert set(visited) == {"seeking-post", "hire-post", "independent-course-clause"}
+    assert len(visited) == 3
     resumed_checkpoint = store.load(account.account_id, auto_policy_fingerprint())
     assert resumed_checkpoint.completed_runs == 3
-    assert resumed_checkpoint.detail_reads == 2
+    assert resumed_checkpoint.detail_reads == 3
     assert store.load(account.account_id, legacy_auto_policy) == legacy_auto_checkpoint
     assert legacy_auto_path.read_bytes() == legacy_auto_bytes
     assert store.load(account.account_id, user_terms_policy) == user_terms_checkpoint

@@ -49,7 +49,10 @@ _SEEKING_POSITIVE_WITH_INHERITED_SUBJECT = re.compile(
 _HIRING_NEGATION = re.compile(
     r"\b(?:khong|chua|chang)(?:\s+con)?(?:\s+dang)?\s+tuyen(?:\s+dung)?\b|"
     r"\b(?:ngung|dung)\s+tuyen(?:\s+dung)?\b|"
-    r"\bda\s+(?:tuyen\s+(?:du|xong|duoc\s+du)|dong\s+tuyen\s+dung)\b"
+    r"\bda\s+(?:tuyen\s+(?:du|xong|duoc\s+du)|dong\s+tuyen\s+dung)\b|"
+    r"\bkhong\s+(?:tiep\s+)?nhan\s+(?:ho\s+so|don\s+ung\s+tuyen|ung\s+vien)"
+    r"(?:\s+(?:nua|them))?\b|"
+    r"\b(?:position\s+(?:is\s+)?filled|applications?\s+(?:are\s+)?closed)\b"
 )
 _SEEKING_NEGATION = re.compile(
     r"\b(?:khong|chua|chang)(?:\s+con)?(?:\s+dang)?\s+"
@@ -70,6 +73,13 @@ _UNCERTAIN_CONTEXT = re.compile(
     r"\b(?:neu|gia\s+su|co\s+the|co\s+le|du\s+kien|suy\s+doan|"
     r"maybe|might|would|perhaps|possibly|speculation)\b"
 )
+_PAST_CONTEXT = re.compile(
+    r"\b(?:nam\s+ngoai|hoi\s+truoc|truoc\s+day|truoc\s+kia|ngay\s+truoc|"
+    r"luc\s+truoc|hoi\s+do|nam\s+truoc|da\s+tung|tung)\b"
+)
+_CURRENT_CONTEXT = re.compile(
+    r"\b(?:hien\s+tai|hien\s+nay|bay\s+gio|hom\s+nay|luc\s+nay)\b"
+)
 _SEEKING_NAME_CONTEXT = re.compile(
     r"\b(?:nguyen|tran|le|pham|hoang|vu|vo|dang|bui|do|ngo|duong|ly|phan|"
     r"truong|dinh|luu)(?:\s+[a-z]{1,16}){0,2}\s+(?:minh|anh|chi)\b"
@@ -77,13 +87,13 @@ _SEEKING_NAME_CONTEXT = re.compile(
 _ENGLISH_CONTEXT = re.compile(
     r"\b(?:we(?:'re|\s+are)?|our\s+team|now\s+hiring|"
     r"open\s+to\s+work|looking\s+for|actively\s+looking|seeking\s+(?:a\s+)?job|"
-    r"position\s+(?:is\s+)?filled|applications?\s+(?:are\s+)?closed|"
-    r"please\s+apply|apply\s+now|join\s+us|for\s+(?:the|our)\s+(?:team|role|position)|"
-    r"but|however)\b"
+    r"please\s+apply|apply\s+now|join\s+us|for\s+(?:the|our)\s+(?:team|role|position))\b"
 )
 _QUOTED_TEXT = re.compile(r"“[^”]*”|\"[^\"]*\"|‘[^’]*’|(?<!\w)'[^']*'")
-_SENTENCES = re.compile(r"[^.!?;\r\n]+(?:[.!?;]+|$)")
-_CLAUSE_BREAK = re.compile(r"\s*[,;]\s*|\s+\b(?:nhung|tuy\s+nhien|but|however)\b\s+")
+_SENTENCES = re.compile(r"[^.!?\r\n]+(?:[.!?]+|$)")
+_CLAUSE_BREAK = re.compile(
+    r"\s*[,;]\s*|\s+\b(?:nhung|tuy\s+nhien|but|however|va)\b\s+"
+)
 
 
 def _plain_text(value: str) -> str:
@@ -95,40 +105,52 @@ def _plain_text(value: str) -> str:
 
 def _sentence_events(sentence: str) -> list[tuple[int, str]]:
     """Return ordered, sentence-local hiring/seeking status evidence."""
-    if (
-        sentence.rstrip().endswith("?")
-        or _NON_JOB_CONTEXT.search(sentence)
-        or _UNCERTAIN_CONTEXT.search(sentence)
-        or _SEEKING_NAME_CONTEXT.search(sentence)
-        or _ENGLISH_CONTEXT.search(sentence)
-    ):
-        return []
-
     events: list[tuple[int, str]] = []
     offset = 0
     hiring_subject_seen = False
     seeking_subject_seen = False
+    historical_context = False
     for clause in _CLAUSE_BREAK.split(sentence):
         if not clause:
             continue
+        if _PAST_CONTEXT.search(clause):
+            historical_context = True
+        elif _CURRENT_CONTEXT.search(clause):
+            historical_context = False
+
+        if (
+            historical_context
+            or clause.rstrip().endswith("?")
+            or _NON_JOB_CONTEXT.search(clause)
+            or _UNCERTAIN_CONTEXT.search(clause)
+            or _SEEKING_NAME_CONTEXT.search(clause)
+        ):
+            offset += len(clause) + 1
+            continue
+
+        hiring_closures = list(_HIRING_NEGATION.finditer(clause))
+        seeking_closures = list(_SEEKING_NEGATION.finditer(clause))
         has_hiring_subject = re.search(rf"\b{_HIRING_SUBJECT}\b", clause) is not None
         has_seeking_subject = re.search(rf"\b{_SEEKING_SUBJECT}\b", clause) is not None
-        hiring_matches = list(_HIRING_POSITIVE.finditer(clause))
-        if hiring_subject_seen and not has_hiring_subject:
-            hiring_matches.extend(_HIRING_POSITIVE_WITH_INHERITED_SUBJECT.finditer(clause))
-        for match in hiring_matches:
-            events.append((offset + match.start(), "HIRING"))
-        for match in _HIRING_NEGATION.finditer(clause):
+        mixed_english_context = _ENGLISH_CONTEXT.search(clause) is not None
+        if not mixed_english_context:
+            hiring_matches = list(_HIRING_POSITIVE.finditer(clause))
+            if hiring_subject_seen and not has_hiring_subject:
+                hiring_matches.extend(_HIRING_POSITIVE_WITH_INHERITED_SUBJECT.finditer(clause))
+            for match in hiring_matches:
+                events.append((offset + match.start(), "HIRING"))
+            seeking_matches = list(_SEEKING_POSITIVE.finditer(clause))
+            if seeking_subject_seen and not has_seeking_subject:
+                seeking_matches.extend(_SEEKING_POSITIVE_WITH_INHERITED_SUBJECT.finditer(clause))
+            for match in seeking_matches:
+                events.append((offset + match.start(), "SEEKING_JOB"))
+        for match in hiring_closures:
             events.append((offset + match.start(), "NOT_HIRING"))
-        seeking_matches = list(_SEEKING_POSITIVE.finditer(clause))
-        if seeking_subject_seen and not has_seeking_subject:
-            seeking_matches.extend(_SEEKING_POSITIVE_WITH_INHERITED_SUBJECT.finditer(clause))
-        for match in seeking_matches:
-            events.append((offset + match.start(), "SEEKING_JOB"))
-        for match in _SEEKING_NEGATION.finditer(clause):
+        for match in seeking_closures:
             events.append((offset + match.start(), "NOT_SEEKING_JOB"))
-        hiring_subject_seen = hiring_subject_seen or has_hiring_subject
-        seeking_subject_seen = seeking_subject_seen or has_seeking_subject
+        if not mixed_english_context:
+            hiring_subject_seen = hiring_subject_seen or has_hiring_subject
+            seeking_subject_seen = seeking_subject_seen or has_seeking_subject
         offset += len(clause) + 1
     return sorted(events)
 
