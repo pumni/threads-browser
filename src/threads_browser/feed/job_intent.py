@@ -111,6 +111,16 @@ _APPLICANT_INTAKE = re.compile(
     r"\b(?:gui\s+(?:cv|ho\s+so)|nop\s+(?:cv|ho\s+so)|"
     r"ung\s+tuyen|nhan\s+(?:cv|ho\s+so|don\s+ung\s+tuyen))\b"
 )
+_PASSIVE_REPOST_CONTEXT = re.compile(
+    r"\b(?:dang\s+(?:lai|ho|dum|giup)|re[\s-]?post|"
+    r"chia\s+se\s+lai|share\s+lai)\b"
+)
+_INDEPENDENT_AUTHOR_HIRING_OR_INTAKE = re.compile(
+    rf"(?:\b(?:rieng|nhung|tuy\s+nhien|con)\s+"
+    rf"(?:{_HIRING_SUBJECT}|minh|em|toi|anh|chi)\b"
+    rf"(?:\s+[\w-]+){{0,3}}\s+{_HIRING_STATUS}\s+tuyen(?:\s+dung)?\b|"
+    rf"{_SELF_RECRUITER_INTAKE.pattern})"
+)
 _SALARY_DETAIL = re.compile(
     r"\b(?:luong|thu\s+nhap|muc\s+luong|salary|wage)\b"
     r"\s*(?:[:\-]\s*)?(?:tu\s+)?\d"
@@ -165,6 +175,41 @@ _SENTENCES = re.compile(r"[^.!?\r\n]+(?:[.!?]+|$)")
 _CLAUSE_BREAK = re.compile(
     r"\s*[,;]\s*|\s+\b(?:nhung|tuy\s+nhien|but|however|va)\b\s+"
 )
+
+
+def _is_passively_reposted_hiring_event(text: str, position: int) -> bool:
+    """Exclude copied hiring evidence while preserving a separate author opening."""
+    paragraph_start = 0
+    paragraph_end = len(text)
+    for separator in re.finditer(r"\n[ \t]*\n", text):
+        if separator.end() <= position:
+            paragraph_start = separator.end()
+        else:
+            paragraph_end = separator.start()
+            break
+    passive_markers = list(
+        _PASSIVE_REPOST_CONTEXT.finditer(text, paragraph_start, position)
+    )
+    if not passive_markers:
+        return False
+
+    latest_marker = passive_markers[-1]
+    for author_opening in _INDEPENDENT_AUTHOR_HIRING_OR_INTAKE.finditer(
+        text, latest_marker.end(), paragraph_end
+    ):
+        sentence_start = max(
+            text.rfind(mark, latest_marker.end(), author_opening.start())
+            for mark in ".!?"
+        ) + 1
+        sentence_end_candidates = [
+            text.find(mark, author_opening.start(), paragraph_end)
+            for mark in ".!?"
+        ]
+        sentence_end_candidates = [value for value in sentence_end_candidates if value >= 0]
+        sentence_end = min(sentence_end_candidates, default=paragraph_end)
+        if sentence_start <= author_opening.start() <= position < sentence_end:
+            return False
+    return True
 
 
 def _plain_text(value: str) -> str:
@@ -431,6 +476,12 @@ def classify_job_intent(body: str | None) -> str:
             continue
         events.append(direct_event)
     events.extend(_expired_deadline_events(text))
+    events = [
+        (position, event, role)
+        for position, event, role in events
+        if event not in {"HIRING", "NOT_HIRING", "NOT_HIRING_OTHER"}
+        or not _is_passively_reposted_hiring_event(text, position)
+    ]
     events.sort(key=lambda event: event[0])
 
     active_hiring_roles: list[str] = []

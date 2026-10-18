@@ -44,6 +44,21 @@ from threads_browser.feed.job_intent import classify_auto_body, classify_job_int
             ),
             "HIRING",
         ),
+        (
+            (
+                "Mình đăng lại bài này: TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. "
+                "Lương: 8 triệu/tháng. Địa điểm: Quận 7. "
+                "Riêng bên mình đang tuyển Backend Developer."
+            ),
+            "HIRING",
+        ),
+        (
+            (
+                "Mình đăng lại bài này. Riêng bên mình đang nhận CV cho đối tác "
+                "ở vị trí QA Engineer."
+            ),
+            "HIRING",
+        ),
         ("Cần tuyển 2 bảo vệ, ca đêm, liên hệ để ứng tuyển.", "HIRING"),
         (
             (
@@ -146,6 +161,8 @@ from threads_browser.feed.job_intent import classify_auto_body, classify_job_int
         "multiline_labeled_direct_ad",
         "structured_direct_ad_without_application_verb",
         "multiline_labeled_ad_without_application_verb",
+        "repost_with_independent_current_author_opening",
+        "repost_with_current_author_partner_intake",
         "direct_ad_with_headcount_shift_and_contact",
         "recruiter_accepting_applications_for_partner",
         "first_person_em_needs_work",
@@ -263,6 +280,22 @@ def test_vietnamese_current_job_intent_is_eligible(body: str, expected: str) -> 
             "Địa điểm Quận 7. Liên hệ 0900000000. HẾT HẠN NHẬN HỒ SƠ."
         ),
         (
+            "Mình đăng lại bài này: TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. "
+            "Lương: 8 triệu/tháng. Địa điểm: Quận 7."
+        ),
+        (
+            "Đăng hộ bạn mình: CẦN TUYỂN 2 THU NGÂN. "
+            "Lương 9 triệu/tháng. Địa điểm: Hà Nội."
+        ),
+        (
+            "Repost: TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. Lương 8 triệu/tháng. "
+            "Địa điểm: Quận 7. Inbox mình để xin link."
+        ),
+        (
+            "Minh dang lai bai nay: TUYEN GAP 3 NHAN VIEN PHUC VU. "
+            "Luong: 8 trieu/thang. Dia diem: Quan 7."
+        ),
+        (
             "TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. Lương 8 triệu. "
             "Inbox ứng tuyển. HẾT HẠN NHẬN HỒ SƠ."
         ),
@@ -337,6 +370,10 @@ def test_vietnamese_current_job_intent_is_eligible(body: str, expected: str) -> 
         "course_with_salary_location_and_contact",
         "career_advice_with_recruitment_details",
         "structured_direct_ad_with_closed_applications",
+        "passive_repost_of_structured_direct_ad",
+        "posted_on_behalf_of_friend_with_job_details",
+        "repost_with_incidental_inbox_request",
+        "unaccented_passive_repost_of_structured_ad",
         "direct_ad_with_explicitly_closed_applications",
         "unaccented_question_about_someone_hiring",
         "unaccented_third_party_listing_with_link_request",

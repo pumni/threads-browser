@@ -36,6 +36,82 @@ def _detail_html(post: SyntheticPost) -> str:
     )
 
 
+def test_reposts_and_posts_on_behalf_are_not_opened_in_detail(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    actor = "offline.repostcheck"
+    account = create_local_account(tmp_path / "data", actor=actor)
+    store = CheckpointStore(tmp_path / "data")
+    posts = (
+        SyntheticPost(
+            "direct-structured-ad",
+            "TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. Lương 8 triệu/tháng. "
+            "Địa điểm: Quận 7. Liên hệ: 0900000000.",
+        ),
+        SyntheticPost(
+            "partner-recruiter-intake",
+            "Mình đang nhận CV cho đối tác ở vị trí QA Engineer. "
+            "Gửi CV qua inbox để ứng tuyển.",
+        ),
+        SyntheticPost(
+            "passive-repost",
+            "Mình đăng lại bài này: TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. "
+            "Lương: 8 triệu/tháng. Địa điểm: Quận 7.",
+        ),
+        SyntheticPost(
+            "posted-on-behalf",
+            "Đăng hộ bạn mình: CẦN TUYỂN 2 THU NGÂN. "
+            "Lương 9 triệu/tháng. Địa điểm: Hà Nội.",
+        ),
+        SyntheticPost(
+            "repost-with-incidental-inbox",
+            "Repost: TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. Lương 8 triệu/tháng. "
+            "Địa điểm: Quận 7. Inbox mình để xin link.",
+        ),
+    )
+    home_html = synthetic_home_html(actor, posts).replace(
+        "<html><body>",
+        '<html><head><meta charset="utf-8"></head><body>',
+        1,
+    )
+    details = {
+        f"https://www.threads.com/@candidate/post/{post.slug}": _detail_html(post)
+        for post in posts
+    }
+    visited: list[str] = []
+
+    async def respond(route: Route) -> None:
+        url = route.request.url
+        if url == HOME_URL:
+            body = home_html
+        elif url in details:
+            visited.append(url.rsplit("/", 1)[-1])
+            body = details[url]
+        elif url == f"https://www.threads.com/@{actor}":
+            body = "<!doctype html><html><body><h1>Local profile</h1></body></html>"
+        else:
+            await route.abort()
+            return
+        await route.fulfill(status=200, content_type="text/html", body=body)
+
+    monkeypatch.setattr(
+        workflow,
+        "async_playwright",
+        lambda: _offline_playwright_manager(respond, headless=False),
+    )
+
+    result = asyncio.run(workflow.run_browser_nurture_auto_cycle(account, store))
+
+    assert result.status == "SESSION_COMPLETE"
+    assert result.checkpoint_saved is True
+    assert result.detail_reads == 2
+    assert set(visited) == {"direct-structured-ad", "partner-recruiter-intake"}
+    assert set(visited).isdisjoint(
+        {"passive-repost", "posted-on-behalf", "repost-with-incidental-inbox"}
+    )
+
+
 def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match(
     tmp_path: Path,
     monkeypatch,
@@ -52,9 +128,10 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
             "Địa điểm: Quận 7. Liên hệ: 0900000000.",
         ),
         SyntheticPost(
-            "direct-recruitment-ad",
-            "TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. Lương 8–10 triệu. "
-            "Làm ở Q7. Inbox ứng tuyển.",
+            "mixed-share-and-own-hiring",
+            "Mình đăng lại bài này: TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. "
+            "Lương: 8 triệu/tháng. Địa điểm: Quận 7. "
+            "Riêng bên mình đang tuyển Backend Developer.",
         ),
         SyntheticPost(
             "partner-recruiter",
@@ -236,7 +313,7 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
     assert set(visited) == {
         "seeking-post",
         "structured-direct-ad",
-        "direct-recruitment-ad",
+        "mixed-share-and-own-hiring",
         "partner-recruiter",
     }
     assert set(visited).isdisjoint(
@@ -286,7 +363,7 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
     assert set(visited) == {
         "seeking-post",
         "structured-direct-ad",
-        "direct-recruitment-ad",
+        "mixed-share-and-own-hiring",
         "partner-recruiter",
     }
     assert len(visited) == 4
