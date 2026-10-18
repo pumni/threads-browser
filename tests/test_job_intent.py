@@ -30,6 +30,20 @@ from threads_browser.feed.job_intent import classify_auto_body, classify_job_int
             ),
             "HIRING",
         ),
+        (
+            (
+                "TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. Lương: 8–10 triệu/tháng. "
+                "Địa điểm: Quận 7. Liên hệ: 0900000000."
+            ),
+            "HIRING",
+        ),
+        (
+            (
+                "TUYỂN DỤNG\nVỊ TRÍ: Thu ngân\nLƯƠNG: 8–10 triệu/tháng\n"
+                "ĐỊA ĐIỂM: Quận 7\nCA: Tối\nLIÊN HỆ: 0900000000"
+            ),
+            "HIRING",
+        ),
         ("Cần tuyển 2 bảo vệ, ca đêm, liên hệ để ứng tuyển.", "HIRING"),
         (
             (
@@ -130,6 +144,8 @@ from threads_browser.feed.job_intent import classify_auto_body, classify_job_int
         "unaccented_seeking_structure",
         "direct_structured_ad_without_company_subject",
         "multiline_labeled_direct_ad",
+        "structured_direct_ad_without_application_verb",
+        "multiline_labeled_ad_without_application_verb",
         "direct_ad_with_headcount_shift_and_contact",
         "recruiter_accepting_applications_for_partner",
         "first_person_em_needs_work",
@@ -229,6 +245,23 @@ def test_vietnamese_current_job_intent_is_eligible(body: str, expected: str) -> 
         "Cần tuyển nhân viên, lương 8 triệu, inbox ứng tuyển.",
         "Có ai đang tuyển QA Engineer không? Inbox mình biết với.",
         "Công ty khác đang tuyển QA Engineer. Inbox mình để xin link.",
+        "Có ai đang tuyển QA Engineer không? Liên hệ mình.",
+        (
+            "Công ty khác đang tuyển QA Engineer. Lương 8 triệu/tháng. "
+            "Địa điểm: Quận 7. Inbox mình để xin link."
+        ),
+        (
+            "Tuyển sinh khóa học QA Engineer. Học phí: 8 triệu. "
+            "Địa điểm: Quận 7. Liên hệ đăng ký."
+        ),
+        (
+            "Hướng dẫn tuyển dụng nhân viên phục vụ, lương 8 triệu, "
+            "địa điểm Quận 7, liên hệ nhận tư vấn."
+        ),
+        (
+            "TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. Lương 8 triệu. "
+            "Địa điểm Quận 7. Liên hệ 0900000000. HẾT HẠN NHẬN HỒ SƠ."
+        ),
         (
             "TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. Lương 8 triệu. "
             "Inbox ứng tuyển. HẾT HẠN NHẬN HỒ SƠ."
@@ -299,6 +332,11 @@ def test_vietnamese_current_job_intent_is_eligible(body: str, expected: str) -> 
         "generic_employee_title_without_identifiable_role",
         "question_about_someone_hiring_with_information_request",
         "third_party_listing_with_link_request",
+        "question_with_contact_request",
+        "third_party_structured_listing_with_link_request",
+        "course_with_salary_location_and_contact",
+        "career_advice_with_recruitment_details",
+        "structured_direct_ad_with_closed_applications",
         "direct_ad_with_explicitly_closed_applications",
         "unaccented_question_about_someone_hiring",
         "unaccented_third_party_listing_with_link_request",

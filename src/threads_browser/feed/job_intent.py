@@ -111,6 +111,23 @@ _APPLICANT_INTAKE = re.compile(
     r"\b(?:gui\s+(?:cv|ho\s+so)|nop\s+(?:cv|ho\s+so)|"
     r"ung\s+tuyen|nhan\s+(?:cv|ho\s+so|don\s+ung\s+tuyen))\b"
 )
+_SALARY_DETAIL = re.compile(
+    r"\b(?:luong|thu\s+nhap|muc\s+luong|salary|wage)\b"
+    r"\s*(?:[:\-]\s*)?(?:tu\s+)?\d"
+)
+_WORK_LOCATION_DETAIL = re.compile(
+    r"\b(?:dia\s+diem|dia\s+chi(?:\s+lam\s+viec)?|noi\s+lam\s+viec|"
+    r"lam\s+viec\s+tai|lam\s+tai|khu\s+vuc)\b"
+)
+_WORK_SCHEDULE_DETAIL = re.compile(
+    r"\b(?:ca\s+(?:sang|chieu|toi|dem|ngay|xoay|hanh\s+chinh)|"
+    r"xoay\s+ca|thoi\s+gian\s+lam\s+viec|full[\s-]?time|"
+    r"part[\s-]?time|ban\s+thoi\s+gian|toan\s+thoi\s+gian)\b"
+)
+_CONTACT_DETAIL = re.compile(
+    r"\b(?:lien\s+he|inbox|ib|zalo|email|sdt|so\s+dien\s+thoai|"
+    r"goi|nhan\s+tin)\b|\b(?:0\d{9,10}|\+?84\d{8,10})\b"
+)
 _EXPLICIT_DEADLINE = re.compile(
     r"\b(?:han\s+(?:nop\s+ho\s+so|ung\s+tuyen|tuyen\s+dung)|deadline)\s*"
     r"(?:la\s+|den\s+|toi\s+|[:\-]\s*)?"
@@ -160,7 +177,7 @@ def _plain_text(value: str) -> str:
 
 
 def _direct_hiring_events(text: str) -> list[tuple[int, str, str | None]]:
-    """Find direct ads with a role and explicit applicant-intake evidence."""
+    """Find direct ads with a role and application or structured vacancy evidence."""
     events: list[tuple[int, str, str | None]] = []
     block_start = 0
     for separator in (*re.finditer(r"\n[ \t]*\n", text), None):
@@ -211,10 +228,31 @@ def _direct_hiring_events(text: str) -> list[tuple[int, str, str | None]]:
                     ),
                     default=None,
                 )
+                intent_in_window = intent.start() - window_start
+                headcount_detail = (
+                    role_match is not None
+                    and intent_in_window < role_match.start()
+                    and re.fullmatch(
+                        r"\s+\d+\s+",
+                        window[intent_in_window + (intent.end() - intent.start()) : role_match.start()],
+                    )
+                    is not None
+                )
+                vacancy_details = (
+                    _SALARY_DETAIL.search(window) is not None,
+                    _WORK_LOCATION_DETAIL.search(window) is not None,
+                    _WORK_SCHEDULE_DETAIL.search(window) is not None,
+                    headcount_detail,
+                    _CONTACT_DETAIL.search(window) is not None,
+                    _EXPLICIT_DEADLINE.search(window) is not None,
+                )
                 if (
                     role_match is None
                     or role_match.group("role") == "nhan vien"
-                    or _APPLICANT_INTAKE.search(window) is None
+                    or (
+                        _APPLICANT_INTAKE.search(window) is None
+                        and sum(vacancy_details) < 2
+                    )
                 ):
                     continue
 

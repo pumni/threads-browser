@@ -46,7 +46,11 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
     account = create_local_account(data_root, actor=actor)
     store = CheckpointStore(data_root)
     posts = (
-        SyntheticPost("hire-post", "Bên mình đang tuyển nhân viên kinh doanh tại Hà Nội."),
+        SyntheticPost(
+            "structured-direct-ad",
+            "TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. Lương: 8–10 triệu/tháng. "
+            "Địa điểm: Quận 7. Liên hệ: 0900000000.",
+        ),
         SyntheticPost(
             "direct-recruitment-ad",
             "TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. Lương 8–10 triệu. "
@@ -57,14 +61,15 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
             "Mình đang nhận CV cho đối tác ở vị trí QA Engineer. "
             "Gửi CV qua inbox để ứng tuyển.",
         ),
-        SyntheticPost("third-party-company", "Công ty khác đang tuyển QA Engineer."),
         SyntheticPost(
             "question-about-hiring",
-            "Có ai đang tuyển QA Engineer không? Inbox mình biết với.",
+            "Có ai đang tuyển QA Engineer không? Liên hệ mình. "
+            "Lương 8 triệu/tháng. Địa điểm: Quận 7.",
         ),
         SyntheticPost(
             "third-party-link-request",
-            "Công ty khác đang tuyển QA Engineer. Inbox mình để xin link.",
+            "Công ty khác đang tuyển QA Engineer. Lương 8 triệu/tháng. "
+            "Địa điểm: Quận 7. Inbox mình để xin link.",
         ),
         SyntheticPost(
             "expired-direct-ad",
@@ -73,7 +78,12 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
         ),
         SyntheticPost(
             "course-enrollment",
-            "Tuyển sinh lớp nghề – học phí 8 triệu – địa chỉ – liên hệ.",
+            "Tuyển sinh khóa học QA Engineer. Học phí: 8 triệu. "
+            "Địa điểm: Quận 7. Liên hệ đăng ký.",
+        ),
+        SyntheticPost(
+            "salary-phone-no-hiring-intent",
+            "Lương 8–10 triệu/tháng, gọi số 0900000000, địa chỉ Quận 7.",
         ),
         SyntheticPost(
             "closed-post",
@@ -81,7 +91,7 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
         ),
         SyntheticPost("seeking-post", "Em đang tìm công việc QA Tester tại TP.HCM."),
     )
-    hire_url = "https://www.threads.com/@candidate/post/hire-post"
+    hire_url = "https://www.threads.com/@candidate/post/structured-direct-ad"
     legacy_auto_policy = sha256(
         b"threads-browser:auto-nurture:job-intent-v1"
     ).hexdigest()
@@ -225,12 +235,18 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
 
     assert set(visited) == {
         "seeking-post",
-        "hire-post",
+        "structured-direct-ad",
         "direct-recruitment-ad",
         "partner-recruiter",
     }
     assert set(visited).isdisjoint(
-        {"question-about-hiring", "third-party-link-request", "expired-direct-ad"}
+        {
+            "question-about-hiring",
+            "third-party-link-request",
+            "expired-direct-ad",
+            "course-enrollment",
+            "salary-phone-no-hiring-intent",
+        }
     )
     assert len(visited) == 4
     assert wheel_counts_at_detail[0] == 0
@@ -269,7 +285,7 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
     assert resumed_result.home_new == 0
     assert set(visited) == {
         "seeking-post",
-        "hire-post",
+        "structured-direct-ad",
         "direct-recruitment-ad",
         "partner-recruiter",
     }
