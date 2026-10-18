@@ -15,6 +15,8 @@ _RETRYABLE_CODES = frozenset(
         "HOME_NAVIGATION_TIMEOUT",
         "HOME_RENDER_PENDING",
         "HOME_FEED_NOT_READY",
+        "FEED_INITIAL_NOT_READY",
+        "FEED_SCROLL_NOT_READY",
         "FOR_YOU_ACTIVATION_NOT_READY",
         "DOM_CHANGED_DURING_SCAN",
         "UI_READ_UNVERIFIED",
@@ -26,7 +28,21 @@ _RETRYABLE_CODES = frozenset(
         "DETAIL_PROVENANCE_UNVERIFIED",
     }
 )
+_RECOVERABLE_SESSION_STATUSES = frozenset(
+    {
+        "SESSION_COVERAGE_INCOMPLETE",
+        "VIEWPORT_OBSERVATION_INCOMPLETE",
+        "DETAIL_RETRY_PENDING",
+        "NO_ACTIONABLE_TARGET",
+        "UNVERIFIED_RELEVANCE_REQUIRES_VERIFICATION",
+        "OBSERVED_UNVERIFIED_ONLY",
+        "OBSERVATION_UNCERTAIN_ONLY",
+        "NO_VERIFIED_POSTS_IN_BUDGET",
+        "RELEVANT_POST_NOT_CURRENT",
+    }
+)
 _MAX_TRANSIENT_RETRIES = 2
+_MAX_INCOMPLETE_RETRIES = 2
 _MAX_DISTINCT_FINGERPRINTS = 5_000
 _BASE_IDLE_SECONDS = 15
 _MAX_IDLE_SECONDS = 300
@@ -48,6 +64,7 @@ async def run_auto_nurture(
     cycles = 0
     no_novel_cycles = 0
     transient_retries = 0
+    incomplete_retries = 0
     recent_fingerprints: set[str] = set()
     fingerprint_order: deque[str] = deque()
 
@@ -68,8 +85,33 @@ async def run_auto_nurture(
             await sleep(cooldown)
             continue
 
-        cycles += 1
         transient_retries = 0
+        status = getattr(result, "status", None)
+        if status in _RECOVERABLE_SESSION_STATUSES:
+            incomplete_retries += 1
+            if incomplete_retries > _MAX_INCOMPLETE_RETRIES:
+                emit(
+                    f"AUTO cycle={cycles + 1} stop_code=INCOMPLETE_RETRY_LIMIT "
+                    f"status={_safe_code(status)} "
+                    f"checkpoint_saved={str(getattr(result, 'checkpoint_saved', False) is True).lower()}"
+                )
+                raise UiReadError("INCOMPLETE_RETRY_LIMIT")
+            cooldown = _RETRY_COOLDOWNS[incomplete_retries - 1]
+            emit(
+                f"AUTO cycle={cycles + 1} status={_safe_code(status)} "
+                f"checkpoint_saved={str(getattr(result, 'checkpoint_saved', False) is True).lower()} "
+                f"incomplete_retry={incomplete_retries} cooldown_s={cooldown}"
+            )
+            await sleep(cooldown)
+            continue
+
+        if status not in {"SESSION_COMPLETE", "SESSION_BUDGET_EXHAUSTED"}:
+            raise UiReadError(_safe_code(getattr(result, "stop_reason", None)))
+        if getattr(result, "checkpoint_saved", False) is not True:
+            raise UiReadError("CYCLE_NOT_CHECKPOINTED")
+
+        cycles += 1
+        incomplete_retries = 0
         fresh_count = _record_new_fingerprints(
             result,
             recent_fingerprints,
@@ -89,13 +131,6 @@ async def run_auto_nurture(
             f"refresh={refresh_cause} cooldown_s={cooldown}"
         )
 
-        if (
-            getattr(result, "status", None)
-            not in {"SESSION_COMPLETE", "SESSION_BUDGET_EXHAUSTED"}
-        ):
-            raise UiReadError(refresh_cause)
-        if getattr(result, "checkpoint_saved", False) is not True:
-            raise UiReadError("CYCLE_NOT_CHECKPOINTED")
         if max_cycles is not None and cycles >= max_cycles:
             return cycles
         await sleep(cooldown)

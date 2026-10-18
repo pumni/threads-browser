@@ -34,19 +34,8 @@ async def run_page_workflow_session(
     reader_factory: Callable[..., ThreadsHomeReader] = ThreadsHomeReader,
 ) -> NurtureResult:
     """Continue verified Detail/Back observations without resetting session evidence."""
-    normalized_terms = _validate_cycle(
-        account,
-        max_posts,
-        max_scrolls,
-        max_total_posts,
-        terms,
-        allow_empty_terms=auto_mode,
-    )
-    if not 1 <= max_detail_reads <= 40:
-        raise UiReadError("DETAIL_READ_LIMIT_INVALID")
-
-    fingerprint = (
-        auto_policy_fingerprint() if auto_mode else policy_fingerprint(normalized_terms)
+    normalized_terms, fingerprint = _prepare_session_policy(
+        account, max_posts, terms, max_scrolls, max_total_posts, max_detail_reads, auto_mode
     )
     checkpoint = checkpoint_store.load(account.account_id, fingerprint)
     progress = SessionProgress(
@@ -66,7 +55,6 @@ async def run_page_workflow_session(
         detail=False,
         console_output_policy=console_output_policy,
         reader_factory=reader_factory,
-        auto_nurture=auto_mode,
     )
     last_context: CycleContext | None = None
 
@@ -220,3 +208,28 @@ def _finalize_session(
             ),
         )
     return progress.result(reader, status=status, stop_reason=stop_reason)
+
+
+def _prepare_session_policy(
+    account: BrowserAccount,
+    max_posts: int,
+    terms: tuple[str, ...],
+    max_scrolls: int,
+    max_total_posts: int,
+    max_detail_reads: int,
+    auto_mode: bool,
+) -> tuple[tuple[str, ...], str]:
+    normalized_terms = _validate_cycle(
+        account,
+        max_posts,
+        max_scrolls,
+        max_total_posts,
+        terms,
+        allow_empty_terms=auto_mode,
+    )
+    if not 1 <= max_detail_reads <= 40:
+        raise UiReadError("DETAIL_READ_LIMIT_INVALID")
+    fingerprint = (
+        auto_policy_fingerprint() if auto_mode else policy_fingerprint(normalized_terms)
+    )
+    return normalized_terms, fingerprint

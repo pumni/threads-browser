@@ -195,13 +195,10 @@ def _make_reader(
     detail: bool,
     console_output_policy: ConsoleOutputPolicy,
     reader_factory: Callable[..., ThreadsHomeReader],
-    auto_nurture: bool = False,
 ) -> ThreadsHomeReader:
     reader_options = {}
     if console_output_policy is not ConsoleOutputPolicy.INTERACTIVE:
         reader_options["console_output_policy"] = console_output_policy
-    if auto_nurture:
-        reader_options["auto_nurture"] = True
     return reader_factory(
         page,
         account.expected_actor,
