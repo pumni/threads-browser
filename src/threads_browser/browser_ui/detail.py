@@ -769,8 +769,7 @@ class DetailNavigator:
                 deadline,
                 timeout_code="DETAIL_NAVIGATION_UNVERIFIED",
             )
-            current = await self.actionable_now(target)
-            await click_detail_target(self, current, deadline)
+            await click_detail_target(self, target, deadline)
         except PlaywrightTimeoutError:
             raise UiReadError("DETAIL_NAVIGATION_UNVERIFIED") from None
         try:

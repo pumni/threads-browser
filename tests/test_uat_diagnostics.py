@@ -29,7 +29,7 @@ def test_uat_diagnostic_reporter_redacts_untrusted_values_and_bounds_counts() ->
     assert "private post text" not in output
 
 
-def test_uat_diagnostic_result_reports_only_phase_counts() -> None:
+def test_uat_diagnostic_does_not_mislabel_row_appearances_as_viewports() -> None:
     lines: list[str] = []
     diagnostics = AutoUatDiagnostics(emit=lines.append)
     diagnostics.begin_attempt()
@@ -39,7 +39,8 @@ def test_uat_diagnostic_result_reports_only_phase_counts() -> None:
             home_sampled=4,
             home_relevant=1,
             home_unknown=2,
-            viewport_observations=3,
+            viewport_observations=4,
+            viewport_scans=1,
             scroll_attempts=2,
             scrolls=1,
             observed_rows=4,
@@ -70,6 +71,8 @@ def test_uat_diagnostic_result_reports_only_phase_counts() -> None:
     output = "\n".join(lines)
     assert "phase=HOME status=OBSERVED relevant=1 sampled=4 unknown=2" in output
     assert "phase=FEED status=OBSERVED body_read=2" in output
+    assert "observed_rows=4" in output
+    assert "viewports=" not in output
     assert "phase=COVERAGE status=INCOMPLETE" in output
     assert "gap_category=MULTIPLE" in output
     assert "phase=CHECKPOINT status=SAVED checkpoint_runs=2" in output
