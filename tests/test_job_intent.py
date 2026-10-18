@@ -17,6 +17,33 @@ from threads_browser.feed.job_intent import classify_auto_body, classify_job_int
         ("Ben minh dang tuyen nhan vien kinh doanh", "HIRING"),
         ("Minh dang tim viec lam", "SEEKING_JOB"),
         (
+            "TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. Lương 8–10 triệu. "
+            "Làm ở Q7. Inbox ứng tuyển.",
+            "HIRING",
+        ),
+        (
+            "TUYỂN DỤNG\nVỊ TRÍ: Thu ngân\nCA: Tối\nLƯƠNG: 8–10 triệu\n"
+            "ĐỊA ĐIỂM: Quận 7\nGỬI CV để ứng tuyển",
+            "HIRING",
+        ),
+        ("Cần tuyển 2 bảo vệ, ca đêm, liên hệ để ứng tuyển.", "HIRING"),
+        (
+            "Mình đang nhận CV cho đối tác ở vị trí QA Engineer. "
+            "Gửi CV qua inbox để ứng tuyển.",
+            "HIRING",
+        ),
+        ("Em cần việc làm ca tối tại Đà Nẵng.", "SEEKING_JOB"),
+        ("Mình muốn tìm việc làm kế toán tại Hà Nội.", "SEEKING_JOB"),
+        (
+            "Tuyển gấp nhân viên phục vụ. Đã tuyển đủ cho vị trí khác.",
+            "HIRING",
+        ),
+        (
+            "Tuyển gấp nhân viên phục vụ. Đã tuyển đủ nhân viên phục vụ cho vị trí này. "
+            "Hiện đang tuyển lại nhân viên phục vụ ca tối, inbox nhận CV.",
+            "HIRING",
+        ),
+        (
             "Không tuyển nhân viên nữa. Công ty đang cần tuyển 2 lập trình viên Backend.",
             "HIRING",
         ),
@@ -88,6 +115,14 @@ from threads_browser.feed.job_intent import classify_auto_body, classify_job_int
         "job_intent_with_independent_course_clause",
         "independent_author_clause_after_third_party_company",
         "current_seeking_after_past_clause",
+        "direct_structured_ad_without_company_subject",
+        "multiline_labeled_direct_ad",
+        "direct_ad_with_headcount_shift_and_contact",
+        "recruiter_accepting_applications_for_partner",
+        "first_person_em_needs_work",
+        "first_person_minh_wants_work",
+        "direct_ad_kept_open_by_different_vacancy_closure",
+        "direct_vacancy_reopened_after_same_role_closure",
     ),
 )
 def test_vietnamese_current_job_intent_is_eligible(body: str, expected: str) -> None:
@@ -144,6 +179,23 @@ def test_vietnamese_current_job_intent_is_eligible(body: str, expected: str) -> 
         "Vietnam team hire QA engineer.",
         "Career advice about the word engineer.",
         "Khóa học về hiring an engineer.",
+        "Tuyển sinh lớp nghề – học phí 8 triệu – địa chỉ – liên hệ.",
+        "Tổng hợp 20 tin tuyển dụng của công ty khác.",
+        "Công ty khác đang tuyển QA Engineer.",
+        "Bạn Minh đang tìm việc làm.",
+        (
+            "Tuyển gấp 3 nhân viên phục vụ. Lương 8–10 triệu. Inbox ứng tuyển. "
+            "Đã tuyển đủ nhân viên phục vụ, ngừng nhận CV."
+        ),
+        (
+            "Cần tuyển QA Engineer, inbox ứng tuyển. "
+            "Hạn nộp hồ sơ: 01/01/2000."
+        ),
+        "Lương 8–10 triệu, gọi số 0900000000, địa chỉ Quận 7.",
+        "Năm ngoái tuyển gấp nhân viên phục vụ, lương 8 triệu, inbox ứng tuyển.",
+        "'Tuyển gấp nhân viên phục vụ, inbox ứng tuyển.'",
+        "Hiring 3 servers. Salary 8 million. Inbox to apply.",
+        "Hạn ứng tuyển: 31/12/2099. Vị trí: QA Engineer.",
     ),
     ids=(
         "hiring_closed",
@@ -192,6 +244,17 @@ def test_vietnamese_current_job_intent_is_eligible(body: str, expected: str) -> 
         "english_company_context",
         "english_career_advice",
         "course_with_english_role",
+        "course_enrollment_with_salary_address_and_contact",
+        "third_party_job_listing_summary",
+        "passive_third_party_vacancy_without_intake",
+        "third_party_candidate_profile",
+        "direct_vacancy_closed_and_cv_intake_stopped",
+        "direct_vacancy_with_explicitly_expired_deadline",
+        "salary_phone_and_address_without_job_intent",
+        "historical_direct_recruitment_ad",
+        "quoted_direct_recruitment_ad",
+        "english_only_direct_recruitment_ad",
+        "deadline_and_role_without_hiring_intent",
     ),
 )
 def test_uncertain_or_non_current_context_is_ineligible(body: str) -> None:

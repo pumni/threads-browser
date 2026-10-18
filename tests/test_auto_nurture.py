@@ -239,6 +239,7 @@ def test_auto_supervisor_stops_after_incomplete_retry_cap() -> None:
 def test_auto_policy_checkpoint_is_versioned_separately_from_terms() -> None:
     auto = auto_policy_fingerprint()
     assert len(auto) == 64
-    assert AUTO_POLICY_VERSION == "threads-browser:auto-nurture:job-intent-v2-vi"
+    assert AUTO_POLICY_VERSION == "threads-browser:auto-nurture:job-intent-v3-vi"
     assert auto != sha256(b"threads-browser:auto-nurture:job-intent-v1").hexdigest()
+    assert auto != sha256(b"threads-browser:auto-nurture:job-intent-v2-vi").hexdigest()
     assert auto != policy_fingerprint(("auto-nurture-v1",))

@@ -48,11 +48,34 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
     posts = (
         SyntheticPost("hire-post", "Bên mình đang tuyển nhân viên kinh doanh tại Hà Nội."),
         SyntheticPost(
+            "direct-recruitment-ad",
+            "TUYỂN GẤP 3 NHÂN VIÊN PHỤC VỤ. Lương 8–10 triệu. "
+            "Làm ở Q7. Inbox ứng tuyển.",
+        ),
+        SyntheticPost(
+            "direct-recruiter-intake",
+            "Mình đang nhận CV cho đối tác ở vị trí QA Engineer. "
+            "Gửi CV qua inbox để ứng tuyển.",
+        ),
+        SyntheticPost(
             "career-post",
             "Năm ngoái mình đang tìm việc làm ở Đà Nẵng. "
             "Hồi trước bên mình đang tuyển nhân viên kinh doanh.",
         ),
         SyntheticPost("third-party-company", "Công ty khác đang tuyển QA Engineer."),
+        SyntheticPost(
+            "course-enrollment",
+            "Tuyển sinh lớp nghề – học phí 8 triệu – địa chỉ – liên hệ.",
+        ),
+        SyntheticPost(
+            "closed-direct-recruitment-ad",
+            "Tuyển gấp nhân viên phục vụ. Lương 8 triệu. Inbox ứng tuyển. "
+            "Đã tuyển đủ nhân viên phục vụ, ngừng nhận CV.",
+        ),
+        SyntheticPost(
+            "expired-direct-recruitment-ad",
+            "Cần tuyển QA Engineer, inbox ứng tuyển. Hạn nộp hồ sơ: 01/01/2000.",
+        ),
         SyntheticPost(
             "independent-course-clause",
             "Bên mình đang tuyển nhân viên kinh doanh, nhưng khóa học kỹ năng phỏng vấn cũng đang mở. "
@@ -73,7 +96,10 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
     legacy_auto_policy = sha256(
         b"threads-browser:auto-nurture:job-intent-v1"
     ).hexdigest()
-    assert AUTO_POLICY_VERSION == "threads-browser:auto-nurture:job-intent-v2-vi"
+    legacy_v2_policy = sha256(
+        b"threads-browser:auto-nurture:job-intent-v2-vi"
+    ).hexdigest()
+    assert AUTO_POLICY_VERSION == "threads-browser:auto-nurture:job-intent-v3-vi"
     legacy_auto_checkpoint = Checkpoint(
         account.account_id,
         legacy_auto_policy,
@@ -91,6 +117,23 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
         / f"{account.account_id}-{legacy_auto_policy}.json"
     )
     legacy_auto_bytes = legacy_auto_path.read_bytes()
+    legacy_v2_checkpoint = Checkpoint(
+        account.account_id,
+        legacy_v2_policy,
+        completed_runs=2,
+        home_sampled=2,
+        home_new=2,
+        home_relevant=1,
+        seen_fingerprints=(_post_fingerprint(hire_url),),
+    )
+    store.save(legacy_v2_checkpoint)
+    legacy_v2_path = (
+        data_root
+        / "nurture"
+        / "checkpoints"
+        / f"{account.account_id}-{legacy_v2_policy}.json"
+    )
+    legacy_v2_bytes = legacy_v2_path.read_bytes()
     current_auto_policy = auto_policy_fingerprint()
     assert current_auto_policy != legacy_auto_policy
     current_auto_checkpoint = Checkpoint(
@@ -188,11 +231,17 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
     uat_diagnostics.report_result(result)
     assert result.status == "SESSION_COMPLETE"
     assert result.checkpoint_saved is True
-    assert result.detail_reads == 3
+    assert result.detail_reads == 5
     assert result.new_fingerprints
 
-    assert set(visited) == {"seeking-post", "hire-post", "independent-course-clause"}
-    assert len(visited) == 3
+    assert set(visited) == {
+        "seeking-post",
+        "hire-post",
+        "independent-course-clause",
+        "direct-recruitment-ad",
+        "direct-recruiter-intake",
+    }
+    assert len(visited) == 5
     assert wheel_counts_at_detail[0] == 0
     uat_output = "\n".join(uat_lines)
     assert "phase=HOME status=READY" in uat_output
@@ -211,6 +260,8 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
     assert _post_fingerprint(hire_url) in checkpoint.seen_fingerprints
     assert store.load(account.account_id, legacy_auto_policy) == legacy_auto_checkpoint
     assert legacy_auto_path.read_bytes() == legacy_auto_bytes
+    assert store.load(account.account_id, legacy_v2_policy) == legacy_v2_checkpoint
+    assert legacy_v2_path.read_bytes() == legacy_v2_bytes
     assert store.load(account.account_id, user_terms_policy) == user_terms_checkpoint
     assert user_terms_path.read_bytes() == user_terms_bytes
 
@@ -220,13 +271,21 @@ def test_auto_session_opens_only_current_job_posts_and_prioritizes_visible_match
     assert resumed_result.checkpoint_saved is True
     assert resumed_result.detail_reads == 0
     assert resumed_result.home_new == 0
-    assert set(visited) == {"seeking-post", "hire-post", "independent-course-clause"}
-    assert len(visited) == 3
+    assert set(visited) == {
+        "seeking-post",
+        "hire-post",
+        "independent-course-clause",
+        "direct-recruitment-ad",
+        "direct-recruiter-intake",
+    }
+    assert len(visited) == 5
     resumed_checkpoint = store.load(account.account_id, auto_policy_fingerprint())
     assert resumed_checkpoint.completed_runs == 3
     assert resumed_checkpoint.detail_reads == 3
     assert store.load(account.account_id, legacy_auto_policy) == legacy_auto_checkpoint
     assert legacy_auto_path.read_bytes() == legacy_auto_bytes
+    assert store.load(account.account_id, legacy_v2_policy) == legacy_v2_checkpoint
+    assert legacy_v2_path.read_bytes() == legacy_v2_bytes
     assert store.load(account.account_id, user_terms_policy) == user_terms_checkpoint
     assert user_terms_path.read_bytes() == user_terms_bytes
     raw_checkpoint = (
