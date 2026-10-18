@@ -57,7 +57,10 @@ async def click_detail_target(
     """Recheck Auto eligibility, then open the visible target without scrolling."""
     host = navigator._host
     auto_nurture = navigator._console_output_policy is ConsoleOutputPolicy.AUTO
-    target = await navigator.actionable_now(target)
+    current = await navigator.actionable_now(target)
+    if auto_nurture and not _auto_revalidation_body_matches(target, current):
+        raise UiReadError("DETAIL_PROVENANCE_UNVERIFIED")
+    target = current
     if auto_nurture and classify_auto_body(target.body) != "RELEVANT":
         raise UiReadError("AUTO_TARGET_NOT_ELIGIBLE")
 
